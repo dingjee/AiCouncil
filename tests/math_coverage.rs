@@ -67,7 +67,12 @@ fn unsupported_macro_falls_back_gracefully() {
 #[test]
 fn svg_sizes_reasonable() {
     let mut cache = MathCache::new();
-    let m = cache.get_or_render(r"\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}", 17.0, true, iced::Color::BLACK);
+    let m = cache.get_or_render(
+        r"\begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}",
+        17.0,
+        true,
+        iced::Color::BLACK,
+    );
     assert!(m.error.is_none(), "矩阵必须渲染");
     assert!(m.size.width > 20.0 && m.size.height > 20.0, "{:?}", m.size);
 }

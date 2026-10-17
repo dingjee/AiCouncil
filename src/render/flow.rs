@@ -14,10 +14,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iced::advanced::layout::{self, Layout};
-use iced::advanced::text::{self, LineHeight, Paragraph as _, Shaping, Wrapping};
-use iced::advanced::widget::tree;
 use iced::advanced::svg::Renderer as _;
 use iced::advanced::text::Renderer as _;
+use iced::advanced::text::{self, LineHeight, Paragraph as _, Shaping, Wrapping};
+use iced::advanced::widget::tree;
 use iced::advanced::{Clipboard, Renderer as _, Shell, Widget};
 use iced::{
     mouse, Background, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Size, Vector,
@@ -41,13 +41,8 @@ pub struct MathGfx {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Atom {
-    Text {
-        text: String,
-        style: TextAtomStyle,
-    },
-    Math {
-        idx: usize,
-    },
+    Text { text: String, style: TextAtomStyle },
+    Math { idx: usize },
 }
 
 /// 影响字体度量的原子样式(缓存键的一部分;链接/颜色只影响绘制)。
@@ -75,10 +70,8 @@ pub struct ParaFlow {
     pub math_font_size: f32,
 }
 
-/// 一条消息的公式排版产物:
-/// - `paras`:含**行内**公式的段落,按文档遍历顺序排列;
-/// - `blocks`:**块级**公式图形,按文档遍历顺序排列。
-/// 视图层必须以相同的深度优先顺序消费。
+/// 一条消息的公式排版产物:`paras` 为含**行内**公式的段落、`blocks`
+/// 为**块级**公式图形,均按文档遍历顺序排列;视图层以相同顺序消费。
 pub struct FlowContent {
     pub paras: Vec<Arc<ParaFlow>>,
     pub blocks: Vec<MathGfx>,
@@ -161,12 +154,7 @@ fn render_block_math(tex: &str, style: &RenderStyle, cache: &mut MathCache) -> M
     }
 }
 
-fn push_word(
-    word: &mut String,
-    st: &md::Style,
-    atoms: &mut Vec<Atom>,
-    decor: &mut Vec<AtomDecor>,
-) {
+fn push_word(word: &mut String, st: &md::Style, atoms: &mut Vec<Atom>, decor: &mut Vec<AtomDecor>) {
     if word.is_empty() {
         return;
     }
@@ -277,11 +265,13 @@ struct LineBox {
     height: f32,
 }
 
-/// 组件状态:内容版本 + 布局宽度 + 文本测量缓存 + 行盒。
+/// 按字体样式分组的文本测量缓存。
+/// 按字体样式分组的文本测量缓存。
+type PerFontMeasures = HashMap<String, TextMeasure>;
 pub struct FlowState {
     version: u64,
     width: f32,
-    measures: HashMap<TextAtomStyle, HashMap<String, TextMeasure>>,
+    measures: HashMap<TextAtomStyle, PerFontMeasures>,
     lines: Vec<LineBox>,
 }
 
@@ -296,8 +286,11 @@ pub struct MathFlow<'a, Message> {
     style: RenderStyle,
     code_bg: Color,
     error_color: Color,
-    on_link: Option<Box<dyn Fn(&str) -> Message + 'a>>,
+    on_link: Option<OnLinkFn<'a, Message>>,
 }
+
+/// 行内链接回调。
+pub type OnLinkFn<'a, M> = Box<dyn Fn(&str) -> M + 'a>;
 
 impl<'a, Message: 'a> MathFlow<'a, Message> {
     pub fn new(content: &'a ParaFlow, style: RenderStyle) -> Self {
@@ -336,10 +329,10 @@ impl<'a, Message: 'a> MathFlow<'a, Message> {
         }
     }
 
-    fn measure_text(&self, state: &mut FlowState, key: TextAtomStyle, text: &str) -> (f32, f32) {
+    fn measure_text(&self, state: &mut FlowState, key: TextAtomStyle, text: &str) -> Size {
         let per_font = state.measures.entry(key).or_default();
         if let Some(m) = per_font.get(text) {
-            return (m.paragraph.min_bounds().width, m.paragraph.min_bounds().height);
+            return m.paragraph.min_bounds();
         }
         let paragraph = Para::with_text(text::Text {
             content: text,
@@ -353,9 +346,8 @@ impl<'a, Message: 'a> MathFlow<'a, Message> {
             wrapping: Wrapping::Word,
         });
         let bounds = paragraph.min_bounds();
-        let size = (bounds.width, bounds.height);
         per_font.insert(text.to_string(), TextMeasure { paragraph });
-        size
+        bounds
     }
 
     fn layout_lines(&self, state: &mut FlowState, width: f32) {
@@ -385,16 +377,16 @@ impl<'a, Message: 'a> MathFlow<'a, Message> {
         for atom in &self.content.atoms {
             let (w, h, ascent_hint, descent_hint) = match atom {
                 Atom::Text { text, style } => {
-                    let (w, h) = self.measure_text(state, *style, text);
-                    let h = h.max(1.0);
+                    let sz = self.measure_text(state, *style, text);
+                    let h = sz.height.max(1.0);
                     let a = h * ASCENT_RATIO;
-                    (w, h, a, h - a)
+                    (sz.width, h, a, h - a)
                 }
                 Atom::Math { idx: m } => {
                     let gfx = &self.content.math[*m];
-                    if gfx.error.is_some() {
-                        let err = gfx.error.as_ref().unwrap().to_string();
-                        let (w, h) = self.measure_text(
+                    if let Some(err) = gfx.error.as_deref() {
+                        let err = err.to_string();
+                        let sz = self.measure_text(
                             state,
                             TextAtomStyle {
                                 mono: true,
@@ -402,9 +394,9 @@ impl<'a, Message: 'a> MathFlow<'a, Message> {
                             },
                             &err,
                         );
-                        let h = h.max(1.0);
+                        let h = sz.height.max(1.0);
                         let a = h * ASCENT_RATIO;
-                        (w, h, a, h - a)
+                        (sz.width, h, a, h - a)
                     } else {
                         let h = gfx.size.height;
                         let axis = AXIS_EM * math_size;

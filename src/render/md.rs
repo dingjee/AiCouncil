@@ -252,11 +252,7 @@ fn protect_math(src: &str) -> (String, Vec<Stashed>) {
                                 out.push('\\');
                                 i += 1;
                             } else {
-                                stash_push(
-                                    &mut out,
-                                    &mut stash,
-                                    Stashed::Inline(tex.to_string()),
-                                );
+                                stash_push(&mut out, &mut stash, Stashed::Inline(tex.to_string()));
                                 i = close + 2;
                             }
                         } else {
@@ -279,11 +275,7 @@ fn protect_math(src: &str) -> (String, Vec<Stashed>) {
                             out.push_str("$$");
                             i += 2;
                         } else {
-                            stash_push(
-                                &mut out,
-                                &mut stash,
-                                Stashed::Display(tex.to_string()),
-                            );
+                            stash_push(&mut out, &mut stash, Stashed::Display(tex.to_string()));
                             i = close + 2;
                         }
                     } else {
@@ -713,9 +705,7 @@ impl Builder {
             TagEnd::CodeBlock => {
                 let cont = self.stack.pop().unwrap();
                 if let Container::CodeBlock { language, code } = cont {
-                    self.finish_into(move |c| {
-                        push_block(c, Block::CodeBlock { language, code })
-                    });
+                    self.finish_into(move |c| push_block(c, Block::CodeBlock { language, code }));
                 }
             }
             TagEnd::Table => {
@@ -756,13 +746,15 @@ impl Builder {
     }
 
     fn pop_mark(&mut self, kind: &MarkKind) {
-        let same_kind = |m: &Mark| match (m, kind) {
-            (Mark::Bold, MarkKind::Bold)
-            | (Mark::Italic, MarkKind::Italic)
-            | (Mark::Strike, MarkKind::Strike) => true,
-            _ => false,
+        let same_kind = |m: &Mark| {
+            matches!(
+                (m, kind),
+                (Mark::Bold, MarkKind::Bold)
+                    | (Mark::Italic, MarkKind::Italic)
+                    | (Mark::Strike, MarkKind::Strike)
+            )
         };
-        if let Some(pos) = self.style_stack.iter().rposition(|m| same_kind(m)) {
+        if let Some(pos) = self.style_stack.iter().rposition(same_kind) {
             self.style_stack.remove(pos);
         }
     }
@@ -807,8 +799,9 @@ impl Builder {
 
         if let Some(top) = self.stack.last_mut() {
             match top {
-                Container::Paragraph { parts: dst }
-                | Container::Heading { parts: dst, .. } => dst.extend(parts),
+                Container::Paragraph { parts: dst } | Container::Heading { parts: dst, .. } => {
+                    dst.extend(parts)
+                }
                 Container::Table { cell, .. } => cell.extend(parts),
                 _ => {}
             }
@@ -852,9 +845,9 @@ enum MarkKind {
 
 fn push_block(c: &mut Container, b: Block) {
     match c {
-        Container::Root { blocks }
-        | Container::Quote { blocks }
-        | Container::Item { blocks } => blocks.push(b),
+        Container::Root { blocks } | Container::Quote { blocks } | Container::Item { blocks } => {
+            blocks.push(b)
+        }
         _ => {}
     }
 }
@@ -935,7 +928,12 @@ mod tests {
                 content: "质量 ".into()
             }
         );
-        assert_eq!(i.parts[1], Part::Math { tex: "E = mc^2".into() });
+        assert_eq!(
+            i.parts[1],
+            Part::Math {
+                tex: "E = mc^2".into()
+            }
+        );
     }
 
     #[test]
@@ -1013,7 +1011,10 @@ mod tests {
 
     #[test]
     fn unclosed_dollar_stays_literal() {
-        assert_eq!(parts_text("未闭合 $x^2 +"), vec!["未闭合 $x^2 +".to_string()]);
+        assert_eq!(
+            parts_text("未闭合 $x^2 +"),
+            vec!["未闭合 $x^2 +".to_string()]
+        );
     }
 
     #[test]

@@ -15,6 +15,12 @@ macro_rules! define_id {
                 Self(Uuid::new_v4())
             }
 
+            pub fn from_uuid_str(s: &str) -> Self {
+                Uuid::parse_str(s)
+                    .map(Self)
+                    .unwrap_or_else(|_| Self(Uuid::nil()))
+            }
+
             pub fn as_uuid(&self) -> Uuid {
                 self.0
             }

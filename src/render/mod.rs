@@ -51,7 +51,11 @@ pub struct RenderedMessage {
 ///
 /// 公式 SVG 在此渲染并进入 `math::MathCache`(跨消息去重);
 /// 视图层只读取产物,不再做耗时工作。
-pub fn render_message(markdown: &str, style: &RenderStyle, cache: &mut math::MathCache) -> RenderedMessage {
+pub fn render_message(
+    markdown: &str,
+    style: &RenderStyle,
+    cache: &mut math::MathCache,
+) -> RenderedMessage {
     let doc = md::parse(markdown);
     let flow = flow::FlowContent::from_document(&doc, style, cache);
     RenderedMessage {

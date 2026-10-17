@@ -10,12 +10,14 @@
 use std::sync::Arc;
 
 use iced::advanced::text::{Highlight, Span};
-use iced::widget::{self, column, container, rich_text, row, rule, scrollable, svg as svg_widget, text};
+use iced::widget::{
+    self, column, container, rich_text, row, rule, scrollable, svg as svg_widget, text,
+};
 use iced::{Alignment, Element, Font, Length, Padding};
 
 use super::flow::{FlowContent, MathFlow, MathGfx, ParaFlow};
 use super::md::{Align, Block, Inlines, Part, Style as MdStyle};
-use super::{RenderedMessage, RenderStyle};
+use super::{RenderStyle, RenderedMessage};
 
 /// 链接点击回调类型。
 pub type OnLink<'a, M> = Arc<dyn Fn(String) -> M + 'a>;
@@ -242,7 +244,11 @@ fn md_font(st: &MdStyle) -> Font {
 }
 
 /// 代码块:iced_highlighter 语法高亮 + 横向滚动 + 圆角底色容器。
-fn code_block_view<'a, M: 'a>(language: Option<&str>, code: &str, style: RenderStyle) -> Element<'a, M> {
+fn code_block_view<'a, M: 'a>(
+    language: Option<&str>,
+    code: &str,
+    style: RenderStyle,
+) -> Element<'a, M> {
     let code_size = style.text_size * 0.85;
     let mut stream = iced_highlighter::Stream::new(&iced_highlighter::Settings {
         theme: iced_highlighter::Theme::InspiredGitHub,

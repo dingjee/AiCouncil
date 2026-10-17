@@ -95,8 +95,7 @@ impl MathCache {
 /// 环境名映射:iced_math 不支持带编号的 `align`/`gather` 等,
 /// 映射到等价的无编号环境(渲染语义一致,编号本就不在首版范围)。
 pub fn normalize_tex(tex: &str) -> String {
-    let trimmed = tex.trim();
-    let mapped = trimmed
+    tex.trim()
         .replace("\\begin{align}", "\\begin{aligned}")
         .replace("\\begin{align*}", "\\begin{aligned}")
         .replace("\\end{align}", "\\end{aligned}")
@@ -104,8 +103,7 @@ pub fn normalize_tex(tex: &str) -> String {
         .replace("\\begin{gather}", "\\begin{gathered}")
         .replace("\\begin{gather*}", "\\begin{gathered}")
         .replace("\\end{gather}", "\\end{gathered}")
-        .replace("\\end{gather*}", "\\end{gathered}");
-    mapped
+        .replace("\\end{gather*}", "\\end{gathered}")
 }
 
 /// 从 iced_math 输出的 SVG 头部解析固有尺寸。
@@ -143,9 +141,10 @@ mod tests {
     #[test]
     fn parse_error_returns_fallback() {
         let mut cache = MathCache::new();
-        let m = cache.get_or_render(r"\unknownmacro{x}", 16.0, false, iced::Color::BLACK);
-        // 未知宏:要么 iced_math 容忍(渲染结果),要么给出错误回退;两种都不 panic。
-        let _ = &m.error;
+        // 未知宏:要么 iced_math 容忍(渲染出结果),要么给出错误回退;两种都不 panic。
+        let _ = cache
+            .get_or_render(r"\unknownmacro{x}", 16.0, false, iced::Color::BLACK)
+            .error;
     }
 
     #[test]

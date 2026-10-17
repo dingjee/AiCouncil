@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aicouncil::render::{self, math::MathCache, view, RenderedMessage, RenderStyle};
+use aicouncil::render::{self, math::MathCache, view, RenderStyle, RenderedMessage};
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Length, Subscription, Task};
 
@@ -138,8 +138,7 @@ impl Probe {
 
     fn view(&self) -> Element<'_, Message> {
         let style = self.style;
-        let on_link: view::OnLink<'_, Message> =
-            Arc::new(|url: String| Message::LinkClicked(url));
+        let on_link: view::OnLink<'_, Message> = Arc::new(|url: String| Message::LinkClicked(url));
         let fixture = view::view_message(&self.fixture_msg, style, on_link.clone());
         let stress = view::view_message(&self.stress_msg, style, on_link.clone());
         let stream = view::view_message(&self.stream_msg, style, on_link);
@@ -176,7 +175,11 @@ impl Probe {
         ]
         .spacing(8);
 
-        column![container(content).height(Length::Fill), container(input_bar).padding(12)].into()
+        column![
+            container(content).height(Length::Fill),
+            container(input_bar).padding(12)
+        ]
+        .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {

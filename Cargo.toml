@@ -1,0 +1,59 @@
+[package]
+name = "aicouncil"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "AiCouncil - minimal native AI chat with parallel model branches"
+license = "MIT"
+
+[lib]
+name = "aicouncil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aicouncil"
+path = "src/main.rs"
+
+[dependencies]
+# UI(默认含 wgpu/tiny-skia/thread-pool;附加 markdown/代码高亮/SVG/tokio/advanced)
+iced = { version = "0.14", features = ["markdown", "highlighter", "svg", "tokio", "advanced"] }
+iced_math = "0.5"
+
+# 异步与网络
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+futures-util = "0.3"
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 存储
+rusqlite = { version = "0.32", features = ["bundled"] }
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+
+# 平台
+directories = "5"
+rfd = "0.15"
+
+# 领域
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1", features = ["serde"] }
+thiserror = "2"
+
+# Markdown 解析(公式定界符识别在此层完成)
+pulldown-cmark = "0.12"
+
+# 代码块语法高亮(与 iced markdown 组件同一引擎)
+iced_highlighter = "0.14"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"

@@ -94,6 +94,8 @@ pub struct CredentialVault {
     process: ProcessCredentials,
     /// 系统库是否可用(首次探测结果缓存)。
     system_available: Mutex<Option<bool>>,
+    /// DPAPI 文件路径;仅 Windows 构建读取(非 Windows 目标上无读者)。
+    #[cfg_attr(not(windows), allow(dead_code))]
     local_file: Option<std::path::PathBuf>,
 }
 

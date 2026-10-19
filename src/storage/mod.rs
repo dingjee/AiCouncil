@@ -34,8 +34,21 @@ pub enum StorageError {
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
-const MIGRATIONS: &[(&str, &str)] =
-    &[("0001_init", include_str!("../../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("../../migrations/0001_init.sql")),
+    (
+        "0002_attachments",
+        include_str!("../../migrations/0002_attachments.sql"),
+    ),
+    (
+        "0003_title_metadata",
+        include_str!("../../migrations/0003_title_metadata.sql"),
+    ),
+    (
+        "0004_request_recovery",
+        include_str!("../../migrations/0004_request_recovery.sql"),
+    ),
+];
 
 /// 打开(必要时创建)数据库并执行迁移。
 pub fn open(path: &Path) -> Result<Db> {
@@ -78,7 +91,11 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
             )
             .map(|n| n > 0)?;
         if !applied {
-            conn.execute_batch(sql)?;
+            // 单迁移单事务:任一语句失败整体回滚,不部分升级(T08)
+            if let Err(e) = conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{sql}\nCOMMIT;")) {
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(StorageError::Migration(format!("{name}: {e}")));
+            }
             conn.execute(
                 "INSERT INTO schema_migrations(name, applied_at) VALUES (?1, ?2)",
                 rusqlite::params![name, now_ms()],
@@ -86,6 +103,10 @@ fn migrate(conn: &rusqlite::Connection) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub fn now_dt() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now()
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -113,6 +134,9 @@ pub struct SendBatchRecord {
     pub generations: Vec<Generation>,
     /// 发送后应立即写为 pending 的用量记录(每请求一条)。
     pub usage: Vec<UsageRecord>,
+    /// 事务内一并落库的 main_leaf 意图(CAS;None 不动 leaf)。
+    /// (期望当前值, 新值):期望不匹配则不移动,保护用户后续选择。
+    pub intended_main_leaf: Option<(Option<MessageId>, MessageId)>,
 }
 
 impl Db {
@@ -160,39 +184,33 @@ impl Db {
     pub fn conversations(&self) -> Result<Vec<Conversation>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, title, group_id, system_prompt, main_leaf_id, draft, created_at, updated_at
+            "SELECT id, title, group_id, system_prompt, main_leaf_id, draft,
+                    draft_attachments_json, created_at, updated_at,
+                    title_source, title_status, title_revision, title_attempt_count
              FROM conversations ORDER BY updated_at DESC",
         )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(Conversation {
-                    id: ConversationId::from_uuid_str(r.get::<_, String>(0)?.as_str()),
-                    title: r.get(1)?,
-                    group_id: r
-                        .get::<_, Option<String>>(2)?
-                        .map(|s| GroupId::from_uuid_str(s.as_str())),
-                    system_prompt: r.get(3)?,
-                    main_leaf_id: r
-                        .get::<_, Option<String>>(4)?
-                        .map(|s| MessageId::from_uuid_str(s.as_str())),
-                    draft: r.get(5)?,
-                    created_at: ms_to_dt(r.get(6)?),
-                    updated_at: ms_to_dt(r.get(7)?),
-                })
-            })?
+            .query_map([], row_to_conversation)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
+    /// 插入或更新会话的**非标题**字段。
+    ///
+    /// 标题只经 [`Db::rename_conversation_title`] /
+    /// [`Db::apply_generated_title`] 字段级写入(PLAN 7.4:草稿/leaf
+    /// 更新不得携带旧 title 全量覆盖)。
     pub fn upsert_conversation(&self, c: &Conversation) -> Result<()> {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO conversations
-                (id, title, group_id, system_prompt, main_leaf_id, draft, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (id, title, group_id, system_prompt, main_leaf_id, draft,
+                 draft_attachments_json, created_at, updated_at,
+                 title_source, title_status, title_revision, title_attempt_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
-                title = ?2, group_id = ?3, system_prompt = ?4,
-                main_leaf_id = ?5, draft = ?6, updated_at = ?8",
+                group_id = ?3, system_prompt = ?4,
+                main_leaf_id = ?5, draft = ?6, draft_attachments_json = ?7, updated_at = ?9",
             rusqlite::params![
                 c.id.as_str(),
                 c.title,
@@ -200,11 +218,251 @@ impl Db {
                 c.system_prompt,
                 c.main_leaf_id.map(|m| m.as_str()),
                 c.draft,
+                serde_json::to_string(&c.draft_attachments)?,
                 c.created_at.timestamp_millis(),
                 chrono::Utc::now().timestamp_millis(),
+                c.title_source.as_str(),
+                c.title_status.as_str(),
+                c.title_revision,
+                c.title_attempt_count,
             ],
         )?;
         Ok(())
+    }
+
+    /// 手动改名:字段级 + 乐观锁。成功返回权威状态;版本不符返回 None。
+    pub fn rename_conversation_title(
+        &self,
+        id: ConversationId,
+        title: &str,
+        expected_revision: i64,
+    ) -> Result<Option<Conversation>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE conversations SET
+                title = ?2, title_source = 'manual', title_status = 'ready',
+                title_revision = title_revision + 1, updated_at = ?3
+             WHERE id = ?1 AND title_revision = ?4",
+            rusqlite::params![id.as_str(), title, now_ms(), expected_revision],
+        )?;
+        let conv = if n > 0 {
+            Some(read_conversation(&tx, id)?)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(conv)
+    }
+
+    /// 自动标题落库:仅在版本匹配且来源仍允许自动时写入。
+    /// 迟到的旧结果(CAS 失败)返回 None,不覆盖手动标题(T07)。
+    pub fn apply_generated_title(
+        &self,
+        id: ConversationId,
+        expected_revision: i64,
+        title: &str,
+    ) -> Result<Option<Conversation>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE conversations SET
+                title = ?2, title_source = 'generated', title_status = 'ready',
+                title_revision = title_revision + 1
+             WHERE id = ?1 AND title_revision = ?3
+               AND title_source IN ('empty','fallback')
+               AND title_status = 'in_flight'",
+            rusqlite::params![id.as_str(), title, expected_revision],
+        )?;
+        let conv = if n > 0 {
+            Some(read_conversation(&tx, id)?)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(conv)
+    }
+
+    /// fallback 标题:仅来源允许自动时写入(首问落库后立即调用,7.2)。
+    pub fn set_fallback_title(
+        &self,
+        id: ConversationId,
+        title: &str,
+    ) -> Result<Option<Conversation>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE conversations SET
+                title = ?2, title_source = 'fallback',
+                title_revision = title_revision + 1, updated_at = ?3
+             WHERE id = ?1 AND title_source IN ('empty','fallback')",
+            rusqlite::params![id.as_str(), title, now_ms()],
+        )?;
+        let conv = if n > 0 {
+            Some(read_conversation(&tx, id)?)
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(conv)
+    }
+
+    /// 标题尝试登记:in_flight + auxiliary_requests 唯一约束(事务)。
+    /// 返回 false = 已有在途/登记冲突(同 turn 去重)。
+    pub fn begin_title_attempt(
+        &self,
+        id: ConversationId,
+        turn_id: Option<&str>,
+        token: &str,
+        model: &str,
+        expected_revision: i64,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE conversations SET title_status = 'in_flight',
+                title_attempt_count = title_attempt_count + 1,
+                title_attempted_at = ?2
+             WHERE id = ?1 AND title_revision = ?3 AND title_status = 'needs_generation'",
+            rusqlite::params![id.as_str(), now_ms(), expected_revision],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO auxiliary_requests
+                (request_token, conversation_id, purpose, turn_id, provider, model,
+                 status, started_at, cost_status)
+             VALUES (?1, ?2, 'title', ?3, 'deepseek', ?4, 'in_flight', ?5, 'unknown')",
+            rusqlite::params![token, id.as_str(), turn_id, model, now_ms()],
+        )?;
+        if inserted == 0 {
+            // 唯一冲突:回滚整个尝试
+            return Ok(false);
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// 标题请求失败:恢复 needs_generation(下次提问再试),记录错误类别。
+    pub fn fail_title_attempt(
+        &self,
+        id: ConversationId,
+        token: &str,
+        error_kind: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE conversations SET title_status = 'needs_generation'
+             WHERE id = ?1 AND title_status = 'in_flight'",
+            [id.as_str()],
+        )?;
+        tx.execute(
+            "UPDATE auxiliary_requests SET status = 'failed', finished_at = ?2,
+                error_kind = ?3, cost_status = 'unknown'
+             WHERE request_token = ?1",
+            rusqlite::params![token, now_ms(), error_kind],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 标题请求成功后的台账收尾(标题本体由 apply_generated_title 写)。
+    pub fn complete_aux_request(
+        &self,
+        token: &str,
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        cost_text: Option<String>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE auxiliary_requests SET status = 'completed', finished_at = ?2,
+                prompt_tokens = ?3, completion_tokens = ?4,
+                cost_text = ?5, cost_status = CASE WHEN ?5 IS NULL THEN 'unknown' ELSE 'known' END
+             WHERE request_token = ?1",
+            rusqlite::params![token, now_ms(), prompt_tokens, completion_tokens, cost_text],
+        )?;
+        Ok(())
+    }
+
+    /// 重启恢复:in_flight 标题 → needs_generation(不自动立即重试,7.2);
+    /// 在途辅助请求记为 interrupted 失败。
+    pub fn recover_title_in_flight(&self) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE conversations SET title_status = 'needs_generation'
+             WHERE title_status = 'in_flight'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE auxiliary_requests SET status = 'failed', finished_at = ?1,
+                error_kind = 'interrupted'
+             WHERE status = 'in_flight'",
+            [now_ms()],
+        )?;
+        Ok(n)
+    }
+
+    /// 辅助请求用量(标题调用;UI 用量详情)。
+    pub fn aux_usage_of(&self, conversation: ConversationId) -> Result<Vec<AuxRequestRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT request_token, purpose, turn_id, provider, model, status,
+                    started_at, finished_at, prompt_tokens, completion_tokens,
+                    cost_text, cost_status, error_kind
+             FROM auxiliary_requests WHERE conversation_id = ?1 ORDER BY started_at",
+        )?;
+        let rows = stmt
+            .query_map([conversation.as_str()], |r| {
+                Ok(AuxRequestRecord {
+                    request_token: r.get(0)?,
+                    purpose: r.get(1)?,
+                    turn_id: r.get(2)?,
+                    provider: r.get(3)?,
+                    model: r.get(4)?,
+                    status: r.get(5)?,
+                    started_at: r.get::<_, i64>(6)?,
+                    finished_at: r.get::<_, Option<i64>>(7)?,
+                    prompt_tokens: r.get(8)?,
+                    completion_tokens: r.get(9)?,
+                    cost_text: r.get(10)?,
+                    cost_status: r.get(11)?,
+                    error_kind: r.get(12)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 模型使用排名(PLAN 6):有效已启用模型内按“到达 Started 的人工
+    /// 聊天请求数”降序;同次数按最近使用;再按模型 ID 稳定排序。
+    /// 标题等辅助请求独立台账,不参与本排名;并行各路各计一次(每
+    /// generation 一行);重试是新 generation 行,按实际发生计。
+    pub fn model_usage_rank(
+        &self,
+        provider: crate::domain::ProviderId,
+    ) -> Result<Vec<(String, i64, Option<i64>)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT g.model_id, COUNT(*) AS used, MAX(g.started_at) AS last_used
+             FROM generations g
+             JOIN send_batches b ON b.id = g.batch_id
+             WHERE g.provider_id = ?1 AND g.started_at IS NOT NULL
+             GROUP BY g.model_id
+             ORDER BY used DESC, last_used DESC, g.model_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([provider.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn delete_conversation(&self, id: ConversationId) -> Result<()> {
@@ -213,19 +471,69 @@ impl Db {
         Ok(())
     }
 
+    // ----- 会话字段级更新(不携带 title / draft / leaf 互相覆盖,7.4) -----
+
+    pub fn set_conversation_draft(
+        &self,
+        id: ConversationId,
+        draft: &str,
+        attachments_json: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE conversations SET draft = ?2, draft_attachments_json = ?3,
+                updated_at = ?4
+             WHERE id = ?1",
+            rusqlite::params![id.as_str(), draft, attachments_json, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_conversation_main_leaf(
+        &self,
+        id: ConversationId,
+        leaf: Option<MessageId>,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id.as_str(), leaf.map(|m| m.as_str()), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_conversation_group(&self, id: ConversationId, group: Option<GroupId>) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE conversations SET group_id = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id.as_str(), group.map(|g| g.as_str()), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_conversation_system_prompt(&self, id: ConversationId, prompt: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE conversations SET system_prompt = ?2, updated_at = ?3 WHERE id = ?1",
+            rusqlite::params![id.as_str(), prompt, now_ms()],
+        )?;
+        Ok(())
+    }
+
     // ----- 消息 -----
 
     pub fn insert_message(&self, m: &Message) -> Result<()> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO messages(id, conversation_id, parent_id, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO messages(id, conversation_id, parent_id, role, content, attachments_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 m.id.as_str(),
                 m.conversation_id.as_str(),
                 m.parent_id.map(|p| p.as_str()),
                 m.role.as_str(),
                 m.content,
+                serde_json::to_string(&m.attachments)?,
                 m.created_at.timestamp_millis(),
             ],
         )?;
@@ -236,7 +544,7 @@ impl Db {
     pub fn messages_of(&self, conversation: ConversationId) -> Result<Vec<Message>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, parent_id, role, content, created_at
+            "SELECT id, conversation_id, parent_id, role, content, attachments_json, created_at
              FROM messages WHERE conversation_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt
@@ -250,7 +558,11 @@ impl Db {
                     role: crate::domain::Role::from_str(&r.get::<_, String>(3)?)
                         .unwrap_or(crate::domain::Role::User),
                     content: r.get(4)?,
-                    created_at: ms_to_dt(r.get(5)?),
+                    attachments: r
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    created_at: ms_to_dt(r.get(6)?),
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -285,14 +597,15 @@ impl Db {
         )?;
         for m in rec.user_messages.iter().chain(&rec.assistant_messages) {
             tx.execute(
-                "INSERT INTO messages(id, conversation_id, parent_id, role, content, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO messages(id, conversation_id, parent_id, role, content, attachments_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     m.id.as_str(),
                     m.conversation_id.as_str(),
                     m.parent_id.map(|p| p.as_str()),
                     m.role.as_str(),
                     m.content,
+                    serde_json::to_string(&m.attachments)?,
                     m.created_at.timestamp_millis(),
                 ],
             )?;
@@ -303,8 +616,10 @@ impl Db {
                     (request_id, batch_id, user_message_id, assistant_message_id,
                      provider_id, model_id, status, params_json, system_prompt,
                      context_json, price_json, remote_generation_id, error, retry_of,
+                     failure_json, request_snapshot_json, retry_root_id,
+                     retry_not_before_ms, dispatch_phase,
                      started_at, finished_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 rusqlite::params![
                     g.request_id.as_str(),
                     g.batch_id.as_str(),
@@ -327,6 +642,14 @@ impl Db {
                     g.remote_generation_id,
                     g.error,
                     g.retry_of.map(|r| r.as_str()),
+                    g.failure.as_ref().map(|f| f.to_json()),
+                    g.request_snapshot
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                    g.retry_root_id.map(|r| r.as_str()),
+                    g.retry_not_before_ms,
+                    g.dispatch_phase.as_str(),
                     g.started_at.map(|t| t.timestamp_millis()),
                     g.finished_at.map(|t| t.timestamp_millis()),
                 ],
@@ -341,10 +664,36 @@ impl Db {
                 rusqlite::params![u.request_id.as_str(), u.remote_generation_id],
             )?;
         }
+        // 事务内一并保存 intended main_leaf(CAS;失败不移动)
+        if let Some((expected, new)) = &rec.intended_main_leaf {
+            match expected {
+                Some(exp) => {
+                    tx.execute(
+                        "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3
+                         WHERE id = ?1 AND main_leaf_id = ?4",
+                        rusqlite::params![
+                            rec.conversation_id.as_str(),
+                            new.as_str(),
+                            now_ms(),
+                            exp.as_str()
+                        ],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3
+                         WHERE id = ?1 AND main_leaf_id IS NULL",
+                        rusqlite::params![rec.conversation_id.as_str(), new.as_str(), now_ms()],
+                    )?;
+                }
+            }
+        }
         tx.commit()?;
         Ok(())
     }
 
+    /// 非终态推进(queued→connecting→streaming):无条件写状态,
+    /// started_at 只补不覆盖。
     pub fn update_generation_status(
         &self,
         request: GenerationId,
@@ -364,13 +713,219 @@ impl Db {
         Ok(())
     }
 
+    /// 终态 CAS:只有活动态可转终态;重复终态不覆盖 finished_at、
+    /// 不抹掉 error。返回是否发生了转换(首个终态)。
+    pub fn finish_generation(
+        &self,
+        request: GenerationId,
+        status: crate::domain::GenerationStatus,
+        error: Option<&str>,
+        failure_json: Option<&str>,
+        retry_not_before_ms: Option<i64>,
+        remote_generation_id: Option<&str>,
+    ) -> Result<bool> {
+        debug_assert!(status.is_terminal());
+        let conn = self.lock();
+        let now = now_ms();
+        let n = conn.execute(
+            "UPDATE generations SET
+                status = ?2,
+                error = COALESCE(?3, error),
+                failure_json = COALESCE(?4, failure_json),
+                retry_not_before_ms = COALESCE(?5, retry_not_before_ms),
+                remote_generation_id = COALESCE(?6, remote_generation_id),
+                finished_at = ?7
+             WHERE request_id = ?1 AND status IN ('queued','connecting','streaming')",
+            rusqlite::params![
+                request.as_str(),
+                status.as_str(),
+                error,
+                failure_json,
+                retry_not_before_ms,
+                remote_generation_id,
+                now
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 请求阶段推进(DispatchAttempted 起 may_be_billed)。
+    pub fn set_dispatch_phase(
+        &self,
+        request: GenerationId,
+        phase: crate::domain::DispatchPhase,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE generations SET dispatch_phase = ?2 WHERE request_id = ?1
+             AND (dispatch_phase = 'not_dispatched' OR ?2 = 'remote_accepted')",
+            rusqlite::params![request.as_str(), phase.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// main_leaf CAS:期望当前值列表任一匹配才移动(None 期望 = 当前为
+    /// NULL)。晚到的完成/重试回执不得抢回用户已移动的分支。
+    pub fn cas_main_leaf(
+        &self,
+        conversation: ConversationId,
+        expected: CasExpectation<'_>,
+        new: MessageId,
+    ) -> Result<bool> {
+        let conn = self.lock();
+        let n = match expected {
+            CasExpectation::Null => conn.execute(
+                "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3
+                 WHERE id = ?1 AND main_leaf_id IS NULL",
+                rusqlite::params![conversation.as_str(), new.as_str(), now_ms()],
+            )?,
+            CasExpectation::AnyOf(ids) => {
+                let list = ids
+                    .iter()
+                    .map(|i| format!("'{}'", i.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute(
+                    &format!(
+                        "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3
+                         WHERE id = ?1 AND main_leaf_id IN ({list})"
+                    ),
+                    rusqlite::params![conversation.as_str(), new.as_str(), now_ms()],
+                )?
+            }
+        };
+        Ok(n > 0)
+    }
+
+    /// 当前 main_leaf(读取,CAS 判定用)。
+    pub fn main_leaf_of(&self, conversation: ConversationId) -> Result<Option<MessageId>> {
+        let conn = self.lock();
+        let v = conn
+            .query_row(
+                "SELECT main_leaf_id FROM conversations WHERE id = ?1",
+                [conversation.as_str()],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?
+            .flatten();
+        Ok(v.map(|s| MessageId::from_uuid_str(s.as_str())))
+    }
+
+    /// lineage 是否有活动尝试(防重兜底;与唯一索引配合)。
+    pub fn lineage_has_active(&self, root: GenerationId) -> Result<bool> {
+        let conn = self.lock();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM generations
+             WHERE retry_root_id = ?1 AND status IN ('queued','connecting','streaming')",
+            [root.as_str()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// lineage 最新一次失败(冷却/补救计算用最新持久数据)。
+    pub fn lineage_latest_failure(
+        &self,
+        root: GenerationId,
+    ) -> Result<Option<crate::domain::FailureInfo>> {
+        let conn = self.lock();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT failure_json FROM generations
+                 WHERE retry_root_id = ?1 AND failure_json IS NOT NULL
+                 ORDER BY COALESCE(finished_at, started_at, 0) DESC LIMIT 1",
+                [root.as_str()],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(v.as_deref().and_then(crate::domain::FailureInfo::from_json))
+    }
+
+    /// lineage 尝试次数(退避指数输入;含原请求)。
+    pub fn lineage_attempt_count(&self, root: GenerationId) -> Result<u32> {
+        let conn = self.lock();
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM generations WHERE retry_root_id = ?1",
+            [root.as_str()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(n.clamp(0, u32::MAX as i64) as u32)
+    }
+
+    /// 按请求定位其 lineage 尝试次数(失败写入时计算退避用)。
+    pub fn lineage_attempt_count_of(&self, request: GenerationId) -> Result<Option<u32>> {
+        let conn = self.lock();
+        let root: Option<String> = conn
+            .query_row(
+                "SELECT retry_root_id FROM generations WHERE request_id = ?1",
+                [request.as_str()],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let Some(root) = root else {
+            return Ok(None);
+        };
+        let n = conn.query_row(
+            "SELECT COUNT(*) FROM generations WHERE retry_root_id = ?1",
+            [root],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(Some(n.clamp(0, u32::MAX as i64) as u32))
+    }
+
+    /// 本地未发送的失败:用量不留 pending("费用查询中")。
+    pub fn mark_usage_unavailable(&self, request: GenerationId, _note: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE usage_records SET status = 'unavailable', queried_at = ?2
+             WHERE request_id = ?1 AND status = 'pending'",
+            rusqlite::params![request.as_str(), now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// 按 lineage 根聚合(重试尝试展示)。
+    pub fn generations_of_lineage(
+        &self,
+        root: GenerationId,
+    ) -> Result<Vec<(GenerationId, crate::domain::GenerationStatus)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT request_id, status FROM generations
+             WHERE retry_root_id = ?1 ORDER BY COALESCE(started_at, 0), request_id",
+        )?;
+        let rows = stmt
+            .query_map([root.as_str()], |r| {
+                Ok((
+                    GenerationId::from_uuid_str(r.get::<_, String>(0)?.as_str()),
+                    crate::domain::GenerationStatus::from_str(&r.get::<_, String>(1)?)
+                        .unwrap_or(crate::domain::GenerationStatus::Interrupted),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn generations_of(&self, conversation: ConversationId) -> Result<Vec<Generation>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT g.request_id, g.batch_id, g.user_message_id, g.assistant_message_id,
                     g.provider_id, g.model_id, g.status, g.params_json, g.system_prompt,
                     g.context_json, g.price_json, g.remote_generation_id, g.error, g.retry_of,
-                    g.started_at, g.finished_at
+                    g.started_at, g.finished_at, g.failure_json, g.request_snapshot_json,
+                    g.retry_root_id, g.retry_not_before_ms, g.dispatch_phase
              FROM generations g
              JOIN send_batches b ON b.id = g.batch_id
              WHERE b.conversation_id = ?1
@@ -389,7 +944,8 @@ impl Db {
             "SELECT g.request_id, g.batch_id, g.user_message_id, g.assistant_message_id,
                     g.provider_id, g.model_id, g.status, g.params_json, g.system_prompt,
                     g.context_json, g.price_json, g.remote_generation_id, g.error, g.retry_of,
-                    g.started_at, g.finished_at
+                    g.started_at, g.finished_at, g.failure_json, g.request_snapshot_json,
+                    g.retry_root_id, g.retry_not_before_ms, g.dispatch_phase
              FROM generations g WHERE g.assistant_message_id = ?1
              ORDER BY g.started_at DESC LIMIT 1",
         )?;
@@ -544,6 +1100,173 @@ impl Db {
         Ok(rows)
     }
 
+    // ----- 目录与偏好 -----
+
+    /// 提供方注册(内置 OpenRouter 幂等存在)。
+    pub fn ensure_provider(
+        &self,
+        id: crate::domain::ProviderId,
+        kind: &str,
+        base_url: &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO providers(id, kind, base_url, credential_ref) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET kind = ?2, base_url = ?3",
+            rusqlite::params![id.as_str(), kind, base_url, "openrouter"],
+        )?;
+        Ok(())
+    }
+
+    /// 原子替换目录缓存(单事务;失败保留旧数据)。
+    pub fn replace_catalog(
+        &self,
+        provider: crate::domain::ProviderId,
+        entries: &[crate::providers::CatalogEntry],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM catalog_models WHERE provider_id = ?1",
+            [provider.as_str()],
+        )?;
+        let mut stmt = tx.prepare(
+            "INSERT INTO catalog_models
+                (provider_id, model_id, name, context_window, max_output,
+                 pricing_json, capabilities_json, defaults_json, available, updated_at, raw_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'{}')",
+        )?;
+        for e in entries {
+            stmt.execute(rusqlite::params![
+                provider.as_str(),
+                e.model_id,
+                e.name,
+                e.context_window,
+                e.max_output,
+                serde_json::to_string(&e.pricing)?,
+                serde_json::to_string(&e.capabilities)?,
+                e.server_defaults.as_ref().map(|v| v.to_string()),
+                e.available,
+                now.timestamp_millis(),
+            ])?;
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn catalog(
+        &self,
+        provider: crate::domain::ProviderId,
+    ) -> Result<Vec<crate::providers::CatalogEntry>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model_id, name, context_window, max_output, pricing_json,
+                    capabilities_json, defaults_json, available
+             FROM catalog_models WHERE provider_id = ?1 ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([provider.as_str()], |r| {
+                Ok(crate::providers::CatalogEntry {
+                    model_id: r.get(0)?,
+                    name: r.get(1)?,
+                    context_window: r.get(2)?,
+                    max_output: r.get(3)?,
+                    pricing: r
+                        .get::<_, Option<String>>(4)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    capabilities: r
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    server_defaults: r
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    available: r.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn catalog_updated_at(
+        &self,
+        provider: crate::domain::ProviderId,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let conn = self.lock();
+        let v = conn
+            .query_row(
+                "SELECT MAX(updated_at) FROM catalog_models WHERE provider_id = ?1",
+                [provider.as_str()],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .unwrap_or(None);
+        Ok(v.map(ms_to_dt))
+    }
+
+    pub fn upsert_preference(
+        &self,
+        provider: crate::domain::ProviderId,
+        model: &str,
+        pref: &crate::providers::catalog::ModelPreference,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO model_preferences(provider_id, model_id, enabled, sort_order, is_default, overrides_json)
+             VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(provider_id, model_id) DO UPDATE SET
+                enabled = ?3, sort_order = ?4, is_default = ?5, overrides_json = ?6",
+            rusqlite::params![
+                provider.as_str(),
+                model,
+                pref.enabled,
+                pref.sort_order,
+                pref.is_default,
+                pref.overrides.as_ref().map(|v| v.to_string()),
+            ],
+        )?;
+        if pref.is_default {
+            // 唯一默认
+            tx.execute(
+                "UPDATE model_preferences SET is_default = 0
+                 WHERE provider_id = ?1 AND model_id != ?2",
+                rusqlite::params![provider.as_str(), model],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn preferences(
+        &self,
+        provider: crate::domain::ProviderId,
+    ) -> Result<Vec<(String, crate::providers::catalog::ModelPreference)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT model_id, enabled, sort_order, is_default, overrides_json
+             FROM model_preferences WHERE provider_id = ?1 ORDER BY sort_order",
+        )?;
+        let rows = stmt
+            .query_map([provider.as_str()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    crate::providers::catalog::ModelPreference {
+                        enabled: r.get::<_, i64>(1)? != 0,
+                        sort_order: r.get(2)?,
+                        is_default: r.get::<_, i64>(3)? != 0,
+                        overrides: r
+                            .get::<_, Option<String>>(4)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     // ----- UI 状态 -----
 
     pub fn set_ui_state(&self, key: &str, value: &serde_json::Value) -> Result<()> {
@@ -574,10 +1297,72 @@ impl Db {
     }
 }
 
+/// 辅助请求台账行(标题等;与普通聊天 generations 分离,PLAN 7.1)。
+#[derive(Debug, Clone)]
+pub struct AuxRequestRecord {
+    pub request_token: String,
+    pub purpose: String,
+    pub turn_id: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub cost_text: Option<String>,
+    pub cost_status: String,
+    pub error_kind: Option<String>,
+}
+
+fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> {
+    Ok(Conversation {
+        id: ConversationId::from_uuid_str(r.get::<_, String>(0)?.as_str()),
+        title: r.get(1)?,
+        group_id: r
+            .get::<_, Option<String>>(2)?
+            .map(|s| GroupId::from_uuid_str(s.as_str())),
+        system_prompt: r.get(3)?,
+        main_leaf_id: r
+            .get::<_, Option<String>>(4)?
+            .map(|s| MessageId::from_uuid_str(s.as_str())),
+        draft: r.get(5)?,
+        draft_attachments: r
+            .get::<_, Option<String>>(6)?
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        created_at: ms_to_dt(r.get(7)?),
+        updated_at: ms_to_dt(r.get(8)?),
+        title_source: crate::domain::TitleSource::from_str(&r.get::<_, String>(9)?)
+            .unwrap_or_default(),
+        title_status: crate::domain::TitleStatus::from_str(&r.get::<_, String>(10)?)
+            .unwrap_or_default(),
+        title_revision: r.get(11)?,
+        title_attempt_count: r.get(12)?,
+    })
+}
+
+/// 事务内读取单会话(改名/自动标题落库后取权威状态)。
+fn read_conversation(
+    tx: &rusqlite::Transaction<'_>,
+    id: ConversationId,
+) -> rusqlite::Result<Conversation> {
+    tx.query_row(
+        "SELECT id, title, group_id, system_prompt, main_leaf_id, draft,
+                draft_attachments_json, created_at, updated_at,
+                title_source, title_status, title_revision, title_attempt_count
+         FROM conversations WHERE id = ?1",
+        [id.as_str()],
+        row_to_conversation,
+    )
+}
+
 fn row_to_generation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Generation> {
     let ctx: String = r.get(9)?;
     let ctx_ids: Vec<String> = serde_json::from_str(&ctx).unwrap_or_default();
     let price_json: Option<String> = r.get(10)?;
+    let failure_json: Option<String> = r.get(16)?;
+    let snapshot_json: Option<String> = r.get(17)?;
     Ok(Generation {
         request_id: GenerationId::from_uuid_str(r.get::<_, String>(0)?.as_str()),
         batch_id: BatchId::from_uuid_str(r.get::<_, String>(1)?.as_str()),
@@ -603,7 +1388,29 @@ fn row_to_generation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Generation> {
             .map(|s| GenerationId::from_uuid_str(s.as_str())),
         started_at: r.get::<_, Option<i64>>(14)?.map(ms_to_dt),
         finished_at: r.get::<_, Option<i64>>(15)?.map(ms_to_dt),
+        // 新列(0004):读取失败安全降级,不阻止会话读取
+        retry_root_id: r
+            .get::<_, Option<String>>(18)?
+            .map(|s| GenerationId::from_uuid_str(s.as_str())),
+        failure: failure_json
+            .as_deref()
+            .and_then(crate::domain::FailureInfo::from_json),
+        request_snapshot: snapshot_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok()),
+        retry_not_before_ms: r.get(19)?,
+        dispatch_phase: crate::domain::DispatchPhase::from_str(
+            &r.get::<_, Option<String>>(20)?.unwrap_or_default(),
+        ),
     })
+}
+
+/// main_leaf CAS 期望。
+pub enum CasExpectation<'a> {
+    /// 当前必须为 NULL。
+    Null,
+    /// 当前值在列表内任一匹配。
+    AnyOf(&'a [MessageId]),
 }
 
 fn row_to_usage(r: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {

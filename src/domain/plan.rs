@@ -6,8 +6,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::attachment::{compose_prompt, Attachment};
 use super::ids::{BatchId, ConversationId, GenerationId, MessageId, ProviderId};
 use super::money::Pricing;
+use super::recovery::{DispatchPhase, FailureInfo};
 
 /// 一次生成的完整快照(Generation 实体)。
 #[derive(Debug, Clone)]
@@ -29,10 +31,39 @@ pub struct Generation {
     pub price_snapshot: Option<Pricing>,
     /// OpenRouter generation ID(补查费用用)。
     pub remote_generation_id: Option<String>,
+    /// 错误简述(旧字段;保留兼容)。结构化详情在 failure。
     pub error: Option<String>,
     pub retry_of: Option<GenerationId>,
+    /// lineage 根(原样重试防重粒度;原请求 root 为自己)。
+    pub retry_root_id: Option<GenerationId>,
+    /// 结构化失败信息(版本化 JSON;读取失败安全降级)。
+    pub failure: Option<FailureInfo>,
+    /// 完整可重放请求快照(身份字段与内容字段分离;不含凭据)。
+    pub request_snapshot: Option<RequestSnapshot>,
+    /// 冷却截止(epoch 毫秒;服务端与 UI 以最新持久数据计算资格)。
+    pub retry_not_before_ms: Option<i64>,
+    /// 请求阶段(NotDispatched 才能确定未调用生成接口)。
+    pub dispatch_phase: DispatchPhase,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// 完整可重放请求快照:原样重试默认沿用此内容;
+/// 不含 Key、Authorization、网络凭据。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestSnapshot {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// 有序上下文(不含本轮 user/system)。
+    pub history: Vec<ContextMessage>,
+    /// 本轮 user 最终文本(附件已拼接)。
+    pub prompt: String,
+    /// 上下文消息 ID 顺序(审计)。
+    pub context_ids: Vec<String>,
 }
 
 /// 续聊选择:发送前用户确定的分支与目标模型集合。
@@ -71,7 +102,10 @@ pub struct ModelTarget {
 #[derive(Debug, Clone)]
 pub struct SendPlan {
     pub conversation_id: ConversationId,
+    /// 本轮 user 原始输入(不含附件文本)。
     pub prompt: String,
+    /// 本轮纯文本附件(发送时由 [`compose_prompt`] 拼接;P7B)。
+    pub attachments: Vec<Attachment>,
     pub system_prompt: Option<String>,
     /// 每个分支:父叶子 + 该分支下的请求。共享 user 节点时 len==1。
     pub branches: Vec<PlannedBranch>,
@@ -98,8 +132,11 @@ pub struct PlannedRequest {
     pub model_id: String,
     pub params: Option<serde_json::Value>,
     pub price_snapshot: Option<Pricing>,
-    /// 已按分支历史构建的有序上下文(不含本轮 user/system)。
+    /// 已按分支历史构建的有序上下文(不含本轮 user/system;
+    /// 空失败占位已过滤)。
     pub history: Vec<ContextMessage>,
+    /// 分支祖先链消息 ID(审计快照;含被过滤的占位)。
+    pub context_ids: Vec<MessageId>,
 }
 
 /// 发往提供方的消息。
@@ -129,37 +166,53 @@ impl ContextMessage {
 pub struct Planner;
 
 impl Planner {
-    /// `build_history`:某分支叶子的根→叶子有序历史。
-    fn build_history(
+    /// 分支上下文:根→叶子有序历史 + 完整祖先链 ID(审计)。
+    /// user 消息按 P7B 把附件拼接进 content(追问轮上下文可见附件)。
+    /// 状态感知:assistant 仅在有实际内容时进入上下文——空失败/取消/
+    /// 中断占位与旧空 Completed 都被过滤(B3;错误说明绝不进模型上下文);
+    /// 部分输出保留(B4)。展示树与导出不受此过滤影响(5.5(3))。
+    fn branch_context(
         tree: &super::MessageTree,
         leaf: Option<MessageId>,
-    ) -> Result<Vec<ContextMessage>, super::DomainError> {
+    ) -> Result<(Vec<ContextMessage>, Vec<MessageId>), super::DomainError> {
         let Some(leaf) = leaf else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let path = tree.path_from_root(leaf)?;
-        Ok(path
-            .into_iter()
+        let history = path
+            .iter()
             .filter_map(|id| {
-                tree.get(id).map(|m| ContextMessage {
+                let m = tree.get(*id)?;
+                if m.role == super::Role::Assistant && m.content.trim().is_empty() {
+                    return None; // 空占位:不把"未回答"伪装成已回答
+                }
+                let content = if m.role == super::Role::User {
+                    compose_prompt(&m.content, &m.attachments)
+                } else {
+                    m.content.clone()
+                };
+                Some(ContextMessage {
                     role: m.role.as_str().to_string(),
-                    content: m.content.clone(),
+                    content,
                 })
             })
-            .collect())
+            .collect();
+        Ok((history, path))
     }
 
     /// 生成发送计划。`history_provider` 负责给出分支历史(通常为
     /// ContextBuilder + 存储读取的组合,测试中可直接传树)。
+    /// `prompt` 与 `attachments` 均为空才视为无效。
     pub fn prepare(
         conversation_id: ConversationId,
         selection: &ContinuationSelection,
         prompt: &str,
+        attachments: &[Attachment],
         system_prompt: Option<String>,
         tree: &super::MessageTree,
         now: DateTime<Utc>,
     ) -> Result<SendPlan, super::DomainError> {
-        if prompt.trim().is_empty() {
+        if prompt.trim().is_empty() && attachments.is_empty() {
             return Err(super::DomainError::Invalid("提示词为空".into()));
         }
 
@@ -172,7 +225,7 @@ impl Planner {
                 provider_id,
                 model_id,
             } => {
-                let history = Self::build_history(tree, *leaf)?;
+                let (history, context_ids) = Self::branch_context(tree, *leaf)?;
                 branches.push(PlannedBranch {
                     parent_leaf: *leaf,
                     user_message_id: MessageId::new(),
@@ -183,6 +236,7 @@ impl Planner {
                         params: None,
                         price_snapshot: None,
                         history,
+                        context_ids,
                     }],
                 });
             }
@@ -198,7 +252,7 @@ impl Planner {
                     return Err(super::DomainError::Invalid("主模型索引越界".into()));
                 }
                 // 所有请求使用同一历史(同一 user 节点)
-                let history = Self::build_history(tree, *leaf)?;
+                let (history, context_ids) = Self::branch_context(tree, *leaf)?;
                 let user_message_id = MessageId::new();
                 let requests = targets
                     .iter()
@@ -209,6 +263,7 @@ impl Planner {
                         params: t.params.clone(),
                         price_snapshot: t.price,
                         history: history.clone(),
+                        context_ids: context_ids.clone(),
                     })
                     .collect();
                 branches.push(PlannedBranch {
@@ -238,7 +293,7 @@ impl Planner {
                     }
                 }
                 for (leaf, target) in sel {
-                    let history = Self::build_history(tree, Some(*leaf))?;
+                    let (history, context_ids) = Self::branch_context(tree, Some(*leaf))?;
                     branches.push(PlannedBranch {
                         parent_leaf: Some(*leaf),
                         user_message_id: MessageId::new(),
@@ -249,6 +304,7 @@ impl Planner {
                             params: target.params.clone(),
                             price_snapshot: target.price,
                             history,
+                            context_ids,
                         }],
                     });
                 }
@@ -259,11 +315,25 @@ impl Planner {
         Ok(SendPlan {
             conversation_id,
             prompt: prompt.to_string(),
+            attachments: attachments.to_vec(),
             system_prompt,
             branches,
             primary,
             created_at: now,
         })
+    }
+
+    /// 重试兜底上下文:该 user 节点之前的祖先链(过滤空 assistant)。
+    /// 服务层默认使用持久化快照;此函数仅用于旧数据无快照时的
+    /// "按现有历史重新生成"(不用导出工具构建 retry 上下文,5)。
+    pub fn history_before(
+        tree: &super::MessageTree,
+        user_message_id: MessageId,
+    ) -> Vec<ContextMessage> {
+        let parent = tree.get(user_message_id).and_then(|m| m.parent_id);
+        Self::branch_context(tree, parent)
+            .map(|(h, _)| h)
+            .unwrap_or_default()
     }
 
     /// 原样重试:沿用原请求内容(模型/参数/上下文不变),新 request_id。
@@ -276,6 +346,7 @@ impl Planner {
             params: req.params.clone(),
             price_snapshot: req.price_snapshot,
             history: req.history.clone(),
+            context_ids: req.context_ids.clone(),
         }
     }
 }
@@ -303,6 +374,7 @@ mod tests {
                 parent_id: parent,
                 role,
                 content: content.to_string(),
+                attachments: Vec::new(),
                 created_at: now,
             })
             .unwrap();
@@ -330,6 +402,7 @@ mod tests {
                 model_id: "m".into(),
             },
             "Q2",
+            &[],
             None,
             &tree,
             Utc::now(),
@@ -355,6 +428,7 @@ mod tests {
                 primary: 0,
             },
             "Q2",
+            &[],
             None,
             &tree,
             Utc::now(),
@@ -385,6 +459,7 @@ mod tests {
                 primary: 2,
             },
             "Q2",
+            &[],
             None,
             &tree,
             Utc::now(),
@@ -408,6 +483,7 @@ mod tests {
                 primary: 0,
             },
             "Q2",
+            &[],
             None,
             &tree,
             Utc::now(),
@@ -426,6 +502,7 @@ mod tests {
                 model_id: "m".into(),
             },
             "Q2",
+            &[],
             None,
             &tree,
             Utc::now(),
@@ -448,10 +525,137 @@ mod tests {
                 model_id: "m".into(),
             },
             "   ",
+            &[],
             None,
             &tree,
             Utc::now(),
         );
         assert!(matches!(err, Err(DomainError::Invalid(_))));
+    }
+
+    #[test]
+    fn attachments_without_prompt_accepted() {
+        let (tree, _, a1, _) = tree_qab();
+        let plan = Planner::prepare(
+            ConversationId::new(),
+            &ContinuationSelection::Single {
+                leaf: Some(a1),
+                provider_id: ProviderId::new(),
+                model_id: "m".into(),
+            },
+            "",
+            &[crate::domain::Attachment {
+                name: "n.txt".into(),
+                content: "c".into(),
+            }],
+            None,
+            &tree,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(plan.branches.len(), 1);
+        assert_eq!(plan.attachments.len(), 1);
+    }
+
+    #[test]
+    fn empty_assistant_placeholder_filtered_from_history() {
+        // B3:U1 + 空失败 A1,随后 U2 —— 上下文不含空 assistant;
+        // B4:有部分内容的失败 assistant 保留
+        let mut tree = super::super::MessageTree::new();
+        let conv = ConversationId::new();
+        let u1 = MessageId::new();
+        let a1 = MessageId::new();
+        let now = Utc::now();
+        for (id, parent, role, content) in [
+            (u1, None, Role::User, "U1"),
+            (a1, Some(u1), Role::Assistant, ""),
+        ] {
+            tree.insert(Message {
+                id,
+                conversation_id: conv,
+                parent_id: parent,
+                role,
+                content: content.to_string(),
+                attachments: Vec::new(),
+                created_at: now,
+            })
+            .unwrap();
+        }
+        let plan = Planner::prepare(
+            conv,
+            &ContinuationSelection::Single {
+                leaf: Some(a1),
+                provider_id: ProviderId::new(),
+                model_id: "m".into(),
+            },
+            "U2",
+            &[],
+            None,
+            &tree,
+            Utc::now(),
+        )
+        .unwrap();
+        let hist = &plan.branches[0].requests[0].history;
+        assert_eq!(hist.len(), 1, "空失败占位不进上下文");
+        assert_eq!(hist[0].content, "U1");
+
+        // 部分内容保留
+        let mut m = tree.messages.get_mut(&a1).unwrap().clone();
+        m.content = "部分回答".into();
+        tree.messages.insert(a1, m);
+        let plan = Planner::prepare(
+            conv,
+            &ContinuationSelection::Single {
+                leaf: Some(a1),
+                provider_id: ProviderId::new(),
+                model_id: "m".into(),
+            },
+            "U2",
+            &[],
+            None,
+            &tree,
+            Utc::now(),
+        )
+        .unwrap();
+        let hist = &plan.branches[0].requests[0].history;
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[1].content, "部分回答");
+    }
+
+    #[test]
+    fn history_composes_user_attachments() {
+        let (mut tree, _, a1, _) = tree_qab();
+        // 给根 user 节点(Q)挂附件
+        let root = tree.path_from_root(a1).unwrap()[0];
+        let mut m = tree.messages.get(&root).unwrap().clone();
+        m.attachments = vec![crate::domain::Attachment {
+            name: "a.txt".into(),
+            content: "附件正文".into(),
+        }];
+        tree.messages.insert(root, m);
+
+        let plan = Planner::prepare(
+            ConversationId::new(),
+            &ContinuationSelection::Single {
+                leaf: Some(a1),
+                provider_id: ProviderId::new(),
+                model_id: "m".into(),
+            },
+            "追问",
+            &[],
+            None,
+            &tree,
+            Utc::now(),
+        )
+        .unwrap();
+        let hist = &plan.branches[0].requests[0].history;
+        assert!(
+            hist[0].content.contains("===== 附件 1: a.txt ====="),
+            "{}",
+            hist[0].content
+        );
+        assert!(hist[0].content.contains("附件正文"));
+        // 本轮附件独立于历史附件
+        assert!(plan.attachments.is_empty());
     }
 }

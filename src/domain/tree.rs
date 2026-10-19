@@ -23,8 +23,91 @@ pub struct Conversation {
     pub main_leaf_id: Option<MessageId>,
     /// 输入框草稿。
     pub draft: String,
+    /// 输入区待发送附件草稿(P7B)。
+    pub draft_attachments: Vec<super::attachment::Attachment>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 标题来源(自动标题服务,PLAN 7.1)。
+    pub title_source: TitleSource,
+    /// 标题状态。
+    pub title_status: TitleStatus,
+    /// 标题版本(手动/自动写入的乐观锁)。
+    pub title_revision: i64,
+    /// 已尝试的标题请求次数(退避与上限判断)。
+    pub title_attempt_count: i64,
+}
+
+/// 标题来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitleSource {
+    /// 空(尚无标题)。
+    #[default]
+    Empty,
+    /// 首问 fallback。
+    Fallback,
+    /// 自动生成成功。
+    Generated,
+    /// 手动命名(始终优先)。
+    Manual,
+}
+
+impl TitleSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Fallback => "fallback",
+            Self::Generated => "generated",
+            Self::Manual => "manual",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "empty" => Self::Empty,
+            "fallback" => Self::Fallback,
+            "generated" => Self::Generated,
+            "manual" => Self::Manual,
+            _ => return None,
+        })
+    }
+
+    /// 自动标题允许覆盖的来源。
+    pub fn allows_auto(&self) -> bool {
+        matches!(self, Self::Empty | Self::Fallback)
+    }
+}
+
+/// 标题状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitleStatus {
+    /// 需要生成(等下一次提问)。
+    #[default]
+    NeedsGeneration,
+    /// 在途(重启后恢复为 needs_generation)。
+    InFlight,
+    /// 已定(手动或生成成功)。
+    Ready,
+}
+
+impl TitleStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NeedsGeneration => "needs_generation",
+            Self::InFlight => "in_flight",
+            Self::Ready => "ready",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "needs_generation" => Self::NeedsGeneration,
+            "in_flight" => Self::InFlight,
+            "ready" => Self::Ready,
+            _ => return None,
+        })
+    }
 }
 
 impl Conversation {
@@ -36,8 +119,13 @@ impl Conversation {
             system_prompt: String::new(),
             main_leaf_id: None,
             draft: String::new(),
+            draft_attachments: Vec::new(),
             created_at: now,
             updated_at: now,
+            title_source: TitleSource::Empty,
+            title_status: TitleStatus::NeedsGeneration,
+            title_revision: 0,
+            title_attempt_count: 0,
         }
     }
 }
@@ -51,6 +139,8 @@ pub struct Message {
     pub role: super::Role,
     /// 原始 content(assistant 为累积的 Markdown;中断时保留部分文本)。
     pub content: String,
+    /// user 消息的纯文本附件(P7B;发送时拼接进 prompt)。
+    pub attachments: Vec<super::attachment::Attachment>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -193,6 +283,7 @@ mod tests {
             parent_id: parent,
             role,
             content: String::new(),
+            attachments: Vec::new(),
             created_at: Utc::now(),
         }
     }

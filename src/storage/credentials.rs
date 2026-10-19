@@ -1,5 +1,5 @@
-//! API Key 凭据存储:系统凭据库(keyring)优先,不可用时支持
-//! 仅当前进程输入(P1.3)。任何情况下不落明文文件。
+//! API Key 凭据存储:Windows 使用 DPAPI 加密文件并可导入旧 keyring；
+//! 其他平台仅保留于当前进程。任何情况下不落明文文件。
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -15,14 +15,14 @@ pub trait CredentialStore: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CredentialError {
-    /// 系统凭据库不可用(未解锁/服务缺失);可回退进程内输入。
-    #[error("系统凭据存储不可用: {0}")]
+    /// 加密存储不可用；仅当前进程缓存有效。
+    #[error("安全凭据存储不可用: {0}")]
     Backend(String),
     #[error("未找到条目")]
     NotFound,
 }
 
-/// 系统凭据库实现(Windows 凭据管理器 / macOS 钥匙串 / Linux secret service)。
+/// 旧版系统凭据库读取适配器，仅用于 Windows 首次导入。
 pub struct SystemCredentials;
 
 impl CredentialStore for SystemCredentials {
@@ -88,12 +88,13 @@ impl CredentialStore for ProcessCredentials {
     }
 }
 
-/// 组合:系统库优先,失败读进程内;保存时尝试系统库,失败则进程内。
+/// Windows 使用本地 DPAPI 文件，其他平台使用仅进程内存储。
 pub struct CredentialVault {
     system: SystemCredentials,
     process: ProcessCredentials,
     /// 系统库是否可用(首次探测结果缓存)。
     system_available: Mutex<Option<bool>>,
+    local_file: Option<std::path::PathBuf>,
 }
 
 impl CredentialVault {
@@ -102,10 +103,42 @@ impl CredentialVault {
             system: SystemCredentials,
             process: ProcessCredentials::new(),
             system_available: Mutex::new(None),
+            local_file: crate::storage::repo::data_dir()
+                .ok()
+                .map(|p| p.join("credentials.dpapi")),
         }
     }
 
-    /// 探测系统凭据库是否可用(用一个探测条目)。
+    #[cfg(windows)]
+    fn read_local(&self) -> Result<Option<HashMap<String, String>>, CredentialError> {
+        let Some(path) = &self.local_file else {
+            return Ok(None);
+        };
+        let encrypted = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(CredentialError::Backend(e.to_string())),
+        };
+        let plain = dpapi_unprotect(&encrypted).map_err(CredentialError::Backend)?;
+        serde_json::from_slice(&plain)
+            .map(Some)
+            .map_err(|e| CredentialError::Backend(e.to_string()))
+    }
+
+    #[cfg(windows)]
+    fn write_local(&self, values: &HashMap<String, String>) -> Result<(), CredentialError> {
+        let Some(path) = &self.local_file else {
+            return Err(CredentialError::Backend("exe 数据目录不可用".into()));
+        };
+        let plain =
+            serde_json::to_vec(values).map_err(|e| CredentialError::Backend(e.to_string()))?;
+        let encrypted = dpapi_protect(&plain).map_err(CredentialError::Backend)?;
+        let tmp = path.with_extension("dpapi.tmp");
+        std::fs::write(&tmp, encrypted).map_err(|e| CredentialError::Backend(e.to_string()))?;
+        std::fs::rename(tmp, path).map_err(|e| CredentialError::Backend(e.to_string()))
+    }
+
+    /// 检测旧版凭据后端是否可用。
     pub fn system_available(&self) -> bool {
         let mut flag = self
             .system_available
@@ -125,40 +158,159 @@ impl CredentialVault {
     }
 
     pub fn save(&self, provider_ref: &str, key: &str) -> Result<bool, CredentialError> {
-        if self.system_available() {
-            match self.system.save(provider_ref, key) {
-                Ok(()) => return Ok(true),
-                Err(_) => {
-                    // 系统库运行中失效:回退进程内并标记不可用
-                    *self
-                        .system_available
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = Some(false);
-                }
-            }
+        #[cfg(windows)]
+        {
+            self.process.save(provider_ref, key)?;
+            let mut values = match self.read_local() {
+                Ok(Some(values)) => values,
+                Ok(None) => HashMap::new(),
+                Err(_) => return Ok(false),
+            };
+            values.insert(provider_ref.to_string(), key.to_string());
+            Ok(self.write_local(&values).is_ok())
         }
-        self.process.save(provider_ref, key)?;
-        Ok(false)
+        #[cfg(not(windows))]
+        {
+            self.process.save(provider_ref, key)?;
+            Ok(false)
+        }
     }
 
     /// 读取:进程内优先(用户本次显式输入),否则系统库。
     pub fn load(&self, provider_ref: &str) -> Result<Option<String>, CredentialError> {
-        if let Some(k) = self.process.load(provider_ref)? {
-            return Ok(Some(k));
+        #[cfg(windows)]
+        {
+            if let Some(key) = self.process.load(provider_ref)? {
+                return Ok(Some(key));
+            }
+            if let Ok(Some(values)) = self.read_local() {
+                return Ok(values.get(provider_ref).cloned());
+            }
+            if std::env::var_os("AICOUNCIL_DATA_DIR").is_some()
+                || std::env::var_os("AICOUNCIL_DEMO_MODE").is_some()
+            {
+                return Ok(None);
+            }
+            // One-time import from the legacy Windows Credential Manager. The
+            // encrypted local file becomes authoritative after the first save.
+            let legacy = self.system.load(provider_ref)?;
+            if let Some(key) = &legacy {
+                let _ = self.save(provider_ref, key)?;
+            }
+            Ok(legacy)
         }
-        if self.system_available() {
-            return self.system.load(provider_ref);
+        #[cfg(not(windows))]
+        {
+            if let Some(k) = self.process.load(provider_ref)? {
+                return Ok(Some(k));
+            }
+            Ok(None)
         }
-        Ok(None)
     }
 
     pub fn delete(&self, provider_ref: &str) -> Result<(), CredentialError> {
         self.process.delete(provider_ref)?;
-        if self.system_available() {
-            self.system.delete(provider_ref)?;
+        #[cfg(windows)]
+        {
+            let mut values = match self.read_local() {
+                Ok(Some(values)) => values,
+                Ok(None) => HashMap::new(),
+                Err(error) => return Err(error),
+            };
+            values.remove(provider_ref);
+            self.write_local(&values)
         }
-        Ok(())
+        #[cfg(not(windows))]
+        {
+            Ok(())
+        }
     }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct DataBlob {
+    size: u32,
+    data: *mut u8,
+}
+
+#[cfg(windows)]
+#[link(name = "Crypt32")]
+unsafe extern "system" {
+    fn CryptProtectData(
+        input: *const DataBlob,
+        description: *const u16,
+        entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *mut std::ffi::c_void,
+        flags: u32,
+        output: *mut DataBlob,
+    ) -> i32;
+    fn CryptUnprotectData(
+        input: *const DataBlob,
+        description: *mut *mut u16,
+        entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *mut std::ffi::c_void,
+        flags: u32,
+        output: *mut DataBlob,
+    ) -> i32;
+}
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(windows)]
+fn dpapi_protect(input: &[u8]) -> Result<Vec<u8>, String> {
+    dpapi(input, true)
+}
+#[cfg(windows)]
+fn dpapi_unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
+    dpapi(input, false)
+}
+#[cfg(windows)]
+fn dpapi(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
+    let source = DataBlob {
+        size: input.len() as u32,
+        data: input.as_ptr() as *mut u8,
+    };
+    let mut output = DataBlob {
+        size: 0,
+        data: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &source,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &source,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut output,
+            )
+        }
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(output.data, output.size as usize).to_vec() };
+    unsafe {
+        LocalFree(output.data.cast());
+    }
+    Ok(bytes)
 }
 
 impl Default for CredentialVault {
@@ -184,10 +336,27 @@ mod tests {
     #[test]
     fn vault_prefers_process_input() {
         // CI/无钥匙串环境下 system_available() 为 false,进程内路径生效
-        let v = CredentialVault::new();
+        let dir = tempfile::tempdir().unwrap();
+        let v = CredentialVault {
+            system: SystemCredentials,
+            process: ProcessCredentials::new(),
+            system_available: Mutex::new(Some(false)),
+            local_file: Some(dir.path().join("credentials.dpapi")),
+        };
         v.save("p1", "sk-x").unwrap();
         assert_eq!(v.load("p1").unwrap().as_deref(), Some("sk-x"));
         v.delete("p1").unwrap();
         assert!(v.load("p1").unwrap().is_none());
+        drop(v);
+        drop(dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_roundtrip_is_encrypted() {
+        let plain = b"a fake test credential";
+        let encrypted = dpapi_protect(plain).unwrap();
+        assert_ne!(encrypted, plain);
+        assert_eq!(dpapi_unprotect(&encrypted).unwrap(), plain);
     }
 }

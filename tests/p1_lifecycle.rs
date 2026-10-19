@@ -35,6 +35,7 @@ fn persist_plan(db: &Db, plan: &aicouncil::domain::SendPlan) -> BatchId {
             parent_id: b.parent_leaf,
             role: Role::User,
             content: plan.prompt.clone(),
+            attachments: plan.attachments.clone(),
             created_at: now,
         };
         users.push(user);
@@ -46,6 +47,7 @@ fn persist_plan(db: &Db, plan: &aicouncil::domain::SendPlan) -> BatchId {
                 parent_id: Some(b.user_message_id),
                 role: Role::Assistant,
                 content: String::new(),
+                attachments: Vec::new(),
                 created_at: now,
             });
             generations.push(Generation {
@@ -63,6 +65,11 @@ fn persist_plan(db: &Db, plan: &aicouncil::domain::SendPlan) -> BatchId {
                 remote_generation_id: None,
                 error: None,
                 retry_of: None,
+                retry_root_id: Some(req.request_id),
+                failure: None,
+                request_snapshot: None,
+                retry_not_before_ms: None,
+                dispatch_phase: aicouncil::domain::DispatchPhase::NotDispatched,
                 started_at: None,
                 finished_at: None,
             });
@@ -79,6 +86,7 @@ fn persist_plan(db: &Db, plan: &aicouncil::domain::SendPlan) -> BatchId {
         assistant_messages: assistants,
         generations,
         usage,
+        intended_main_leaf: None,
     })
     .expect("批次落库");
     batch
@@ -106,6 +114,7 @@ fn full_branch_lifecycle_roundtrip() {
             model_id: "openrouter/auto".into(),
         },
         "Q",
+        &[],
         Some("你是助手".into()),
         &MessageTree::new(),
         Utc::now(),
@@ -140,6 +149,7 @@ fn full_branch_lifecycle_roundtrip() {
             primary: 0,
         },
         "Q2",
+        &[],
         None,
         &tree,
         Utc::now(),
@@ -174,6 +184,7 @@ fn full_branch_lifecycle_roundtrip() {
             primary: 0,
         },
         "Q3",
+        &[],
         None,
         &tree,
         Utc::now(),
@@ -226,6 +237,7 @@ fn restart_recovery_marks_interrupted() {
             model_id: "m".into(),
         },
         "Q",
+        &[],
         None,
         &MessageTree::new(),
         Utc::now(),
@@ -264,6 +276,7 @@ fn usage_upsert_idempotent_and_no_regression() {
             model_id: "m".into(),
         },
         "Q",
+        &[],
         None,
         &MessageTree::new(),
         Utc::now(),
@@ -326,6 +339,7 @@ fn transaction_rollback_on_bad_parent() {
         parent_id: Some(MessageId::new()), // 不存在的父
         role: Role::User,
         content: "Q".into(),
+        attachments: Vec::new(),
         created_at: now,
     };
     let rec = SendBatchRecord {
@@ -336,6 +350,7 @@ fn transaction_rollback_on_bad_parent() {
         assistant_messages: vec![],
         generations: vec![],
         usage: vec![],
+        intended_main_leaf: None,
     };
     assert!(db.save_send_batch(&rec).is_err(), "外键应拒绝");
     // 整体回滚:批次未写入

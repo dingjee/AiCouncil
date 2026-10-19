@@ -9,6 +9,11 @@
 //!   `ui`       — 聊天、右侧栏、分组、模型管理、设置(P3+)
 //!   `app`      — UI 状态与后台事件桥接(P3+)
 
+pub mod app;
 pub mod domain;
+pub mod providers;
 pub mod render;
+pub mod services;
 pub mod storage;
+/// 共享 UI 令牌(render 与 app 共同依赖;禁止 render → app)。
+pub mod ui_style;

@@ -5,14 +5,23 @@
 //! - 时间一律 UTC(epoch 毫秒存储);金额用十进制定点,禁止浮点累计。
 //! - 密钥与 Authorization 不进入本层任何结构。
 
+pub mod attachment;
 pub mod ids;
+pub mod model_identity;
 pub mod money;
 pub mod plan;
+pub mod recovery;
 pub mod tree;
 
+pub use attachment::{compose_prompt, Attachment};
 pub use ids::*;
-pub use money::{CostSource, Pricing, UsageRecord, UsageStatus};
+pub use model_identity::{developer_of, is_anthropic, presentation, Developer, ModelPresentation};
+pub use money::{CostSource, CostSummary, Pricing, UsageRecord, UsageStatus};
 pub use plan::*;
+pub use recovery::{
+    apply_backoff, backoff_delay_ms, retry_decision, DispatchPhase, FailureInfo, FailureKind,
+    Remedy, RetryDecision,
+};
 pub use tree::*;
 
 /// 领域错误。

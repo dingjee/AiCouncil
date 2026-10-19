@@ -39,6 +39,7 @@ enum Message {
     ResetStream,
     InputChanged(String),
     LinkClicked(String),
+    Nop,
 }
 
 struct Probe {
@@ -93,9 +94,24 @@ impl Probe {
     fn new() -> (Self, Task<Message>) {
         let style = RenderStyle::light();
         let mut cache = MathCache::new();
-        let fixture_msg = render::render_message(FIXTURE, &style, &mut cache);
-        let stress_msg = render::render_message(&stress_doc(), &style, &mut cache);
-        let stream_msg = render::render_message("", &style, &mut cache);
+        let fixture_msg = render::render_message(
+            FIXTURE,
+            &style,
+            aicouncil::render::md::ParsePolicy::LlmCompatible,
+            &mut cache,
+        );
+        let stress_msg = render::render_message(
+            &stress_doc(),
+            &style,
+            aicouncil::render::md::ParsePolicy::LlmCompatible,
+            &mut cache,
+        );
+        let stream_msg = render::render_message(
+            "",
+            &style,
+            aicouncil::render::md::ParsePolicy::LlmCompatible,
+            &mut cache,
+        );
         (
             Self {
                 fixture_msg,
@@ -118,17 +134,28 @@ impl Probe {
                     self.stream_pos += 2.min(chunks.len() - self.stream_pos);
                     let src: String = chunks[..self.stream_pos].concat();
                     let mut cache = std::mem::take(&mut self.math_cache);
-                    self.stream_msg = render::render_message(&src, &self.style, &mut cache);
+                    self.stream_msg = render::render_message(
+                        &src,
+                        &self.style,
+                        aicouncil::render::md::ParsePolicy::LlmCompatible,
+                        &mut cache,
+                    );
                     self.math_cache = cache;
                 }
             }
             Message::ResetStream => {
                 self.stream_pos = 0;
                 let mut cache = std::mem::take(&mut self.math_cache);
-                self.stream_msg = render::render_message("", &self.style, &mut cache);
+                self.stream_msg = render::render_message(
+                    "",
+                    &self.style,
+                    aicouncil::render::md::ParsePolicy::LlmCompatible,
+                    &mut cache,
+                );
                 self.math_cache = cache;
             }
             Message::InputChanged(s) => self.input = s,
+            Message::Nop => {}
             Message::LinkClicked(url) => {
                 tracing::info!(%url, "链接点击");
             }
@@ -139,9 +166,15 @@ impl Probe {
     fn view(&self) -> Element<'_, Message> {
         let style = self.style;
         let on_link: view::OnLink<'_, Message> = Arc::new(|url: String| Message::LinkClicked(url));
-        let fixture = view::view_message(&self.fixture_msg, style, on_link.clone());
-        let stress = view::view_message(&self.stress_msg, style, on_link.clone());
-        let stream = view::view_message(&self.stream_msg, style, on_link);
+        let hooks = || aicouncil::render::flow::SelectionHooks::<Message> {
+            on_start: std::sync::Arc::new(|_, _| Message::Nop),
+            on_extend: std::sync::Arc::new(|_, _| Message::Nop),
+            on_finish: std::sync::Arc::new(|| Message::Nop),
+            on_range: std::sync::Arc::new(|_, _, _| Message::Nop),
+        };
+        let fixture = view::view_message(&self.fixture_msg, style, None, hooks(), on_link.clone());
+        let stress = view::view_message(&self.stress_msg, style, None, hooks(), on_link.clone());
+        let stream = view::view_message(&self.stream_msg, style, None, hooks(), on_link);
 
         let stream_indicator = if self.stream_pos >= stream_chunks().len() {
             "(流式完成)".to_string()

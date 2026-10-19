@@ -1,18 +1,35 @@
 //! Markdown 解析(含 LaTeX 公式定界符识别)→ 块级 IR。
 //!
-//! 设计要点:
-//! - **占位符预处理**:pulldown-cmark 会把 `\[`、`\(`、`\,` 等转义
-//!   拆散成多个 Text 事件并做反转义,无法在事件文本上识别公式定界符。
-//!   因此先把源文中的公式区域替换为私用区占位符(U+E000…U+E003),
-//!   解析后再还原为 [`Part::Math`] / [`Part::DisplayMath`]。
-//! - 代码保护:围栏代码块整块跳过;行内代码 span(等长反引号对)跳过;
-//!   缩进代码块在事件层还原占位符。`\$` 转义为字面美元。
+//! 设计要点(PLAN 4.1 / 4.3):
+//! - **占位符预处理**:pulldown-cmark 会把 `\[`、`\(` 等转义拆散,
+//!   因此先把源文中的公式区域替换为私用区占位符(U+E000…U+E002),
+//!   解析后还原为 [`Part::Math`] / [`Part::DisplayMath`]。
+//! - **公式保真**:每个公式同时保存 `raw`(含**原始定界符**的源文,
+//!   供复制投影)与 `tex`(渲染用内部内容);`align → aligned` 等兼容
+//!   变换只发生在渲染缓存键,绝不回写或影响复制。
+//! - **解析策略**:[`ParsePolicy::Strict`] 为 CommonMark 基线(用户原文);
+//!   [`ParsePolicy::LlmCompatible`] 针对 assistant 输出追加保守的
+//!   中文标点边界 `**…**` 强调识别(见 `compat_emphasis`),只放宽
+//!   实测确认的情况,不做全局 regex,不跨容器配对。
+//! - **表格**:parser 给出的每行按列数保存 cell,空 cell 不删除。
 //! - `$$…$$` 与 `\[…\]` 在段落完成时拆分为独立的 [`Block::MathBlock`];
-//!   未闭合的定界符保持字面(流式输出回退,R2)。
+//!   未闭合的定界符保持字面(流式输出回退)。
 //! - 货币保护规则(KaTeX/pandoc 兼容):开 `$` 后不能是空白;闭 `$`
 //!   前不能是空白、后不能是数字。
+//! - SoftBreak / HardBreak 分别建模:显示与复制投影都由此派生,
+//!   不再统一折叠成空格。
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+/// 解析策略(版本化;LlmCompatible 仅对 assistant 正文启用)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ParsePolicy {
+    /// CommonMark 基线(用户原文默认)。
+    #[default]
+    Strict,
+    /// assistant 输出:在严格基线上追加保守兼容规则。
+    LlmCompatible,
+}
 
 /// 块级文档。
 #[derive(Debug, Clone, Default)]
@@ -42,6 +59,9 @@ pub enum Block {
         rows: Vec<Vec<Inlines>>, // 首行为表头
     },
     MathBlock {
+        /// 含原始定界符的完整源文(复制用)。
+        raw: String,
+        /// 内部内容(渲染用)。
         tex: String,
     },
 }
@@ -59,22 +79,21 @@ pub enum Align {
 #[derive(Debug, Clone, Default)]
 pub struct Inlines {
     pub parts: Vec<Part>,
-    /// 是否含行内公式(决定走 MathFlow 还是 rich_text 快路径)。
+    /// 是否含行内公式(决定走 MathFlow 还是纯文本快路径)。
     pub has_math: bool,
 }
 
 impl Inlines {
+    /// 可见文本投影:粗体/链接取内容,实体为解码后字符(pulldown 已解),
+    /// 行内代码取内容,公式取含原始定界符的源文。非"删除所有 Markdown 符号"。
     pub fn plain_text(&self) -> String {
         let mut s = String::new();
         for p in &self.parts {
             match p {
                 Part::Text { content, .. } => s.push_str(content),
-                Part::Math { tex, .. } => {
-                    s.push('$');
-                    s.push_str(tex);
-                    s.push('$');
-                }
-                _ => {}
+                Part::SoftBreak => s.push(' '),
+                Part::HardBreak => s.push('\n'),
+                Part::Math { raw, .. } | Part::DisplayMath { raw, .. } => s.push_str(raw),
             }
         }
         s
@@ -87,11 +106,18 @@ pub enum Part {
         style: Style,
         content: String,
     },
+    /// 软换行(源文单个换行;显示为空格)。
+    SoftBreak,
+    /// 硬换行(行尾两空格/反斜杠;显示为换行)。
+    HardBreak,
+    /// 行内公式:raw 含原始定界符($…$ 或 \(…\)),tex 为内部内容。
     Math {
+        raw: String,
         tex: String,
     },
-    /// 段落内出现的块级公式标记($$…$$ / \[…\]),段落结束时拆分。
+    /// 段落内出现的块级公式($$…$$ / \[…\]),段落结束时拆分。
     DisplayMath {
+        raw: String,
         tex: String,
     },
 }
@@ -106,7 +132,7 @@ pub struct Style {
 }
 
 /// 解析 Markdown 源文为块级 IR。
-pub fn parse(markdown: &str) -> Document {
+pub fn parse(markdown: &str, policy: ParsePolicy) -> Document {
     let mut o = Options::empty();
     o.insert(Options::ENABLE_TABLES);
     o.insert(Options::ENABLE_STRIKETHROUGH);
@@ -125,7 +151,218 @@ pub fn parse(markdown: &str) -> Document {
     for event in parser {
         builder.event(event);
     }
-    builder.finish()
+    let mut doc = builder.finish();
+    if policy == ParsePolicy::LlmCompatible {
+        compat_emphasis(&mut doc);
+    }
+    doc
+}
+
+// ---------------------------------------------------------------------------
+// LlmCompatible:保守的中文标点边界强调识别(4.3)
+// ---------------------------------------------------------------------------
+
+/// 对解析后仍保持字面的 `**…**` 做保守补识别。
+///
+/// CommonMark 的 delimiter flanking 规则导致紧邻中文标点/引号的
+/// `**` 无法开合(实测:`借用**"X"**的机制` 无 bold)。此处理只在
+/// **同一个已解析 Text part 内部**寻找成对 `**`,且要求:
+/// - 内容非空、无换行、内部不含 `**`;
+/// - 内容首尾非空白;
+/// - 开或闭定界符紧邻 CJK 字符(开侧:前为 CJK 字符且后为 Unicode
+///   标点;闭侧:前为 Unicode 标点且后为 CJK 字符)——正是严格规则
+///   判失败而人眼认定强调的组合;
+/// - 所在 part 不在代码/链接上下文。
+///
+/// 不跨 part、不跨段落、不猜测未闭合结尾;单星、下划线、`##标题`、
+/// 乘法等歧义场景一律不触碰。输入每字符只作有限次扫描。
+fn compat_emphasis(doc: &mut Document) {
+    for block in &mut doc.blocks {
+        compat_block(block);
+    }
+}
+
+fn compat_block(block: &mut Block) {
+    match block {
+        Block::Paragraph(inlines) => compat_inlines(inlines),
+        Block::Heading { inlines, .. } => compat_inlines(inlines),
+        Block::Quote(inner) => {
+            for b in inner {
+                compat_block(b);
+            }
+        }
+        Block::List { items, .. } => {
+            for blocks in items {
+                for b in blocks {
+                    compat_block(b);
+                }
+            }
+        }
+        Block::Table { rows, .. } => {
+            for row in rows {
+                for cell in row {
+                    compat_inlines(cell);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compat_inlines(inlines: &mut Inlines) {
+    // pulldown 会把未解释的 `*` 拆成独立 Text 事件;先合并相邻同样式
+    // 的纯文本 part(渲染语义不变),再做同 part 内配对。
+    let mut merged: Vec<Part> = Vec::with_capacity(inlines.parts.len());
+    for part in inlines.parts.drain(..) {
+        match (merged.last_mut(), part) {
+            (
+                Some(Part::Text {
+                    style: s_prev,
+                    content: c_prev,
+                }),
+                Part::Text {
+                    style: s_cur,
+                    content: c_cur,
+                },
+            ) if *s_prev == s_cur && !s_prev.code && s_prev.link.is_none() => {
+                c_prev.push_str(&c_cur);
+            }
+            (_, other) => merged.push(other),
+        }
+    }
+    inlines.parts = merged;
+    let mut idx = 0;
+    while idx < inlines.parts.len() {
+        let Part::Text { style, content } = &inlines.parts[idx] else {
+            idx += 1;
+            continue;
+        };
+        if style.code || style.link.is_some() {
+            idx += 1;
+            continue;
+        }
+        match compat_text(content) {
+            Some((head, body, tail)) => {
+                let base = style.clone();
+                let mut replacement = Vec::with_capacity(3);
+                if !head.is_empty() {
+                    replacement.push(Part::Text {
+                        style: base.clone(),
+                        content: head,
+                    });
+                }
+                if !body.is_empty() {
+                    replacement.push(Part::Text {
+                        style: Style {
+                            bold: true,
+                            ..base.clone()
+                        },
+                        content: body,
+                    });
+                }
+                if !tail.is_empty() {
+                    replacement.push(Part::Text {
+                        style: base,
+                        content: tail,
+                    });
+                }
+                let n = replacement.len();
+                inlines.parts.splice(idx..idx + 1, replacement);
+                idx += n;
+            }
+            None => idx += 1,
+        }
+    }
+}
+
+/// 兼容扫描的一条实现:把 `text` 拆为 (前段, bold 内容, 后段)。
+/// 至多处理第一对符合条件的定界符(其余留待后续版本,复杂度有界)。
+fn compat_text(text: &str) -> Option<(String, String, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    // 找所有 `**` 位置(char index)
+    let mut stars = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] == '*' && chars[i + 1] == '*' {
+            stars.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if stars.len() < 2 {
+        return None;
+    }
+    for w in stars.windows(2) {
+        let (open, close) = (w[0], w[1]);
+        // 廉价检查先行,避免病态输入的重复分配(复杂度合同 4.3)
+        let mut has_forbidden = false;
+        for &c in &chars[open + 2..close] {
+            if c == '*' || c == '\n' {
+                has_forbidden = true;
+                break;
+            }
+        }
+        if has_forbidden {
+            continue;
+        }
+        let content: Vec<char> = chars[open + 2..close].to_vec();
+        if content.is_empty() {
+            continue;
+        }
+        if content.first().is_some_and(|c| c.is_whitespace())
+            || content.last().is_some_and(|c| c.is_whitespace())
+        {
+            continue;
+        }
+        let before_open = if open == 0 {
+            None
+        } else {
+            Some(chars[open - 1])
+        };
+        let after_open = content.first().copied();
+        let before_close = content.last().copied();
+        let after_close = chars.get(close + 2).copied();
+        // 开侧:前为 CJK 字符 且 后为 Unicode 标点
+        let open_side = matches!(before_open, Some(c) if is_cjk_ish(c))
+            && matches!(after_open, Some(c) if is_unicode_punct(c));
+        // 闭侧:前为 Unicode 标点 且 后为 CJK 字符
+        let close_side = matches!(before_close, Some(c) if is_unicode_punct(c))
+            && matches!(after_close, Some(c) if is_cjk_ish(c));
+        if open_side || close_side {
+            let head: String = chars[..open].iter().collect();
+            let body: String = content.iter().collect();
+            let tail: String = chars[close + 2..].iter().collect();
+            return Some((head, body, tail));
+        }
+    }
+    None
+}
+
+/// CJK 表意/扩展A/日文(与 flow::is_cjk 同口径,另含全角标点由 punct 覆盖)。
+fn is_cjk_ish(c: char) -> bool {
+    matches!(c as u32,
+        0x4E00..=0x9FFF
+        | 0x3400..=0x4DBF
+        | 0x3040..=0x30FF
+        | 0xFF00..=0xFFEF
+    )
+}
+
+/// Unicode 标点(CommonMark 定义:P* 类 + 符号子集;此处取常用闭集,
+/// 覆盖中英引号/括号/逗号句号等实测组合)。
+fn is_unicode_punct(c: char) -> bool {
+    c.is_ascii_punctuation()
+        || matches!(c as u32,
+            0x2013..=0x2022 // – — ‘ ’ “ ” •
+            | 0x2026        // …
+            | 0x2032..=0x2035
+            | 0x3001..=0x3011 // 、。〝〞〈〉《》「」『』【】
+            | 0xFF01..=0xFF0F // !＂#＄%＆'()*+,-./
+            | 0xFF1A..=0xFF20 // :;<=>?＠
+            | 0xFF3B..=0xFF40 // [\]^_`
+            | 0xFF5B..=0xFF65 // {|}~〃
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -139,18 +376,32 @@ const LITERAL_DOLLAR: char = '\u{E002}';
 
 #[derive(Debug, Clone)]
 enum Stashed {
-    Inline(String),
-    Display(String),
+    Inline { tex: String, raw: String },
+    Display { tex: String, raw: String },
 }
 
-/// 把公式区域替换为占位符,并暂存公式源文。
+/// 把公式区域替换为占位符,并暂存公式源文(raw 含原始定界符)。
 fn protect_math(src: &str) -> (String, Vec<Stashed>) {
     let mut out = String::with_capacity(src.len());
     let mut stash: Vec<Stashed> = Vec::new();
 
-    let stash_push = |out: &mut String, stash: &mut Vec<Stashed>, item: Stashed| {
+    let stash_push = |out: &mut String,
+                      stash: &mut Vec<Stashed>,
+                      tex: String,
+                      delim_open: &str,
+                      delim_close: &str| {
         let idx = stash.len();
-        stash.push(item);
+        // 行内: $…$ 与 \(…\);块级: $$…$$ 与 \[…\]
+        stash.push(match delim_open {
+            "$" | "\\(" => Stashed::Inline {
+                raw: format!("{delim_open}{tex}{delim_close}"),
+                tex,
+            },
+            _ => Stashed::Display {
+                raw: format!("{delim_open}{tex}{delim_close}"),
+                tex,
+            },
+        });
         out.push(PH_OPEN);
         out.push_str(&idx.to_string());
         out.push(PH_CLOSE);
@@ -233,11 +484,8 @@ fn protect_math(src: &str) -> (String, Vec<Stashed>) {
                     }
                     b'[' => {
                         if let Some(close) = find_sub(bytes, i + 2, b"\\]") {
-                            stash_push(
-                                &mut out,
-                                &mut stash,
-                                Stashed::Display(src[i + 2..close].to_string()),
-                            );
+                            let tex = src[i + 2..close].to_string();
+                            stash_push(&mut out, &mut stash, tex, "\\[", "\\]");
                             i = close + 2;
                         } else {
                             out.push('\\');
@@ -252,7 +500,8 @@ fn protect_math(src: &str) -> (String, Vec<Stashed>) {
                                 out.push('\\');
                                 i += 1;
                             } else {
-                                stash_push(&mut out, &mut stash, Stashed::Inline(tex.to_string()));
+                                let tex = tex.to_string();
+                                stash_push(&mut out, &mut stash, tex, "\\(", "\\)");
                                 i = close + 2;
                             }
                         } else {
@@ -275,7 +524,8 @@ fn protect_math(src: &str) -> (String, Vec<Stashed>) {
                             out.push_str("$$");
                             i += 2;
                         } else {
-                            stash_push(&mut out, &mut stash, Stashed::Display(tex.to_string()));
+                            let tex = tex.to_string();
+                            stash_push(&mut out, &mut stash, tex, "$$", "$$");
                             i = close + 2;
                         }
                     } else {
@@ -283,7 +533,7 @@ fn protect_math(src: &str) -> (String, Vec<Stashed>) {
                         i += 2;
                     }
                 } else if let Some((close, tex)) = match_inline_dollars(bytes, i) {
-                    stash_push(&mut out, &mut stash, Stashed::Inline(tex));
+                    stash_push(&mut out, &mut stash, tex, "$", "$");
                     i = close + 1;
                 } else {
                     out.push('$');
@@ -407,9 +657,17 @@ fn split_placeholders(text: &str, stash: &[Stashed]) -> Vec<Part> {
                         });
                     }
                     match stash.get(idx) {
-                        Some(Stashed::Inline(tex)) => parts.push(Part::Math { tex: tex.clone() }),
-                        Some(Stashed::Display(tex)) => {
-                            parts.push(Part::DisplayMath { tex: tex.clone() })
+                        Some(Stashed::Inline { tex, raw }) => {
+                            parts.push(Part::Math {
+                                tex: tex.clone(),
+                                raw: raw.clone(),
+                            });
+                        }
+                        Some(Stashed::Display { tex, raw }) => {
+                            parts.push(Part::DisplayMath {
+                                tex: tex.clone(),
+                                raw: raw.clone(),
+                            });
                         }
                         None => {}
                     }
@@ -431,7 +689,7 @@ fn split_placeholders(text: &str, stash: &[Stashed]) -> Vec<Part> {
     parts
 }
 
-/// 代码内容中的占位符还原为原始源文(代码块不解析公式,R2)。
+/// 代码内容中的占位符还原为原始源文(代码块不解析公式)。
 fn restore_code(text: &str, stash: &[Stashed]) -> String {
     if !text.contains(PH_OPEN) && !text.contains(LITERAL_DOLLAR) {
         return text.to_string();
@@ -453,16 +711,12 @@ fn restore_code(text: &str, stash: &[Stashed]) -> String {
                 if closed {
                     if let Ok(idx) = idx_str.parse::<usize>() {
                         match stash.get(idx) {
-                            Some(Stashed::Inline(tex)) => {
-                                out.push('$');
-                                out.push_str(tex);
-                                out.push('$');
+                            Some(Stashed::Inline { raw, .. }) => {
+                                out.push_str(raw);
                                 continue;
                             }
-                            Some(Stashed::Display(tex)) => {
-                                out.push_str("$$");
-                                out.push_str(tex);
-                                out.push_str("$$");
+                            Some(Stashed::Display { raw, .. }) => {
+                                out.push_str(raw);
                                 continue;
                             }
                             None => {}
@@ -513,6 +767,7 @@ enum Container {
     },
     Table {
         aligns: Vec<Align>,
+        cols: usize,
         rows: Vec<Vec<Inlines>>,
         row: Vec<Inlines>,
         cell: Vec<Part>,
@@ -563,14 +818,18 @@ impl Builder {
                     content: restore_code(&c, &self.stash),
                 }]);
             }
-            Event::SoftBreak | Event::HardBreak => {
+            Event::SoftBreak => {
                 if let Some(Container::CodeBlock { code, .. }) = self.stack.last_mut() {
                     code.push('\n');
                 } else if self.image_depth == 0 {
-                    self.push_parts(vec![Part::Text {
-                        style: Style::default(),
-                        content: " ".into(),
-                    }]);
+                    self.push_parts(vec![Part::SoftBreak]);
+                }
+            }
+            Event::HardBreak => {
+                if let Some(Container::CodeBlock { code, .. }) = self.stack.last_mut() {
+                    code.push('\n');
+                } else if self.image_depth == 0 {
+                    self.push_parts(vec![Part::HardBreak]);
                 }
             }
             Event::Rule => {
@@ -629,7 +888,7 @@ impl Builder {
                 });
             }
             Tag::Table(aligns) => {
-                let aligns = aligns
+                let aligns: Vec<Align> = aligns
                     .into_iter()
                     .map(|a| match a {
                         pulldown_cmark::Alignment::None => Align::None,
@@ -638,8 +897,10 @@ impl Builder {
                         pulldown_cmark::Alignment::Right => Align::Right,
                     })
                     .collect();
+                let cols = aligns.len();
                 self.stack.push(Container::Table {
                     aligns,
+                    cols,
                     rows: Vec::new(),
                     row: Vec::new(),
                     cell: Vec::new(),
@@ -674,6 +935,20 @@ impl Builder {
             TagEnd::Heading(_) => {
                 let cont = self.stack.pop().unwrap();
                 if let Container::Heading { level, parts } = cont {
+                    // 标题文字加粗(3.2:H1–H4 bold,H5/H6 视觉由标题
+                    // 模式接管;原子带 bold 使 MathFlow 按粗体度量绘制)
+                    let parts = parts
+                        .into_iter()
+                        .map(|p| match p {
+                            Part::Text { mut style, content } => {
+                                if !style.code {
+                                    style.bold = true;
+                                }
+                                Part::Text { style, content }
+                            }
+                            other => other,
+                        })
+                        .collect();
                     let inlines = to_inlines(parts);
                     self.finish_into(move |c| push_block(c, Block::Heading { level, inlines }));
                 }
@@ -710,19 +985,35 @@ impl Builder {
             }
             TagEnd::Table => {
                 let cont = self.stack.pop().unwrap();
-                if let Container::Table { aligns, rows, .. } = cont {
-                    self.finish_into(move |c| push_block(c, Block::Table { aligns, rows }));
-                }
-            }
-            TagEnd::TableCell => {
-                if let Some(Container::Table { row, cell, .. }) = self.stack.last_mut() {
-                    if !cell.is_empty() {
-                        row.push(to_inlines(std::mem::take(cell)));
+                if let Container::Table {
+                    aligns, rows, row, ..
+                } = cont
+                {
+                    // 末行未满也保存(parser 已保证对齐;保底)
+                    if !row.is_empty() {
+                        let mut rows = rows;
+                        rows.push(row);
+                        self.finish_into(move |c| push_block(c, Block::Table { aligns, rows }));
+                    } else {
+                        self.finish_into(move |c| push_block(c, Block::Table { aligns, rows }));
                     }
                 }
             }
+            TagEnd::TableCell => {
+                // 空 cell 必须保留,否则后续列左移(T11 / PLAN 2 表格列错位)
+                if let Some(Container::Table { row, cell, .. }) = self.stack.last_mut() {
+                    row.push(to_inlines(std::mem::take(cell)));
+                }
+            }
             TagEnd::TableHead | TagEnd::TableRow => {
-                if let Some(Container::Table { rows, row, .. }) = self.stack.last_mut() {
+                if let Some(Container::Table {
+                    cols, rows, row, ..
+                }) = self.stack.last_mut()
+                {
+                    // 补齐缺失列(异常表格按列数补空,不偷偷合并)
+                    while row.len() < *cols {
+                        row.push(Inlines::default());
+                    }
                     if !row.is_empty() {
                         rows.push(std::mem::take(row));
                     }
@@ -859,11 +1150,11 @@ fn paragraph_blocks(parts: Vec<Part>) -> Vec<Block> {
 
     for p in parts {
         match p {
-            Part::DisplayMath { tex } => {
+            Part::DisplayMath { raw, tex } => {
                 if !current.is_empty() {
                     blocks.push(Block::Paragraph(to_inlines(std::mem::take(&mut current))));
                 }
-                blocks.push(Block::MathBlock { tex });
+                blocks.push(Block::MathBlock { raw, tex });
             }
             other => current.push(other),
         }
@@ -903,9 +1194,16 @@ fn to_inlines(mut parts: Vec<Part>) -> Inlines {
 mod tests {
     use super::*;
 
+    fn parse_s(md: &str) -> Document {
+        parse(md, ParsePolicy::Strict)
+    }
+    fn parse_l(md: &str) -> Document {
+        parse(md, ParsePolicy::LlmCompatible)
+    }
+
     fn parts_text(md: &str) -> Vec<String> {
-        let doc = parse(md);
-        doc.blocks
+        parse_s(md)
+            .blocks
             .iter()
             .filter_map(|b| match b {
                 Block::Paragraph(i) => Some(i.plain_text()),
@@ -916,24 +1214,35 @@ mod tests {
 
     #[test]
     fn inline_dollar_math() {
-        let doc = parse(r"质量 $E = mc^2$ 很著名");
+        let doc = parse_s(r"质量 $E = mc^2$ 很著名");
         let Block::Paragraph(i) = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks);
         };
         assert!(i.has_math);
         assert_eq!(
-            i.parts[0],
-            Part::Text {
-                style: Style::default(),
-                content: "质量 ".into()
-            }
-        );
-        assert_eq!(
             i.parts[1],
             Part::Math {
+                raw: "$E = mc^2$".into(),
                 tex: "E = mc^2".into()
             }
         );
+    }
+
+    #[test]
+    fn paren_math_keeps_original_delimiters() {
+        // 原文 \(…\) 复制时保留原定界形式(PLAN 4.2 合同 3)
+        let doc = parse_s(r"正切 \(\tan x\) 公式");
+        let Block::Paragraph(i) = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(
+            i.parts[1],
+            Part::Math {
+                raw: r"\(\tan x\)".into(),
+                tex: r"\tan x".into()
+            }
+        );
+        assert_eq!(i.plain_text(), r"正切 \(\tan x\) 公式");
     }
 
     #[test]
@@ -970,7 +1279,7 @@ mod tests {
 
     #[test]
     fn code_block_protects_dollar() {
-        let doc = parse("```rust\nlet x = \"$5\";\n```\n");
+        let doc = parse_s("```rust\nlet x = \"$5\";\n```\n");
         let Block::CodeBlock { language, code } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
@@ -979,34 +1288,24 @@ mod tests {
     }
 
     #[test]
-    fn display_math_splits_paragraph() {
-        let doc = parse("前文 $$a+b$$ 后文");
+    fn display_math_splits_paragraph_with_raw() {
+        let doc = parse_s("前文 $$a+b$$ 后文");
         assert_eq!(doc.blocks.len(), 3, "{:?}", doc.blocks);
-        assert!(matches!(doc.blocks[1], Block::MathBlock { .. }));
+        let Block::MathBlock { raw, tex } = &doc.blocks[1] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(raw, "$$a+b$$");
+        assert_eq!(tex, "a+b");
     }
 
     #[test]
     fn bracket_display_math() {
-        let doc = parse("\\[ x^2 \\]");
-        let Block::MathBlock { tex } = &doc.blocks[0] else {
+        let doc = parse_s("\\[ x^2 \\]");
+        let Block::MathBlock { raw, tex } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
+        assert_eq!(raw, "\\[ x^2 \\]");
         assert_eq!(tex.trim(), "x^2");
-    }
-
-    #[test]
-    fn paren_inline_math() {
-        let doc = parse(r"正切 \(\tan x\) 公式");
-        let Block::Paragraph(i) = &doc.blocks[0] else {
-            panic!("{:?}", doc.blocks)
-        };
-        assert!(i.has_math);
-        assert_eq!(
-            i.parts[1],
-            Part::Math {
-                tex: r"\tan x".into()
-            }
-        );
     }
 
     #[test]
@@ -1023,22 +1322,8 @@ mod tests {
     }
 
     #[test]
-    fn latex_braces_survive_in_math() {
-        let doc = parse(r"集合 $\{x \mid x > 0\}$ 非空");
-        let Block::Paragraph(i) = &doc.blocks[0] else {
-            panic!("{:?}", doc.blocks)
-        };
-        assert_eq!(
-            i.parts[1],
-            Part::Math {
-                tex: r"\{x \mid x > 0\}".into()
-            }
-        );
-    }
-
-    #[test]
     fn bold_italic_strike_link() {
-        let doc = parse("*斜体*、**粗体**、~~删除~~、[链接](https://example.com)");
+        let doc = parse_s("*斜体*、**粗体**、~~删除~~、[链接](https://example.com)");
         let Block::Paragraph(i) = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
@@ -1063,19 +1348,34 @@ mod tests {
     }
 
     #[test]
-    fn table_parses() {
-        let doc = parse("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+    fn table_empty_cells_preserved() {
+        let doc = parse_s("| a | | c |\n| --- | --- | --- |\n| | 2 | |\n");
         let Block::Table { rows, .. } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0][0].plain_text(), "a");
+        for row in rows {
+            assert_eq!(row.len(), 3, "空 cell 不能丢失: {row:?}");
+        }
+        assert_eq!(rows[0][1].plain_text(), "");
+        assert_eq!(rows[1][0].plain_text(), "");
         assert_eq!(rows[1][1].plain_text(), "2");
     }
 
     #[test]
+    fn table_missing_trailing_cells_padded() {
+        // 异常缺列:按表头列数补空(T11)
+        let doc = parse_s("| a | b | c |\n| --- | --- | --- |\n| 1 |\n");
+        let Block::Table { rows, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(rows[1].len(), 3);
+        assert_eq!(rows[1][1].plain_text(), "");
+    }
+
+    #[test]
     fn table_cell_with_math() {
-        let doc = parse("| $x$ | b |\n| --- | --- |\n| $y$ | 2 |\n");
+        let doc = parse_s("| $x$ | b |\n| --- | --- |\n| $y$ | 2 |\n");
         let Block::Table { rows, .. } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
@@ -1085,7 +1385,7 @@ mod tests {
 
     #[test]
     fn list_parses() {
-        let doc = parse("- 一项\n- 二项\n");
+        let doc = parse_s("- 一项\n- 二项\n");
         let Block::List { start, items } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
@@ -1099,7 +1399,7 @@ mod tests {
 
     #[test]
     fn ordered_list_start() {
-        let doc = parse("3. 三\n4. 四\n");
+        let doc = parse_s("3. 三\n4. 四\n");
         let Block::List { start, .. } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
@@ -1108,15 +1408,161 @@ mod tests {
 
     #[test]
     fn heading_and_quote() {
-        let doc = parse("# 标题\n\n> 引用\n");
+        let doc = parse_s("# 标题\n\n> 引用\n");
         assert!(matches!(doc.blocks[0], Block::Heading { level: 1, .. }));
         assert!(matches!(doc.blocks[1], Block::Quote(_)));
     }
 
     #[test]
+    fn hard_break_is_newline_soft_break_is_space() {
+        let doc = parse_s("行一  \n行二\n行三");
+        let Block::Paragraph(i) = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(i.parts.contains(&Part::HardBreak), "{:?}", i.parts);
+        assert!(i.parts.contains(&Part::SoftBreak), "{:?}", i.parts);
+        let pt = i.plain_text();
+        assert!(pt.contains("行一\n行二 行三"), "{pt}");
+    }
+
+    // ----- LlmCompatible 兼容强调(T09) -----
+
+    #[test]
+    fn compat_cjk_quote_bold() {
+        // 实测失败样例(2.2):中文 + 引号边界 → bold
+        let doc = parse_l("借用**\"把负面状态传给队友\"**的机制");
+        let Block::Paragraph(i) = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(
+            i.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { style, .. } if style.bold && content_contains(p, "把负面状态"))),
+            "{:?}",
+            i.parts
+        );
+        // 原文不回写:IR 文本不含星号定界符本身
+        assert!(i.plain_text().contains("把负面状态传给队友"));
+    }
+
+    #[test]
+    fn compat_cjk_fullwidth_quote_bold() {
+        let doc = parse_l("借用**“把负面状态传给队友”**的机制");
+        let Block::Paragraph(i) = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(
+            i.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { style, .. } if style.bold)),
+            "{:?}",
+            i.parts
+        );
+    }
+
+    fn content_contains(p: &Part, needle: &str) -> bool {
+        match p {
+            Part::Text { content, .. } => content.contains(needle),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn compat_strict_baseline_unchanged_cases() {
+        // 正常 bold 不受影响
+        let doc = parse_l("借用**把负面状态传给队友**的机制");
+        let Block::Paragraph(i) = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert!(i.parts.iter().any(
+            |p| matches!(p, Part::Text { style, .. } if style.bold && content_contains(p, "把负面状态"))
+        ));
+    }
+
+    #[test]
+    fn compat_ambiguity_stays_strict() {
+        // 反例(T09):乘法、单星、下划线、hashtag、未闭合 —— 全部保持字面
+        for md in [
+            "3 * 4 = 12 乘法",
+            "a * b * c",
+            "snake_case_identifier",
+            "##标题无空格",
+            "#hashtag 标签",
+            "前文**尚未闭合",
+            "snake_case 与 __双下划线__ 保持",
+        ] {
+            let l = parse_l(md);
+            let s = parse_s(md);
+            let lt: Vec<String> = l
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Paragraph(i) => Some(i.plain_text()),
+                    _ => None,
+                })
+                .collect();
+            let st: Vec<String> = s
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Paragraph(i) => Some(i.plain_text()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lt, st, "歧义场景 Strict/LlmCompatible 必须一致: {md}");
+        }
+    }
+
+    #[test]
+    fn compat_no_bold_inside_code_or_link() {
+        // LlmCompatible 结果与 Strict 基线完全一致([**link**] 的 bold
+        // 来自 CommonMark 本身,不是兼容层产物)
+        let src = "`code ** x` 与 [**link**](https://e.com)";
+        let l = parse_l(src);
+        let s = parse_s(src);
+        assert_eq!(format!("{l:?}"), format!("{s:?}"));
+        let Block::Paragraph(i) = &l.blocks[0] else {
+            panic!("{:?}", l.blocks)
+        };
+        assert!(
+            i.parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { style, .. } if style.link.is_some())),
+            "{:?}",
+            i.parts
+        );
+    }
+
+    #[test]
+    fn latex_braces_survive_in_math() {
+        let doc = parse_s(r"集合 $\{x \mid x > 0\}$ 非空");
+        let Block::Paragraph(i) = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(
+            i.parts[1],
+            Part::Math {
+                raw: r"$\{x \mid x > 0\}$".into(),
+                tex: r"\{x \mid x > 0\}".into()
+            }
+        );
+    }
+
+    #[test]
+    fn table_parses() {
+        let doc = parse_s("| a | b |\n| --- | --- |\n| 1 | 2 |\n");
+        let Block::Table { rows, .. } = &doc.blocks[0] else {
+            panic!("{:?}", doc.blocks)
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].plain_text(), "a");
+        assert_eq!(rows[1][1].plain_text(), "2");
+    }
+
+    #[test]
     fn multiline_display_math() {
-        let doc = parse("$$\n\\int_0^1 x \\, dx\n$$");
-        let Block::MathBlock { tex } = &doc.blocks[0] else {
+        let doc = parse_s("$$\n\\int_0^1 x \\, dx\n$$");
+        let Block::MathBlock { tex, .. } = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
         assert!(tex.contains(r"\int_0^1"), "{tex}");
@@ -1125,7 +1571,7 @@ mod tests {
 
     #[test]
     fn dollar_inside_bold() {
-        let doc = parse(r"**重点 $x^2$ 内容**");
+        let doc = parse_s(r"**重点 $x^2$ 内容**");
         let Block::Paragraph(i) = &doc.blocks[0] else {
             panic!("{:?}", doc.blocks)
         };
@@ -1139,16 +1585,14 @@ mod tests {
 
     #[test]
     fn streaming_unclosed_then_closed() {
-        // 流式:先未闭合(字面),闭合后应识别为公式 —— 重新解析即可
         assert_eq!(parts_text("部分 $$x^"), vec!["部分 $$x^".to_string()]);
-        let doc = parse("$$x^2$$");
+        let doc = parse_s("$$x^2$$");
         assert!(matches!(doc.blocks[0], Block::MathBlock { .. }));
     }
 
     #[test]
     fn fenced_code_with_backticks_inside_placeholder_source() {
-        // 代码块里包含 $$$ 与反引号,不破坏外层解析
-        let doc = parse("````\nlet a = `$5`;\n````\n\n正文 $x$ 继续");
+        let doc = parse_s("````\nlet a = `$5`;\n````\n\n正文 $x$ 继续");
         assert!(matches!(doc.blocks[1], Block::Paragraph(ref p) if p.has_math));
     }
 
@@ -1158,5 +1602,22 @@ mod tests {
             parts_text("代码 `p = $q$ and $r` 保持"),
             vec!["代码 p = $q$ and $r 保持".to_string()]
         );
+    }
+
+    #[test]
+    fn chunked_stream_equals_full_parse() {
+        // T10 简化版:分块到达后拼接重解析 == 完整解析(同一 policy)
+        let full = "## 标题\n\n借用**\"引号强调\"**的机制与 $x^2$ 公式。\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n";
+        let chunks = [
+            "## 标",
+            "题\n\n借用**\"引号",
+            "强调\"**的机制与 $x",
+            "^2$ 公式。\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n",
+        ];
+        let joined: String = chunks.concat();
+        assert_eq!(joined, full);
+        let a = parse_l(full);
+        let b = parse_l(&joined);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 }

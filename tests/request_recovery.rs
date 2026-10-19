@@ -26,6 +26,17 @@ fn ok_response() -> Vec<u8> {
     ))
 }
 
+/// 带 SSE 注释填充的慢响应(约 12KB,按 64B/1ms 流出 ≈ 200ms):
+/// mock 的 respond 是同步闭包无法挂起,用流时长保证"取消先于完成"确定性落地。
+fn slow_ok() -> Vec<u8> {
+    let pad = ": ping\n\n".repeat(12 * 1024 / 8);
+    common::sse_ok(&format!(
+        "{pad}{}{}data: [DONE]\n\n",
+        common::delta("回答内容"),
+        common::finish_stop("gen-ok")
+    ))
+}
+
 struct Env {
     db: Arc<Db>,
     svc: Arc<ChatService<OpenRouter>>,
@@ -275,8 +286,18 @@ async fn b04_partial_failure_content_carried_forward() {
 /// 一个新 sibling、至多一个新 POST;旧 user 不复制。
 #[tokio::test]
 async fn b07_retry_dedup_ten_clicks() {
-    // 先制造一条可重试的失败(网络错误无 RA → 退避;用取消制造 Allowed 资格)
-    let e = env_with(|_b, _h| ok_response()).await;
+    // 先制造一条可重试的失败(网络错误无 RA → 退避;用取消制造 Allowed 资格)。
+    // 首个请求用慢响应:快速机器上即时响应会赶在取消前完成(Completed),
+    // 流式填充保证取消确定性地在流中途落地。
+    let served = std::sync::atomic::AtomicUsize::new(0);
+    let e = env_with(move |_b, _h| {
+        if served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            slow_ok()
+        } else {
+            ok_response()
+        }
+    })
+    .await;
     let conv = ConversationId::new();
     let p1 = plan_single(&e.db, conv, &MessageTree::new(), None, "mock/a", "Q1");
     let receipt = e.svc.submit(p1).await.unwrap();

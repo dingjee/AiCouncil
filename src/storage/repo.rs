@@ -240,10 +240,14 @@ mod tests {
 
     #[test]
     fn data_root_is_next_to_executable_and_independent_of_cwd() {
-        let exe = std::path::Path::new("C:\\portable\\AiCouncil\\aicouncil.exe");
+        let exe = if cfg!(windows) {
+            std::path::Path::new("C:\\portable\\AiCouncil\\aicouncil.exe")
+        } else {
+            std::path::Path::new("/opt/AiCouncil/aicouncil")
+        };
         assert_eq!(
             portable_data_dir(exe).unwrap(),
-            std::path::PathBuf::from("C:\\portable\\AiCouncil\\data")
+            exe.parent().unwrap().join("data")
         );
     }
 

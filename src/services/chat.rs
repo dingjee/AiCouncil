@@ -1,4 +1,4 @@
-//! 发送调度服务(P2.4 + REQUEST_RECOVERY_MODEL_PICKER_PLAN 5.3)。
+//! 发送调度服务(P2.4)。
 //!
 //! - admission:Anthropic 全模型出口门禁(submit/retry/dispatch 三层,
 //!   直接服务调用与排队后出口变化都被覆盖);预检拒绝零落库零 POST。

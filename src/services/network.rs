@@ -1,4 +1,4 @@
-//! 统一网络配置(REQUEST_RECOVERY_MODEL_PICKER_PLAN 5.2(7))。
+//! 统一网络配置。
 //!
 //! 同一 `NetworkConfig` 构造检测与生成客户端;认证头逐请求添加,
 //! 检测请求不带 Authorization/prompt/附件/provider 专用头。

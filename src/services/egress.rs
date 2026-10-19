@@ -1,4 +1,4 @@
-//! Anthropic 全模型出口门禁(REQUEST_RECOVERY_MODEL_PICKER_PLAN 4.1/5.2)。
+//! Anthropic 全模型出口门禁。
 //!
 //! - 主服务 `https://api.ip.sb/geoip`,备服务 `https://ipapi.co/json/`;
 //!   仅主服务不可用/数据无效时备用;有效 CN/HK 不可被备用覆盖。

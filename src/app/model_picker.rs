@@ -1,4 +1,4 @@
-//! 模型选择器分组 view model(REQUEST_RECOVERY_MODEL_PICKER_PLAN 6)。
+//! 模型选择器分组 view model。
 //!
 //! - 组按家族;组顺序 = 该家族在 enabled 顺序中的首次出现;
 //!   组内保持原相对顺序(不因使用次数/搜索跳动)。

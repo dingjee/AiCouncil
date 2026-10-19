@@ -1,5 +1,14 @@
 /target
 /dist
+/data
 *.log
+*.db
+*.db-wal
+*.db-shm
+*.dpapi
 .env
 .DS_Store
+Thumbs.db
+.zcode/
+.idea/
+.vscode/

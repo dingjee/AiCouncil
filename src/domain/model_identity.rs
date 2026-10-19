@@ -1,4 +1,4 @@
-//! 模型身份:开发商归属与家族分组(REQUEST_RECOVERY_MODEL_PICKER_PLAN 5.2/6)。
+//! 模型身份:开发商归属与家族分组。
 //!
 //! - 门禁按**开发商**判断(Anthropic 归属覆盖 `anthropic/*` 全部家族与
 //!   受控 `claude-*` 别名),与传输网关(OpenRouter)身份分离;

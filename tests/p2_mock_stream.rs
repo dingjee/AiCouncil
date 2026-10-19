@@ -550,7 +550,7 @@ async fn duplicate_terminal_events_written_once() {
 }
 
 // ---------------------------------------------------------------------------
-// C 系列(REQUEST_RECOVERY_MODEL_PICKER_PLAN):HTTP/SSE/usage 协议修复。
+// C 系列:HTTP/SSE/usage 协议修复。
 // 使用可计数 mock(common 模块),断言 DB 终态/内容/费用,不 snapshot 文案。
 // ---------------------------------------------------------------------------
 

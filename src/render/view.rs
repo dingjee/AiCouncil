@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use iced::advanced::text::Span;
-use iced::widget::{column, container, row, rule, scrollable, text, Space};
-use iced::{Alignment, Element, Length, Padding};
+use iced::widget::{column, container, row, rule, scrollable, text, Space, Stack};
+use iced::{Element, Length, Padding};
 
 use super::code_flow::CodeFlow;
 use super::document::{self, PathSeg};
@@ -299,31 +299,45 @@ impl<'a, M: Clone + 'a> Ctx<'a, M> {
         let mut row_views: Vec<Element<'a, M>> = Vec::with_capacity(rows.len());
         for (ri, r) in rows.iter().enumerate() {
             let mut cells: Vec<Element<'a, M>> = Vec::with_capacity(r.len());
+            let mut backgrounds: Vec<Element<'a, M>> = Vec::with_capacity(r.len());
             for (ci, cell) in r.iter().enumerate() {
                 let align = aligns.get(ci).copied().unwrap_or(Align::None);
                 path.push(PathSeg::Cell(ri, ci));
-                let mut content = self.inlines(cell, path);
-                path.pop();
-                // 对齐应用于文字本身(容器收紧到内容宽)
-                content = match align {
-                    Align::Center => container(content).center_x(Length::Fill).into(),
-                    Align::Right => container(content)
-                        .align_x(Alignment::End)
-                        .width(Length::Fill)
-                        .into(),
-                    _ => container(content).width(Length::Fill).into(),
+                let content: Element<'a, M> = if let Some(flow) = self.flow_of(path) {
+                    let on_link = self.on_link.clone();
+                    MathFlow::new(flow, self.style)
+                        .path(path.clone())
+                        .align(align)
+                        .selection(self.leaf_sel(path))
+                        .selection_hooks(self.hooks.clone())
+                        .on_link(move |url| on_link(url.to_string()))
+                        .into()
+                } else {
+                    self.inlines(cell, path)
                 };
+                path.pop();
                 let head_style = crate::ui_style::table_head_style;
                 let cell_style = |t: &iced::Theme| crate::ui_style::table_cell_style(t);
-                let cell = container(content)
-                    .width(Length::Fill)
-                    .padding(CELL_PADDING)
-                    .style(if ri == 0 { head_style } else { cell_style });
+                let cell = container(content).width(Length::Fill).padding(CELL_PADDING);
                 cells.push(cell.into());
+                backgrounds.push(
+                    container(Space::new())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .style(if ri == 0 { head_style } else { cell_style })
+                        .into(),
+                );
             }
+            // Content determines row height; every background fills that same
+            // height, preserving continuous 1px column borders in wrapped rows.
             row_views.push(
-                container(row(cells).spacing(1.0).width(Length::Fill))
-                    .width(Length::Fill)
+                Stack::with_children([row(cells).spacing(1.0).width(Length::Fill).into()])
+                    .push_under(
+                        row(backgrounds)
+                            .spacing(1.0)
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    )
                     .into(),
             );
         }

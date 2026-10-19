@@ -134,7 +134,7 @@ docs/IMPLEMENTATION_STATUS.md(0.1.3 节)。dist/data/ 为用户真实运行
 
 ---
 
-## 0.1.4:REQUEST_RECOVERY_MODEL_PICKER_PLAN 验收矩阵(2026-10-19)
+## 0.1.4:出口门禁 / 请求恢复 / 选择器 验收矩阵(2026-10-19)
 
 执行环境:Windows,本地可计数 mock(tests/common + examples/mock_openrouter),
 隔离 `AICOUNCIL_DATA_DIR`,无公网、无真实 Key、无真实计费请求。
@@ -225,3 +225,14 @@ Get-FileHash dist\aicouncil.exe -SHA256
 GUI 验证(dist exe + 隔离数据 + mock):见 IMPLEMENTATION_STATUS.md 0.1.4 节。
 未运行项(A11 真实代理、D06 键盘、D07 DPI 矩阵、B18 故障注入)列为限制,
 不写"全部通过"。
+
+## 0.1.5：Markdown 行距与表格回归（2026-10-19）
+
+- `cargo test --release --lib --test render_layout --test math_coverage`：158 通过，0 失败（154 单元测试 + 3 公式测试 + 1 整篇布局回归）。
+- 整篇布局测试覆盖 12/15/22px 正文 × 360/760/1100px 消息宽度，断言文字没有越出段落、表格背景铺满整行、列边界一致、空单元格保留最小行高，分割线后的段落不与前一块重叠。
+- 段落单测覆盖 90/180/360px 宽度，检查实际绘制的行坐标与选择命中一致；另验证英文按词换行、居中/右对齐和标题文字/公式字号。
+- `rustfmt --edition 2021 --check src/render/flow.rs src/render/view.rs tests/render_layout.rs examples/render_probe.rs` 与 `git diff --check` 通过。
+- 根因与复现命令见 `docs/RENDERING.md` 的 0.1.5 节。
+- 截图：`docs/screenshots/markdown-0.1.5/` 共 9 张，由与程序相同的 tiny-skia 渲染器、完整 `view_message` 布局直接生成。目视检查常规字号/中等宽度（15px/760px）、大字窄屏（22px/360px）及大字宽屏（22px/1100px），无段落重叠、灰色断块或分割线穿字。窗口捕获工具两次超时，本轮视觉证据为渲染器离屏输出，不计作真实窗口截图。
+- `cargo build --release --bin aicouncil --example render_probe` 通过，交付 `dist/aicouncil.exe`（0.1.5）；SHA256：`D638CBF8DAF110D3898B3199AFAA0542FC36EE27C4940C39CCCD94A5EBA5D213`。
+- `target/` 未在本轮自动清理，留待手动删除（构建产物与交付 EXE 哈希已核对一致，验收窗口进程已关闭）。

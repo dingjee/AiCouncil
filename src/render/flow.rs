@@ -172,7 +172,15 @@ fn build_blocks(
         match b {
             md::Block::Paragraph(inlines) | md::Block::Heading { inlines, .. } => {
                 path.push(PathSeg::Block(i));
-                out.insert(path.clone(), Arc::new(atomize(inlines, style, cache)));
+                let mut block_style = *style;
+                if let md::Block::Heading { level, .. } = b {
+                    block_style.body *= crate::ui_style::heading_ratio(*level);
+                    block_style.line_height = crate::ui_style::HEADING_LINE_HEIGHT;
+                }
+                out.insert(
+                    path.clone(),
+                    Arc::new(atomize(inlines, &block_style, cache)),
+                );
                 path.pop();
             }
             md::Block::Quote(inner) => {
@@ -194,7 +202,15 @@ fn build_blocks(
                 for (ri, row) in rows.iter().enumerate() {
                     for (ci, cell) in row.iter().enumerate() {
                         path.push(PathSeg::Cell(ri, ci));
-                        out.insert(path.clone(), Arc::new(atomize(cell, style, cache)));
+                        let mut flow = atomize(cell, style, cache);
+                        if ri == 0 {
+                            for atom in &mut flow.atoms {
+                                if let Atom::Text { style, .. } = atom {
+                                    style.bold = true;
+                                }
+                            }
+                        }
+                        out.insert(path.clone(), Arc::new(flow));
                         path.pop();
                     }
                 }
@@ -267,6 +283,9 @@ fn atomize(inlines: &md::Inlines, style: &RenderStyle, cache: &mut MathCache) ->
                         });
                     } else {
                         word.push(ch);
+                        if ch.is_whitespace() {
+                            push_word(&mut word, st, &mut atoms, &mut decor);
+                        }
                     }
                 }
                 push_word(&mut word, st, &mut atoms, &mut decor);
@@ -454,6 +473,7 @@ pub struct MathFlow<'a, Message> {
     selection: Option<(SelPos, SelPos)>,
     on_link: Option<OnLinkFn<'a, Message>>,
     hooks: Option<SelectionHooks<'a, Message>>,
+    align: md::Align,
 }
 
 /// 行内链接回调。
@@ -468,11 +488,17 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
             selection: None,
             on_link: None,
             hooks: None,
+            align: md::Align::None,
         }
     }
 
     pub fn path(mut self, path: Vec<PathSeg>) -> Self {
         self._path = path;
+        self
+    }
+
+    pub fn align(mut self, align: md::Align) -> Self {
+        self.align = align;
         self
     }
 
@@ -531,8 +557,8 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
         let paragraph = Para::with_text(text::Text {
             content: text,
             bounds: Size::new(65_536.0, 1_024.0),
-            size: Pixels(self.style.body),
-            line_height: LineHeight::default(),
+            size: Pixels(self.content.text_size),
+            line_height: LineHeight::Absolute(Pixels(self.content.line_height)),
             font: Self::font_of(key),
             align_x: text::Alignment::Left,
             align_y: iced::alignment::Vertical::Top,
@@ -560,11 +586,15 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
     }
 
     fn layout_lines(&self, state: &mut FlowState, width: f32) {
-        if state.style_revision != self.style.revision {
+        let style_changed = state.style_revision != self.style.revision;
+        if style_changed {
             state.measures.clear();
             state.style_revision = self.style.revision;
         }
-        if state.version == self.content.version && (state.width - width).abs() < f32::EPSILON {
+        if !style_changed
+            && state.version == self.content.version
+            && (state.width - width).abs() < f32::EPSILON
+        {
             return;
         }
         state.version = self.content.version;
@@ -652,6 +682,25 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
             x += w;
         }
         finish_line(&mut cur, &mut lines, &mut y_base, min_line_h);
+        if lines.is_empty() {
+            lines.push(LineBox {
+                atoms: Vec::new(),
+                height: min_line_h,
+                top: 0.0,
+            });
+        }
+        for line in &mut lines {
+            let used = line.atoms.last().map_or(0.0, |p| p.x + p.w);
+            let spare = (width - used).max(0.0);
+            let offset = match self.align {
+                md::Align::Center => spare / 2.0,
+                md::Align::Right => spare,
+                _ => 0.0,
+            };
+            for atom in &mut line.atoms {
+                atom.x += offset;
+            }
+        }
         state.lines = lines;
     }
 
@@ -797,7 +846,9 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
             let children = line
                 .atoms
                 .iter()
-                .map(|p| layout::Node::new(Size::new(p.w, p.h)).move_to(Point::new(p.x, y + p.y)))
+                // Child coordinates are relative to their line node. Adding y
+                // here would apply the line offset twice during drawing.
+                .map(|p| layout::Node::new(Size::new(p.w, p.h)).move_to(Point::new(p.x, p.y)))
                 .collect();
             line_nodes.push(
                 layout::Node::with_children(Size::new(width, line.height), children)
@@ -1079,6 +1130,127 @@ impl<'a, Message: Clone + 'a> From<MathFlow<'a, Message>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_lines_stay_inside_layout_and_match_selection() {
+        for body in [12.0, 15.0, 22.0] {
+            let style = RenderStyle::soft_sage(body);
+            let mut cache = MathCache::new();
+            let rendered = super::super::render_message(
+                "母亲接到投射后，程序从三种返还里抽取。**粗体内容**，中文与 English words wrap across lines，以及行内公式 $x^2$。反复换行时文字和选择必须处于同一行盒内。",
+                &style, md::ParsePolicy::LlmCompatible, &mut cache,
+            );
+            let content = rendered.flow.get(&[PathSeg::Block(0)]).unwrap();
+            let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(body));
+            for width in [90.0, 180.0, 360.0] {
+                let mut flow = MathFlow::<()>::new(content, style);
+                let mut tree =
+                    tree::Tree::new(&flow as &dyn Widget<(), iced::Theme, iced::Renderer>);
+                let node = flow.layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(width, f32::INFINITY)),
+                );
+                let state = tree.state.downcast_ref::<FlowState>();
+                assert!(state.lines.len() >= 2);
+                let root = Layout::with_offset(Vector::new(30.0, 50.0), &node);
+                let mut previous_bottom = root.bounds().y;
+                for (line, line_layout) in state.lines.iter().zip(root.children()) {
+                    assert!(line_layout.bounds().y >= previous_bottom - 0.01);
+                    previous_bottom = line_layout.bounds().y + line_layout.bounds().height;
+                    for (atom, atom_layout) in line.atoms.iter().zip(line_layout.children()) {
+                        let bounds = atom_layout.bounds();
+                        assert!(bounds.y >= line_layout.bounds().y - 0.01);
+                        assert!(
+                            bounds.y + bounds.height <= line_layout.bounds().y + line.height + 0.01,
+                            "drawn atom escapes its line: {bounds:?}, line {:?}",
+                            line_layout.bounds()
+                        );
+                        assert!((bounds.y - root.bounds().y - line.top - atom.y).abs() < 0.01);
+                        let hit = MathFlow::<()>::hit_pos(
+                            state,
+                            content,
+                            atom.x + atom.w / 2.0,
+                            line.top + line.height / 2.0,
+                        );
+                        assert_eq!(hit.0, atom.atom_idx);
+                    }
+                }
+                assert!((previous_bottom - root.bounds().y - node.size().height).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn headings_and_empty_cells_have_their_own_metrics() {
+        let style = RenderStyle::light();
+        let mut cache = MathCache::new();
+        let doc = md::parse(
+            "# 标题 $x^2$\n\n正文\n\n| 左 | 右 |\n|---|---|\n| | 内容 |",
+            md::ParsePolicy::Strict,
+        );
+        let content = FlowContent::from_document(&doc, &style, &mut cache);
+        let heading = content.get(&[PathSeg::Block(0)]).unwrap();
+        let size = style.body * crate::ui_style::heading_ratio(1);
+        assert_eq!(heading.text_size, size);
+        assert_eq!(heading.math_font_size, size);
+        assert_eq!(
+            heading.line_height,
+            size * crate::ui_style::HEADING_LINE_HEIGHT
+        );
+        let header = content
+            .get(&[PathSeg::Block(2), PathSeg::Cell(0, 0)])
+            .unwrap();
+        assert!(header
+            .atoms
+            .iter()
+            .all(|atom| matches!(atom, Atom::Text { style, .. } if style.bold)));
+        let empty = content
+            .get(&[PathSeg::Block(2), PathSeg::Cell(1, 0)])
+            .unwrap();
+        let mut flow = MathFlow::<()>::new(empty, style);
+        let mut tree = tree::Tree::new(&flow as &dyn Widget<(), iced::Theme, iced::Renderer>);
+        let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(style.body));
+        let node = flow.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(100.0, f32::INFINITY)),
+        );
+        assert_eq!(node.size().height, style.body * style.line_height);
+    }
+
+    #[test]
+    fn english_words_wrap_and_table_alignment_moves_glyphs() {
+        let style = RenderStyle::light();
+        let mut cache = MathCache::new();
+        let inlines = md::Inlines {
+            parts: vec![md::Part::Text {
+                style: md::Style::default(),
+                content: "one two three four five six seven eight".into(),
+            }],
+            has_math: false,
+        };
+        let content = atomize(&inlines, &style, &mut cache);
+        assert_eq!(content.atoms.len(), 8);
+        for align in [md::Align::Left, md::Align::Center, md::Align::Right] {
+            let flow = MathFlow::<()>::new(&content, style).align(align);
+            let mut widget_state = flow.state();
+            let state = widget_state.downcast_mut::<FlowState>();
+            flow.layout_lines(state, 120.0);
+            assert!(state.lines.len() > 1);
+            for line in &state.lines {
+                let first = line.atoms.first().unwrap();
+                let last = line.atoms.last().unwrap();
+                let right = last.x + last.w;
+                assert!(right <= 120.01);
+                match align {
+                    md::Align::Center => assert!((first.x - (120.0 - right)).abs() < 0.01),
+                    md::Align::Right => assert!((right - 120.0).abs() < 0.01),
+                    _ => assert_eq!(first.x, 0.0),
+                }
+            }
+        }
+    }
 
     #[test]
     fn norm_sel_orders_and_whole() {

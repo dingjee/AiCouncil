@@ -2,6 +2,7 @@
 //! 不连接任何 API(PLAN P0.2-P0.5)。
 //!
 //! 运行:`cargo run --example render_probe`
+//! 行距/表格回归:`cargo run --release --example render_probe -- --spacing`
 //!
 //! 覆盖:
 //! - `tests/fixtures/render_cases.md` 的全部用例(内嵌,不依赖 cwd)
@@ -94,8 +95,13 @@ impl Probe {
     fn new() -> (Self, Task<Message>) {
         let style = RenderStyle::light();
         let mut cache = MathCache::new();
+        let fixture = if std::env::args().any(|arg| arg == "--spacing") {
+            include_str!("../tests/fixtures/render_spacing.md")
+        } else {
+            FIXTURE
+        };
         let fixture_msg = render::render_message(
-            FIXTURE,
+            fixture,
             &style,
             aicouncil::render::md::ParsePolicy::LlmCompatible,
             &mut cache,

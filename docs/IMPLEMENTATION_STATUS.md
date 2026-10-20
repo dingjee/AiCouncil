@@ -14,8 +14,8 @@ Recorded by phase: completed items, verification commands/results, unresolved it
 - P0.2 `examples/render_probe.rs` (real native window, no network) +
   `tests/fixtures/render_cases.md` (embedded load).
 - P0.3 Validated mixed Chinese-English text / code highlighting / tables /
-  links / scrolling / zoom / font fallback (screenshots under
-  docs/screenshots/); text selection is an inherent limitation of iced 0.14;
+  links / scrolling / zoom / font fallback (visual check in a real window);
+  text selection is an inherent limitation of iced 0.14;
   the message-level Copy button landed in P3 (see known gaps in
   docs/RENDERING.md).
 - P0.4 All four delimiter classes, fractions/integrals/radicals/series/
@@ -35,7 +35,7 @@ Recorded by phase: completed items, verification commands/results, unresolved it
 cargo check --all-targets        # passed, 0 warnings
 cargo test --lib                 # 27 passed; 0 failed
 cargo test --test math_coverage  # 3 passed (including the \LaTeX fallback assertion)
-cargo run --example render_probe # ran in a real window, verified via screenshots (see docs)
+cargo run --example render_probe # ran in a real window, verified visually (see docs)
 ```
 
 ### Unresolved Items
@@ -119,8 +119,7 @@ cargo clippy --all-targets -- -D warnings  # zero warnings
 - P3.1 Main area (header: Export MD / All branches / collapse sidebar;
   scrolling message stream; bottom input area: model picker / multi-line
   editor / Send) + right sidebar (three tabs: sessions/models/settings,
-  collapsible) — layout verified correct via real-window screenshot
-  (docs/screenshots/app_main_dpi.png).
+  collapsible) — layout verified correct in a real window (visual check).
 - P3.2 New chat / search box / single-level grouping (ungrouped + custom
   groups) / group rename and delete / session rename and delete / move to
   group; UI wired to DB persistence.
@@ -141,7 +140,7 @@ cargo clippy --all-targets -- -D warnings  # zero warnings
 ```sh
 cargo test               # 80 passed (66 lib + 3 math + 5 p1 + 6 p2)
 cargo clippy --all-targets -D warnings  # zero warnings
-cargo run                # real window: layout/sidebar/input area render correctly (screenshots)
+cargo run                # real window: layout/sidebar/input area render correctly (visual check)
 ```
 
 ### Unresolved Items (P3 wrap-up)
@@ -163,13 +162,13 @@ cargo run                # real window: layout/sidebar/input area render correct
   answer.
 - Sidebar: current session highlight / rename / delete / move to group;
   input area: model picker.
-- Screenshot: docs/screenshots/p3_single_chat_e2e.png.
+- Verified end to end in a real window (visual check).
 
 ## P4 Parallel and Branching — ✅ Complete (2026-10-18)
 
 - Same-prompt multi-model: checking "Parallel" sends to all enabled models
   with the primary model first; parallel answers shown as side-by-side cards
-  (mock/beta + mock/alpha, screenshot p4_parallel_cards.png).
+  (mock/beta + mock/alpha, visual check).
 - Multi-branch follow-up: the completed card's "Branch" checkbox →
   MultiBranch send (each branch uses its current model; Cartesian product
   forbidden); multi-selection cleared after sending.
@@ -186,7 +185,7 @@ cargo run                # real window: layout/sidebar/input area render correct
 
 - Cost label: bottom-right of the input box, "Known cost $x · pending N ·
   unavailable M"; exact Decimal accumulation (mock two calls
-  $0.00042×2=$0.00084, screenshot p5_cost_label.png); usage cache refreshed
+  $0.00042×2=$0.00084, verified in the UI); usage cache refreshed
   via refresh_from_db.
 - Already in place: idempotent usage event crediting, deduplication of
   duplicate reports, the Pending/Known/Unavailable state machine, and restart
@@ -249,15 +248,15 @@ cargo test                                 # 84 passed (70 lib + 3 math + 5 p1 +
 cargo build --release                      # passed; subsystem=2, icon resources present
 ```
 
-### Screenshot Evidence (docs/screenshots/, all from the final delivery exe, isolated data directory, mock content)
+### GUI Evidence (all from the final delivery exe, isolated data directory, mock content; captures taken locally, not kept in the repo)
 
-- ui011-settings-release.png — empty-state main window + Settings + Usage
-  expansion (data directory shown as a data folder next to the exe)
-- ui011-parallel-release-final.png — dual-model parallel cards
-- ui011-models-release.png — models panel (no persistent prices/quota)
-- ui011-narrow-release.png — minimum-size window: Send button visible, card
-  headers wrap at component level
-- ui011-icons-compare.png — old vs new icons at 16/32/256
+- Empty-state main window + Settings + Usage expansion (data directory shown
+  as a data folder next to the exe)
+- Dual-model parallel cards
+- Models panel (no persistent prices/quota)
+- Minimum-size window: Send button visible, card headers wrap at component
+  level
+- Old vs new icons at 16/32/256
 
 ### Known Observations and Unverified Items
 
@@ -325,10 +324,9 @@ cargo build --release                      # passed; exe copied to dist/
   `attachments_composed_into_request_prompt` (captures the mock request body
   and asserts it contains the attachment separator and content, and that the
   user node stores the original prompt + attachment fields).
-- Screenshots (docs/screenshots/, final delivery exe, isolated data
-  directory): ui012-attachments-release.png (attachment chip bar),
-  ui012-parallel-picker-release.png (parallel multi-select panel expanded,
-  with the "Primary" badge).
+- GUI visual checks (final delivery exe, isolated data directory):
+  attachment chip bar; parallel multi-select panel expanded with the
+  "Primary" badge (captures taken locally, not kept in the repo).
 
 ## Next Steps
 
@@ -452,8 +450,8 @@ follow-up investigation to pick up.
   boot (invalid/NaN/out of range → 300). Lesson: sanitized results must land
   on the field actually consumed, not on a parallel local variable.
 - Isolated-data-directory launch verification: process alive, window title
-  normal, Soft Sage palette and English UI in effect (screenshot
-  ui013-soft-sage-release.png; re-captured after the fix).
+  normal, Soft Sage palette and English UI in effect (visual check,
+  re-verified after the fix).
 
 ### Version and Checks
 

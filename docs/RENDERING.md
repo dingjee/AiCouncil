@@ -18,7 +18,7 @@ cargo run --release --example render_probe -- --spacing
 You can also generate whole-document PNGs directly with the tiny-skia renderer the app uses, without operating a window:
 
 ```powershell
-$env:AICOUNCIL_RENDER_CAPTURE_DIR = 'docs/screenshots/markdown-0.1.5'
+$env:AICOUNCIL_RENDER_CAPTURE_DIR = "$env:TEMP\aicouncil-render"
 cargo test --release --test render_layout
 ```
 
@@ -59,13 +59,13 @@ The lockfile is committed (Cargo.lock).
 - `cargo test --test math_coverage`: all R1 formula categories (fractions, roots, integrals, series, matrices, cases, aligned, align mapping, set brackets) render as SVG graphics without fallback; the known `\LaTeX` macro falls back to source text (documented).
 - Real window (`cargo run --example render_probe`, 1100×800, Light):
   - Mixed Chinese/English text renders crisply, no garbled glyphs/tofu (cosmic-text system font fallback);
-  - Inline formulas render as graphics with baselines aligned well to the text (screenshot crop_sec2.png);
-  - Matrix/cases/integral/fraction display formulas render as graphics (screenshot rp_page0.png);
+  - Inline formulas render as graphics with baselines aligned well to the text;
+  - Matrix/cases/integral/fraction display formulas render as graphics;
   - Rust code block syntax highlighting + rounded background work correctly;
   - The 20,000-character + 50-formula stress sample pages and scrolls normally (PGDN×20 without freezing);
-  - Typing in the input box works normally while the 30ms streaming tick runs (screenshot verifies the typed input "liushiceshi 123" and the send button);
+  - Typing in the input box works normally while the 30ms streaming tick runs (visual check of the typed input "liushiceshi 123" and the send button);
   - Long paragraphs wrap automatically, with no horizontal overflow and no content squeezing out the input box.
-  - Screenshots: docs/screenshots/ (rp_page0 is the full page, crop_sec2 is a zoomed detail).
+  - Verified visually in a real window (full page + zoomed detail captures were taken locally during acceptance and are not kept in the repo).
 
 ## Known Gaps (not blocking the P0 exit; recorded as TODOs)
 

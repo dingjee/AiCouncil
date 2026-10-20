@@ -4,7 +4,7 @@ Date: 2026-10-18 · Environment: Windows 10 19045 x64 (Remote Desktop session) �
 
 | ID | Scenario | Result | Evidence |
 | --- | --- | --- | --- |
-| R1 | Four delimiter types/fractions/integrals/matrices/cases/aligned | ✅ Passed (automated + screenshots) | `tests/math_coverage.rs` all render as SVG; `docs/screenshots/` (full page + zoomed crops) |
+| R1 | Four delimiter types/fractions/integrals/matrices/cases/aligned | ✅ Passed (automated + visual) | `tests/math_coverage.rs` all render as SVG; render_probe real-window check (full page + zoomed crops, captures not kept in the repo) |
 | R2 | `$` inside code/currency/unclosed `$$`/unknown macros | ✅ Passed | `render::md` 27 parsing tests (currency/code protection/literal fallback); `\LaTeX` macro falls back to source text as expected |
 | R3 | Long content scrolling | ✅ Passed (GUI) | render_probe stress sample (20,000 chars + 50 formulas) pages and scrolls normally; input area stays responsive |
 | B1 | Q→A1/B1 defaults to A1 | ✅ Passed | primary is determined before sending (`Planner` tests + Submitted receipt sets main_leaf); not by return order |
@@ -20,7 +20,7 @@ Date: 2026-10-18 · Environment: Windows 10 19045 x64 (Remote Desktop session) �
 | E1 | Export three scopes/failed nodes/no leakage | ✅ Passed (service layer) | `services::export` tests (Main/AllBranches/failure markers/atomic write/filename sanitization); UI Main+All buttons wired, Selected driven by the checked set |
 | A1 | Text attachments into request/DB/export (0.1.2) | ✅ Passed | E2E `attachments_composed_into_request_prompt` (mock request body contains `===== 附件` and the content; user node stores original prompt + attachment fields); roundtrip/0002 migration tests; export appends `[附件 N]` |
 | A2 | Long paste converted to attachment/limits (0.1.2) | ✅ Passed (pure functions + unit tests) | `paste_threshold_classification` (≥2500 chars, counted per character); try_push limits (256KB/10 items/1MB); chip saved/restored with the draft |
-| A3 | Parallel temporary multi-select (0.1.2) | ✅ Passed (pure functions + unit tests) | `resolve_parallel_targets` (None follows the panel/Some keeps intersection order/main model placed first/empty invalid); UI screenshot ui012-parallel-picker-release.png |
+| A3 | Parallel temporary multi-select (0.1.2) | ✅ Passed (pure functions + unit tests) | `resolve_parallel_targets` (None follows the panel/Some keeps intersection order/main model placed first/empty invalid); GUI visual check of the expanded panel |
 | P1 | Three-platform credentials/IME | ⚠️ Partial | Windows Credential Manager + in-process fallback implemented and tested; IME on-device acceptance pending; macOS/Linux unverified |
 
 ## Check Commands (Actually Run)
@@ -37,17 +37,19 @@ cargo build --release          # Passed; release binary verified with mock E2E (
 - Migration consistency: WAL records not yet checkpointed were migrated via the
   backup API and the source database was left unchanged
   (`migration_uses_consistent_wal_snapshot_and_preserves_source`).
-- UI screenshots (final exe, isolated mock data): docs/screenshots/ui011-*.png
-  (empty state / settings + usage expanded, parallel card, model panel, minimum
-  window, icon comparison); details in docs/IMPLEMENTATION_STATUS.md "0.1.1 fixes".
+- UI visual check (final exe, isolated mock data): empty state / settings +
+  usage expanded, parallel card, model panel, minimum window, icon comparison
+  (captures taken locally, not kept in the repo); details in
+  docs/IMPLEMENTATION_STATUS.md "0.1.1 fixes".
 
 ## 0.1.2 Attachments/Parallel Multi-select Supplementary Evidence (2026-10-18)
 
 - Attachment E2E: the mock captures the request body and asserts attachment
   composition; the 0002 migration test simulates an old 0.1.1 database
   (`migration_0002_upgrades_old_database`).
-- UI screenshots (final exe, isolated data directory): docs/screenshots/ui012-*.png
-  (attachment chip bar, parallel multi-select panel expanded).
+- UI visual check (final exe, isolated data directory): attachment chip bar,
+  parallel multi-select panel expanded (captures taken locally, not kept in
+  the repo).
 
 ## Unverified/TODO
 
@@ -110,7 +112,7 @@ cargo test                        # ✅ 146 passed / 0 failed
   `E3BFEBAC7AE7A02BA6BE4FC00A6CE1B27C4DA40C1C7E0F067EF642728C3A28A4`.
 - Startup smoke test: boots and stays alive with an isolated data directory; Soft Sage
   colors/English UI/empty state render correctly
-  (docs/screenshots/ui013-soft-sage-release.png; sidebar drawing is affected by DPI
+  (sidebar drawing is affected by DPI
   virtualization in the current RDP session, see IMPLEMENTATION_STATUS "Issues found
   and fixed during smoke testing" — layout tree dumps prove node positions are
   correct; pixels from this session are not accepted as layout evidence and require
@@ -216,14 +218,14 @@ limitations).
 
 | ID | Result | Evidence |
 | --- | --- | --- |
-| D01 | 🖼️+✅ | docs/screenshots/model-picker-groups.png (group titles small, muted); model_picker.rs unit tests |
+| D01 | 🖼️+✅ | GUI visual check (group titles small, muted); model_picker.rs unit tests |
 | D02 | ✅ | model_identity unit tests (variant preserved/disambiguation/tooltip provided by the UI); the sent ID remains exactly unchanged (C-series asserts the original ID) |
 | D03 | ✅ | model_picker.rs `search_matches_…` (family/short name/original name/raw ID; empty-result explanation in UI) |
 | D04 | ✅ | `many_single_family_groups_…` (30 groups on a single scrollable page; height 150–300 adaptive) |
 | D05 | ✅ | The original 3 unit tests of app/mod.rs resolve_selection keep passing |
 | D06 | ❑ | Keyboard navigation of the Iced custom-drawn list not verified key by key (Enter/Esc go through the global KeyPressed) |
 | D07 | 🖼️ (partial) | Screenshots at both 1456×898 and 1747×1076 window sizes look normal; the 100%/150% DPI matrix not covered item by item |
-| D08 | 🖼️ | request-recovery-failed-card.png (short reason "Provider server error" + details tooltip + retry + input area usable) |
+| D08 | 🖼️ | GUI visual check: failed card (short reason "Provider server error" + details tooltip + retry + input area usable) |
 
 ### Automation and Release Commands (0.1.4)
 
@@ -248,6 +250,6 @@ injection) are listed as limitations; "all passed" is not claimed.
 - Paragraph unit tests cover 90/180/360px widths, checking that the actually drawn line coordinates match selection hit testing; also verifies English word wrapping, centered/right alignment, and heading text/formula font sizes.
 - `rustfmt --edition 2021 --check src/render/flow.rs src/render/view.rs tests/render_layout.rs examples/render_probe.rs` and `git diff --check` pass.
 - Root cause and reproduction commands are in section 0.1.5 of `docs/RENDERING.md`.
-- Screenshots: `docs/screenshots/markdown-0.1.5/`, 9 in total, generated directly by the same tiny-skia renderer and full `view_message` layout as the app. Visual inspection of regular size/medium width (15px/760px), large text on a narrow screen (22px/360px), and large text on a wide screen (22px/1100px) shows no paragraph overlap, gray broken blocks, or dividers cutting through text. The window capture tool timed out twice; this round's visual evidence is renderer offscreen output and does not count as real window screenshots.
+- Visual evidence: 9 whole-document renders (3 font sizes × 3 widths), generated directly by the same tiny-skia renderer and full `view_message` layout as the app via `AICOUNCIL_RENDER_CAPTURE_DIR` (captured locally, not kept in the repo). Visual inspection of regular size/medium width (15px/760px), large text on a narrow screen (22px/360px), and large text on a wide screen (22px/1100px) shows no paragraph overlap, gray broken blocks, or dividers cutting through text. The window capture tool timed out twice; this round's visual evidence is renderer offscreen output and does not count as real window screenshots.
 - `cargo build --release --bin aicouncil --example render_probe` passes; delivered `dist/aicouncil.exe` (0.1.5); SHA256: `D638CBF8DAF110D3898B3199AFAA0542FC36EE27C4940C39CCCD94A5EBA5D213`.
 - `target/` was not automatically cleaned up this round and is left for manual deletion (build artifact and delivered EXE hashes verified identical; the acceptance window process has been closed).

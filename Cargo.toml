@@ -1,6 +1,6 @@
 [package]
 name = "aicouncil"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.88"
 description = "AiCouncil - minimal native AI chat with parallel model branches"
@@ -69,10 +69,15 @@ png = "0.17"
 # Windows exe 资源(资源管理器/任务栏图标)
 winresource = "0.1"
 
+[patch.crates-io]
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
+
 [dev-dependencies]
 tempfile = "3"
 # SVG 栅格化(gen_icon 示例生成 assets/icons 产物;产物已提交)
 resvg = "0.48"
+iced_tiny_skia = "0.14"
+tiny-skia = "0.11"
 
 [profile.release]
 lto = "thin"

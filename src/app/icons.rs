@@ -6,8 +6,7 @@ use iced::{Length, Theme};
 
 use crate::ui_style::palette;
 
-fn stroke_color() -> String {
-    let c = palette::ICON;
+fn stroke_color(c: iced::Color) -> String {
     format!(
         "#{:02x}{:02x}{:02x}",
         (c.r * 255.0) as u8,
@@ -17,6 +16,10 @@ fn stroke_color() -> String {
 }
 
 pub fn icon(name: &'static str) -> svg::Svg<'static, Theme> {
+    icon_with_color(name, palette::ICON)
+}
+
+pub fn icon_with_color(name: &'static str, color: iced::Color) -> svg::Svg<'static, Theme> {
     let paths = match name {
         "panel" => "<rect x='3' y='4' width='18' height='16' rx='2'/><path d='M9 4v16'/>",
         "collapse" => "<path d='m14 18-6-6 6-6'/>",
@@ -39,13 +42,14 @@ pub fn icon(name: &'static str) -> svg::Svg<'static, Theme> {
         "x" => "<path d='M18 6 6 18M6 6l12 12'/>",
         "more" => "<circle cx='5' cy='12' r='1'/><circle cx='12' cy='12' r='1'/><circle cx='19' cy='12' r='1'/>",
         "edit" => "<path d='M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z'/>",
+        "trash" => "<path d='M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m5 4v6m4-6v6'/>",
         "star" => "<path d='m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2Z'/>",
         "blank" => "",
         _ => "<circle cx='12' cy='12' r='8'/>",
     };
     let data = format!(
         "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='{}' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'>{paths}</svg>",
-        stroke_color()
+        stroke_color(color)
     );
     svg::Svg::new(Handle::from_memory(data.into_bytes()))
         .width(Length::Fixed(16.0))

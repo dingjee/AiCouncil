@@ -112,7 +112,7 @@ Raw Markdown (never rewritten)
 
 ### Type Scale (3.2)
 
-- Heading scale factors are interpolated along the Fibonacci limit of φ: H1=φ²≈2.618 / H2=φ^1.5≈2.058 / H3=φ≈1.618 / H4=√φ / H5=φ^0.25 / H6=1 (versus the old 2/1.7/1.45/1.25/1.1/1, the top-level difference goes 18% → 27%). H1–H4 are bold, H6 uses the secondary color; heading line height 1.22, body 1.55; block spacing is computed by rules (0.9× font size before headings / 0.35× font size after, 0.55b between paragraphs, 0.65b before and after tables), replacing the old fixed spacing(8).
+- Heading scale factors use roots of φ to reduce the jump from body text: H1=φ≈1.618 / H2=φ^0.75≈1.435 / H3=√φ≈1.272 / H4=∜φ≈1.128 / H5=⁸√φ≈1.062 / H6=1. H1–H4 are bold, H5/H6 semibold; heading line height 1.22, body 1.55; block spacing is computed by rules (0.9× font size before headings / 0.35× font size after, 0.55b between paragraphs, 0.65b before and after tables), replacing the old fixed spacing(8).
 - Body font size is adjustable 12–22 (Settings slider, persisted as `general.body_text_size`); render and app share `ui_style.rs` (render → app dependencies are forbidden).
 
 ### New Known Gaps This Round
@@ -125,3 +125,22 @@ Raw Markdown (never rewritten)
 ## Conclusion
 
 The P0 exit criteria are met: ordinary Markdown and common formulas are readable, Chinese has no missing glyphs, 20,000 characters + 50 formulas scroll, and streaming appends do not freeze input. Proceeding to P1.
+
+### Editor Glyph Clipping (0.1.7)
+
+- Cosmic Text lays out the **whole** editor buffer, including lines scrolled
+  out of the viewport, so `iced_tiny_skia` received glyph runs reaching far
+  below the visible area. Upstream clipped them to the widget's content area
+  (or not at all), which let scrolled-out lines paint into the editor padding
+  and below the widget.
+- The renderer's damage region for an editor is `editor.bounds` — the editor
+  **viewport** — which is smaller than the content area. A partial redraw
+  therefore repainted only the viewport while the escaped pixels stayed on
+  screen, so the retained frame no longer matched a full redraw of the same
+  tree (9,121 differing pixels in the 1.5× DPI regression).
+- `vendor/iced_tiny_skia` now clips editor glyphs to
+  `Rectangle::new(position, editor.bounds) * transformation`, the same
+  rectangle the damage calculation reports, so painted pixels and repainted
+  regions agree by construction. `tests/editor_render.rs` covers it: retained
+  frame equals full frame (0 differing pixels) across nine editor heights and
+  five scroll steps, and no glyph ink appears below the text viewport.

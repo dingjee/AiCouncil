@@ -5,10 +5,17 @@
 //! - request_id 唯一去重;同一请求重复入账只记一笔。
 
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 
 use super::ids::GenerationId;
+
+/// Format a USD amount for compact UI display, rounding only after all precise
+/// ledger values have been summed.
+pub fn format_usd(value: Decimal) -> String {
+    let rounded = value.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
+    format!("{rounded:.2}")
+}
 
 /// 模型价格快照(USD / 每百万 token;None = 未知,不能当零)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -286,5 +293,14 @@ mod tests {
         assert_eq!(s.known_total, d("0.10"));
         assert_eq!(s.pending_count, 1);
         assert_eq!(s.unavailable_count, 1);
+    }
+
+    #[test]
+    fn usd_display_rounds_to_two_places_without_changing_ledger_precision() {
+        assert_eq!(format_usd(d("0.0049")), "0.00");
+        assert_eq!(format_usd(d("0.1250")), "0.13");
+        assert_eq!(format_usd(d("1.2")), "1.20");
+        assert_eq!(format_usd(d("-0.005")), "-0.01");
+        assert_eq!(d("0.0049"), Decimal::new(49, 4));
     }
 }

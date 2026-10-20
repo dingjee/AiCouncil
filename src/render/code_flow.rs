@@ -10,6 +10,7 @@ use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::widget::tree;
 use iced::advanced::{Clipboard, Renderer as _, Shell, Widget};
 use iced::{mouse, Background, Element, Event, Font, Length, Pixels, Point, Rectangle, Size};
+use std::hash::{Hash, Hasher};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::document::PathSeg;
@@ -127,6 +128,21 @@ impl<'a, Message: Clone + 'a> CodeFlow<'a, Message> {
         }
         rects
     }
+
+    fn cache_key(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.style.revision.hash(&mut hasher);
+        self.style.body.to_bits().hash(&mut hasher);
+        self.style.color.r.to_bits().hash(&mut hasher);
+        self.style.color.g.to_bits().hash(&mut hasher);
+        self.style.color.b.to_bits().hash(&mut hasher);
+        self.style.color.a.to_bits().hash(&mut hasher);
+        self.lines.hash(&mut hasher);
+        // Span styles include syntax colors/fonts, which can change when the
+        // language or highlighting settings change without changing source text.
+        format!("{:?}", self.spans).hash(&mut hasher);
+        hasher.finish().max(1)
+    }
 }
 
 impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
@@ -160,12 +176,11 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
         _renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let width = limits.max().width.max(1.0);
         let size = self.code_size();
         let line_h = size * 1.5;
         let state = tree.state.downcast_mut::<CodeFlowState>();
         state.line_h = line_h;
-        let rev = self.style.revision.wrapping_mul(31) + self.lines.len() as u64;
+        let rev = self.cache_key();
         if state.version != rev {
             state.paragraphs.clear();
             let probe = Para::with_text(text::Text {
@@ -211,6 +226,24 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
             }
             state.version = rev;
         }
+        let intrinsic_width = state
+            .paragraphs
+            .iter()
+            .map(|paragraph| paragraph.min_bounds().width)
+            .fold(1.0_f32, f32::max);
+        // Horizontal Scrollable intentionally supplies an infinite max width.
+        // Returning that value as the child width poisons its viewport and scroll
+        // offset with infinity/NaN, which can make code text disappear after a
+        // wheel/scrollbar update. Use the longest laid-out line as the intrinsic
+        // width, bounded by any finite parent constraint.
+        let width = if limits.max().width.is_finite() {
+            intrinsic_width
+                .max(limits.min().width)
+                .min(limits.max().width)
+        } else {
+            intrinsic_width.max(limits.min().width)
+        }
+        .max(1.0);
         let height = line_h * self.lines.len().max(1) as f32;
         layout::Node::new(Size::new(width, height))
     }

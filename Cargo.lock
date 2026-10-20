@@ -48,7 +48,7 @@ dependencies = [
 
 [[package]]
 name = "aicouncil"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-stream",
  "chrono",
@@ -59,6 +59,7 @@ dependencies = [
  "iced_highlighter",
  "iced_math",
  "iced_runtime",
+ "iced_tiny_skia",
  "keyring",
  "png 0.17.16",
  "pulldown-cmark",
@@ -71,6 +72,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tiny-skia 0.11.4",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1759,8 +1761,6 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c267596d742714b1853cc10c3983a367762816fc4836bd3b79f76ce76787d6f8"
 dependencies = [
  "bytemuck",
  "cosmic-text",

@@ -97,6 +97,10 @@ static TABLE: &[(&str, &str)] = &[
     ("composer.primary_badge", "Primary"),
     ("composer.primary_tooltip", "Primary model (owns the main branch)"),
     ("composer.branch_mode_hint", "Branch follow-up mode: each selected answer continues with its own model"),
+    ("composer.cancel_edit", "Cancel edit"),
+    ("composer.cancel_edit_tooltip", "Leave question editing and keep your normal draft"),
+    ("composer.restore_edit", "Restore edit draft"),
+    ("composer.restore_edit_tooltip", "The edited question was removed; bring its preserved draft back"),
     // 选择器
     ("selector.open", "Models"),
     ("selector.single_hint", "Click a model to choose it"),
@@ -204,6 +208,9 @@ static TABLE: &[(&str, &str)] = &[
     ("toast.retry_rejected", "Retry not available: {reason}"),
     ("toast.retry_in_flight", "This request is already being retried"),
     ("toast.storage_error", "Storage error (state may not be saved): {error}"),
+    ("toast.draft_save_failed", "Draft could not be saved: {error}"),
+    ("toast.draft_kept_after_send", "Your newer input was kept; the sent turn is saved"),
+    ("toast.edit_target_removed", "The question you were editing was removed; its draft is preserved"),
     ("toast.rejected_no_dispatch", "Request blocked before sending: {reason}"),
     // 失败原因(卡片短标签;详情见 tooltip)
     ("failure.egress_blocked", "Network region restricted (CN/HK)"),

@@ -17,6 +17,7 @@
 //! Subscription 进入 update;按 (conversation_id, request_id) 更新。
 
 mod design;
+pub mod drafts;
 pub mod i18n;
 mod icons;
 pub mod model_picker;
@@ -31,6 +32,7 @@ use iced::widget::{
 };
 use iced::{Element, Length, Padding, Subscription, Task};
 
+use crate::app::drafts::{ComposerMode, DraftStore};
 use crate::domain::model_identity::presentation;
 use crate::domain::plan::{ContinuationSelection, ModelTarget, Planner};
 use crate::domain::recovery::{retry_decision, FailureInfo, RetryDecision};
@@ -73,6 +75,7 @@ const MAIN_MIN_WIDTH: f32 = 520.0;
 /// Composer 高度边界(5.1)。
 const COMPOSER_MIN: f32 = 76.0;
 const COMPOSER_MAX: f32 = 220.0;
+const COMPOSER_EDITOR_PADDING_Y: f32 = 16.0;
 
 pub fn main() -> iced::Result {
     tracing_subscriber::fmt()
@@ -138,14 +141,22 @@ pub enum Message {
     EgressModal(EgressModalAction),
     /// broadcast lag 后的 DB 对账。
     Reconcile,
+    /// 后台补查历史 generation usage 完成。
+    UsageRepairFinished(Result<usize, String>),
     TitleFinished(TitleEvent),
     Tick,
     // 输入与发送
     InputEdited(text_editor::Action),
+    ComposerFocus(bool),
     Send,
     Stop(GenerationId),
     Retry(MessageId),
     Copy(MessageId),
+    RemoveMessage(MessageId),
+    EditLatest(MessageId),
+    CancelEdit,
+    /// 取回保留的“编辑最新问题”缓冲(目标问题已被删除时的恢复路径)。
+    RestoreEditDraft,
     /// 展开/收起旧重试尝试(会话级)。
     ToggleAttempts,
     // 滚动(视口驱动;替代旧 WheelScrolled dy 判定)
@@ -197,7 +208,6 @@ pub enum Message {
     SidebarRelease,
     SidebarReset,
     ToggleExportMenu,
-    ToggleUsage,
     // 模型管理
     KeyInput(String),
     SaveKey,
@@ -266,7 +276,22 @@ struct PendingSend {
     /// 提交时的草稿内容(回执只清理已提交 revision,不清除新内容)。
     submitted_text: String,
     submitted_attachments: Vec<Attachment>,
+    /// 提交时冻结的草稿版本(回执按会话+版本判定,不按“当前会话”)。
+    submitted_revision: i64,
+    /// 提交时的 composer 模式(决定消费普通草稿还是编辑缓冲)。
+    mode: ComposerMode,
+    replacement: Option<(MessageId, Option<MessageId>)>,
     intent: u64,
+}
+
+/// “编辑最新问题”上下文。
+///
+/// 普通草稿不存放在这里:它由 [`DraftStore`] 持久化,编辑期间不受影响。
+#[derive(Clone)]
+struct LatestEdit {
+    message_id: MessageId,
+    parent_id: Option<MessageId>,
+    old_leaf: Option<MessageId>,
 }
 
 /// Anthropic 出口门禁弹窗(单弹窗;按 intent 去重,不堆叠)。
@@ -423,6 +448,102 @@ impl std::hash::Hash for TitleBus {
     }
 }
 
+#[derive(Default)]
+struct CostByDay {
+    known: rust_decimal::Decimal,
+    known_requests: usize,
+    pending: usize,
+    unavailable: usize,
+}
+
+#[derive(Default)]
+struct ConversationCost {
+    total: rust_decimal::Decimal,
+    known_requests: usize,
+    pending: usize,
+    unavailable: usize,
+    requests: usize,
+    days: std::collections::BTreeMap<String, CostByDay>,
+}
+
+fn summarize_conversation_cost(
+    usage: &[crate::domain::UsageRecord],
+    generations: &[crate::domain::Generation],
+    auxiliary: &[storage::AuxRequestRecord],
+) -> ConversationCost {
+    use crate::domain::UsageStatus;
+
+    let mut summary = ConversationCost::default();
+    for record in usage {
+        summary.requests += 1;
+        let date = generations
+            .iter()
+            .find(|generation| generation.request_id == record.request_id)
+            .and_then(|generation| generation.started_at)
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "Date unavailable".into());
+        let day = summary.days.entry(date).or_default();
+        match (record.status, record.cost) {
+            (UsageStatus::Known, Some(cost)) => {
+                summary.total += cost;
+                summary.known_requests += 1;
+                day.known += cost;
+                day.known_requests += 1;
+            }
+            (UsageStatus::Known | UsageStatus::Unavailable, _) => {
+                summary.unavailable += 1;
+                day.unavailable += 1;
+            }
+            (UsageStatus::Pending, _) => {
+                summary.pending += 1;
+                day.pending += 1;
+            }
+        }
+    }
+    for request in auxiliary {
+        summary.requests += 1;
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(request.started_at)
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "Date unavailable".into());
+        let day = summary.days.entry(date).or_default();
+        let cost = request
+            .cost_text
+            .as_deref()
+            .and_then(|value| value.parse::<rust_decimal::Decimal>().ok());
+        match (request.cost_status.as_str(), cost) {
+            ("known", Some(cost)) => {
+                summary.total += cost;
+                summary.known_requests += 1;
+                day.known += cost;
+                day.known_requests += 1;
+            }
+            ("pending", _) | (_, _)
+                if request.status == "in_flight" || request.status == "pending" =>
+            {
+                summary.pending += 1;
+                day.pending += 1;
+            }
+            ("known", None) | ("unknown", _) | ("unavailable", _) => {
+                summary.unavailable += 1;
+                day.unavailable += 1;
+            }
+            _ => {
+                summary.unavailable += 1;
+                day.unavailable += 1;
+            }
+        }
+    }
+    summary
+}
+
 pub struct App {
     db: Arc<Db>,
     vault: Arc<CredentialVault>,
@@ -439,7 +560,7 @@ pub struct App {
     trees: HashMap<ConversationId, MessageTree>,
     generations: HashMap<ConversationId, Vec<Generation>>,
     usage_cache: HashMap<ConversationId, Vec<crate::domain::UsageRecord>>,
-    aux_usage_cache: HashMap<ConversationId, (usize, usize)>,
+    aux_usage_cache: HashMap<ConversationId, Vec<storage::AuxRequestRecord>>,
     current: Option<ConversationId>,
 
     renders: HashMap<MessageId, RenderedMessage>,
@@ -467,12 +588,17 @@ pub struct App {
     models_status: String,
     key_status_detail: String,
     export_menu_open: bool,
-    usage_expanded: bool,
     model_search: String,
     /// 模型用量排名缓存(启动/成功提交/Started 后刷新;不在 view 查库)。
     usage_rank: Vec<String>,
 
     editor: text_editor::Content,
+    composer_focused: bool,
+    editing_latest: Option<LatestEdit>,
+    /// composer 草稿协调器(数据库草稿列的唯一写入点)。
+    drafts: DraftStore,
+    /// 编辑目标已删除但缓冲仍在的会话(可恢复路径;不静默丢弃输入)。
+    orphan_edit: Option<ConversationId>,
     model_sel: ModelSelectionState,
     /// 多支追问:已勾选的 assistant 叶子。
     branch_selection: Vec<MessageId>,
@@ -606,6 +732,19 @@ impl App {
             .into_iter()
             .collect();
 
+        // 草稿协调器:载入各会话 composer 状态与新会话槽位指针
+        // (指针悬空或已发送时安全修复,不修改其他会话内容)。
+        let mut drafts = DraftStore::new(db.clone());
+        {
+            let message_counts: HashMap<ConversationId, usize> = conversations
+                .iter()
+                .map(|c| (c.id, db.messages_of(c.id).unwrap_or_default().len()))
+                .collect();
+            drafts.load_on_start(&conversations, &|id: ConversationId| {
+                message_counts.get(&id).copied().unwrap_or(0) == 0
+            });
+        }
+
         let last_conv: Option<ConversationId> = db
             .get_ui_state("current_conversation")
             .ok()
@@ -672,11 +811,13 @@ impl App {
             models_status: String::new(),
             key_status_detail: i18n::t("models.key_not_checked").to_string(),
             export_menu_open: false,
-            usage_expanded: std::env::var_os("AICOUNCIL_DEMO_MODE").is_some()
-                && std::env::var_os("AICOUNCIL_DEMO_USAGE").is_some(),
             model_search: String::new(),
             usage_rank: Vec::new(),
             editor: text_editor::Content::new(),
+            composer_focused: false,
+            editing_latest: None,
+            drafts,
+            orphan_edit: None,
             model_sel: ModelSelectionState::default(),
             branch_selection: Vec::new(),
             pending_attachments: Vec::new(),
@@ -747,25 +888,30 @@ impl App {
             }
         }
 
-        // 草稿恢复
+        // 草稿恢复(按权威行;不读陈旧副本)
         if let Some(id) = app.current {
-            if let Some(c) = app.conversations.iter().find(|c| c.id == id) {
-                app.editor = text_editor::Content::with_text(&c.draft);
-                app.pending_attachments = c.draft_attachments.clone();
-            }
+            app.restore_composer(id);
         }
 
         // 渲染当前会话主分支
+        if let Some(conv) = app.current {
+            app.refresh_costs(conv);
+        }
         app.rerender_current();
         app.scroll
             .set_current_conversation(app.current.unwrap_or_default());
 
+        let chat_for_usage_repair = app.chat.clone();
         let mut tasks = vec![
             Task::perform(fetch_catalog(app.provider.clone()), |r| match r {
                 Ok(entries) => Message::CatalogLoaded(Ok(entries)),
                 Err(e) => Message::CatalogLoaded(Err(e)),
             }),
             Task::perform(test_key(app.provider.clone()), Message::KeyStatusDone),
+            Task::perform(
+                async move { chat_for_usage_repair.repair_pending_usage().await },
+                |result| Message::UsageRepairFinished(result.map_err(|e| e.to_string())),
+            ),
             // AICOUNCIL_E2E(端到端辅助;不改变正常路径)
         ];
         if std::env::var("AICOUNCIL_E2E").is_ok() {
@@ -798,6 +944,18 @@ impl App {
 
     fn current_tree(&self) -> Option<&MessageTree> {
         self.current.and_then(|id| self.trees.get(&id))
+    }
+
+    fn message_has_active_generation(&self, conv: ConversationId, message: MessageId) -> bool {
+        self.db
+            .generations_of(conv)
+            .unwrap_or_default()
+            .iter()
+            .any(|generation| {
+                (generation.user_message_id == message
+                    || generation.assistant_message_id == message)
+                    && !generation.status.is_terminal()
+            })
     }
 
     fn main_path(&self) -> Vec<MessageId> {
@@ -963,12 +1121,7 @@ impl App {
         self.trees.insert(conv, tree);
         self.generations
             .insert(conv, self.db.generations_of(conv).unwrap_or_default());
-        self.usage_cache
-            .insert(conv, self.db.usage_of(conv).unwrap_or_default());
-        let aux = self.db.aux_usage_of(conv).unwrap_or_default();
-        let known = aux.iter().filter(|a| a.cost_status == "known").count();
-        let unknown = aux.len() - known;
-        self.aux_usage_cache.insert(conv, (known, unknown));
+        self.refresh_costs(conv);
         // 刷新会话元数据(标题 CAS 由后台写入)
         if let Ok(all) = self.db.conversations() {
             for c in all {
@@ -977,29 +1130,49 @@ impl App {
                 }
             }
         }
+        // 草稿镜像只同步受影响会话(流式增量不重复克隆全部草稿)。
+        self.sync_draft_state(conv);
+    }
+
+    /// 按权威行同步某会话的草稿镜像(发送事务消费草稿后调用)。
+    fn sync_draft_state(&mut self, conv: ConversationId) {
+        if let Some(row) = self.db.conversation_of(conv).unwrap_or(None) {
+            self.drafts.sync_from_row(&row);
+        }
+    }
+
+    fn refresh_costs(&mut self, conv: ConversationId) {
+        self.usage_cache
+            .insert(conv, self.db.usage_of(conv).unwrap_or_default());
+        self.aux_usage_cache
+            .insert(conv, self.db.aux_usage_of(conv).unwrap_or_default());
     }
 
     fn set_current(&mut self, id: Option<ConversationId>) -> Task<Message> {
-        // 保存旧会话草稿与附件草稿(字段级,不触碰标题)
-        if let Some(old_id) = self.current {
-            let draft = self.editor.text().to_string();
-            let attachments = std::mem::take(&mut self.pending_attachments);
-            let json = serde_json::to_string(&attachments).unwrap_or_default();
-            let _ = self.db.set_conversation_draft(old_id, &draft, &json);
-            self.pending_attachments = attachments;
+        // 旧会话草稿已在每次内容变化时即时落库;此处只做一次安全 flush
+        // (内容未变则不写库、不涨版本)。
+        if self.current.is_some() {
+            self.persist_composer(false);
         }
+        self.pending_attachments.clear();
         self.current = id;
+        self.editing_latest = None;
+        self.orphan_edit = None;
         self.clear_selection();
         let mut tasks = Vec::new();
         if let Some(id) = id {
             let _ = self
                 .db
                 .set_ui_state("current_conversation", &serde_json::json!(id.as_str()));
-            if let Some(c) = self.conversations.iter().find(|c| c.id == id) {
-                self.editor = text_editor::Content::with_text(&c.draft);
-                self.pending_attachments = c.draft_attachments.clone();
-            }
+            // 恢复 composer:按权威行(不读陈旧 Conversation clone)。
+            self.restore_composer(id);
+            self.refresh_costs(id);
             self.rerender_current();
+            let chat_for_usage_repair = self.chat.clone();
+            tasks.push(Task::perform(
+                async move { chat_for_usage_repair.repair_pending_usage().await },
+                |result| Message::UsageRepairFinished(result.map_err(|e| e.to_string())),
+            ));
             self.scroll.set_current_conversation(id);
             let is_new = self
                 .trees
@@ -1014,6 +1187,129 @@ impl App {
             }
         }
         Task::batch(tasks)
+    }
+
+    // ----- composer 草稿协调 -----
+
+    /// 当前 composer 模式(普通草稿 / 编辑最新问题缓冲)。
+    fn composer_mode(&self) -> ComposerMode {
+        match &self.editing_latest {
+            Some(edit) => ComposerMode::Edit(edit.message_id),
+            None => ComposerMode::Normal,
+        }
+    }
+
+    /// 按权威行恢复某会话的 composer(切换/启动共用)。
+    ///
+    /// 存在“编辑最新问题”缓冲且目标消息仍在 → 恢复编辑模式;目标已被
+    /// 删除 → 保留缓冲并标记可恢复(不静默丢弃用户输入),输入框回到
+    /// 普通草稿。
+    fn restore_composer(&mut self, id: ConversationId) {
+        let Some(row) = self.db.conversation_of(id).unwrap_or(None) else {
+            self.editor = text_editor::Content::new();
+            self.pending_attachments.clear();
+            self.editing_latest = None;
+            self.orphan_edit = None;
+            return;
+        };
+        self.drafts.sync_from_row(&row);
+        let target_alive = row.edit_target_id.and_then(|target| {
+            self.trees
+                .get(&id)
+                .and_then(|tree| tree.get(target))
+                .cloned()
+        });
+        match (row.edit_target_id, target_alive) {
+            (Some(target), Some(message)) => {
+                self.editing_latest = Some(LatestEdit {
+                    message_id: target,
+                    parent_id: message.parent_id,
+                    old_leaf: row.main_leaf_id,
+                });
+                self.orphan_edit = None;
+                self.editor = text_editor::Content::with_text(&row.edit_draft);
+                self.pending_attachments = row.edit_draft_attachments.clone();
+            }
+            (Some(_), None) => {
+                // 目标已删除:保留缓冲,提供恢复入口(不静默丢弃输入)。
+                let newly_orphaned = self.orphan_edit != Some(id);
+                self.editing_latest = None;
+                self.orphan_edit = Some(id);
+                self.editor = text_editor::Content::with_text(&row.draft);
+                self.pending_attachments = row.draft_attachments.clone();
+                if newly_orphaned {
+                    self.toast_error = Some(i18n::t("toast.edit_target_removed").to_string());
+                }
+            }
+            (None, _) => {
+                self.editing_latest = None;
+                self.orphan_edit = None;
+                self.editor = text_editor::Content::with_text(&row.draft);
+                self.pending_attachments = row.draft_attachments.clone();
+            }
+        }
+    }
+
+    /// 持久化当前 composer 内容(草稿列的唯一写入口)。
+    ///
+    /// 按当前模式写入普通草稿或编辑缓冲。`changed` 表示本次调用代表
+    /// 一次真实的内容变化:即使用户重新输入了与库中相同的正文也算变化
+    /// (发送事务的 CAS 据此区分“重新输入”与“旧草稿”);`changed = false`
+    /// 且内容一致时不写库、不涨版本(纯光标/选区/滚动与冗余 flush)。
+    /// 保存失败时保留内存内容并给出可见提示,不静默丢弃。
+    fn persist_composer(&mut self, changed: bool) {
+        let Some(conv) = self.current else {
+            return;
+        };
+        let text = self.editor.text().to_string();
+        let attachments = self.pending_attachments.clone();
+        let mode = self.composer_mode();
+        let result = match mode {
+            ComposerMode::Normal => self.drafts.save_normal(conv, &text, &attachments, changed),
+            ComposerMode::Edit(target) => {
+                self.drafts
+                    .save_edit(conv, &text, &attachments, Some(target), changed)
+            }
+        };
+        if let Err(e) = result {
+            tracing::error!(%e, "草稿保存失败");
+            self.toast_error = Some(i18n::f(
+                "toast.draft_save_failed",
+                &[("error", &e.to_string())],
+            ));
+        }
+    }
+
+    /// 首次输入时物化会话载体(current 为空时立即新建并登记 New 槽位)。
+    fn ensure_current_conversation(&mut self) -> Option<ConversationId> {
+        if let Some(id) = self.current {
+            return Some(id);
+        }
+        let conv = Conversation::new(ConversationId::new(), crate::storage::now_dt());
+        if let Err(e) = self.db.upsert_conversation(&conv) {
+            tracing::error!(%e, "新建会话失败");
+            self.toast_error = Some(i18n::f(
+                "toast.draft_save_failed",
+                &[("error", &e.to_string())],
+            ));
+            return None;
+        }
+        let id = conv.id;
+        self.conversations.insert(0, conv);
+        self.trees.insert(id, MessageTree::new());
+        self.generations.insert(id, Vec::new());
+        self.current = Some(id);
+        let _ = self.drafts.set_pending_new(id);
+        let _ = self
+            .db
+            .set_ui_state("current_conversation", &serde_json::json!(id.as_str()));
+        Some(id)
+    }
+
+    /// composer 内容变化后的统一处理(物化载体 + 落盘)。
+    fn on_composer_changed(&mut self) {
+        self.ensure_current_conversation();
+        self.persist_composer(true);
     }
 
     // ----- 滚动操作 -----
@@ -1112,6 +1408,7 @@ impl App {
                     self.model_sel.primary,
                     self.model_sel.parallel
                 );
+                self.on_composer_changed();
                 self.send()
             }
             Message::E2eStage2 => {
@@ -1136,6 +1433,7 @@ impl App {
                 self.branch_selection = done;
                 self.editor = text_editor::Content::with_text("第二轮:请各用一句话补充");
                 self.model_sel.parallel = false;
+                self.on_composer_changed();
                 self.send()
             }
             // ----- 统一模型选择器 -----
@@ -1143,8 +1441,12 @@ impl App {
                 self.model_sel.picker_open = !self.model_sel.picker_open;
                 if !self.model_sel.picker_open {
                     self.picker_search.clear(); // 关闭即清理搜索(6.2 默认)
+                    Task::none()
+                } else {
+                    let operation =
+                        iced::advanced::widget::operation::focusable::unfocus::<Message>();
+                    iced_runtime::task::widget(operation).map(|_| Message::Nop)
                 }
-                Task::none()
             }
             Message::ToggleParallelMode => {
                 if !self.branch_selection.is_empty() {
@@ -1340,7 +1642,21 @@ impl App {
                 }
                 Task::none()
             }
+            Message::UsageRepairFinished(result) => {
+                match result {
+                    Ok(updated) if updated > 0 => {
+                        let ids: Vec<_> = self.conversations.iter().map(|c| c.id).collect();
+                        for id in ids {
+                            self.refresh_costs(id);
+                        }
+                    }
+                    Err(error) => tracing::debug!(%error, "历史 usage 补查未完成"),
+                    _ => {}
+                }
+                Task::none()
+            }
             Message::TitleFinished(ev) => {
+                self.refresh_costs(ev.conversation_id);
                 // 后台标题结果:刷新会话元数据(失败保持 fallback)
                 if ev.outcome.is_ok() {
                     if let Ok(all) = self.db.conversations() {
@@ -1358,6 +1674,9 @@ impl App {
             }
             Message::Tick => self.on_tick(),
             Message::InputEdited(action) => {
+                if self.model_sel.picker_open {
+                    return Task::none();
+                }
                 // 长粘贴转附件(≥2500 字符):不进输入框
                 if let text_editor::Action::Edit(text_editor::Edit::Paste(s)) = &action {
                     if paste_should_attach(s) {
@@ -1381,13 +1700,30 @@ impl App {
                             }
                             Err(e) => self.toast = Some(e),
                         }
+                        // 附件也是草稿的一部分:落盘。
+                        self.on_composer_changed();
                         return Task::none();
                     }
                 }
+                let before = self.editor.text().to_string();
                 self.editor.perform(action);
+                // 仅光标/选区/滚动不改内容:不触发写入,版本不增长。
+                if self.editor.text() != before.as_str() {
+                    self.on_composer_changed();
+                }
+                self.check_composer_focus()
+            }
+            Message::ComposerFocus(focused) => {
+                self.composer_focused = focused;
                 Task::none()
             }
-            Message::Send => self.send(),
+            Message::Send => {
+                if self.model_sel.picker_open {
+                    Task::none()
+                } else {
+                    self.send()
+                }
+            }
             Message::Stop(req) => {
                 // 服务侧按 request_id 定位取消令牌(submit 后立即 Stop 也可见)
                 let chat = self.chat.clone();
@@ -1411,6 +1747,128 @@ impl App {
                     .unwrap_or_default();
                 iced::clipboard::write::<Message>(content)
             }
+            Message::RemoveMessage(msg_id) => {
+                let Some(conv) = self.current else {
+                    return Task::none();
+                };
+                if self.pending_send.is_some()
+                    || self.egress_modal.is_some()
+                    || self.message_has_active_generation(conv, msg_id)
+                {
+                    return Task::none();
+                }
+                match self.db.remove_message(msg_id) {
+                    Ok(()) => {
+                        self.refresh_from_db(conv);
+                        self.branch_selection.retain(|id| {
+                            self.trees.get(&conv).is_some_and(|t| t.get(*id).is_some())
+                        });
+                        if self
+                            .selection
+                            .as_ref()
+                            .is_some_and(|(selected, _)| *selected == msg_id)
+                        {
+                            self.clear_selection();
+                        }
+                    }
+                    Err(e) => self.toast_error = Some(e.to_string()),
+                }
+                Task::none()
+            }
+            Message::EditLatest(msg_id) => {
+                if self.pending_send.is_some() || self.egress_modal.is_some() {
+                    return Task::none();
+                }
+                let Some(conv) = self.current else {
+                    return Task::none();
+                };
+                let Some(message) = self
+                    .current_tree()
+                    .and_then(|tree| tree.get(msg_id))
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                let latest_user = self.main_path().into_iter().rev().find(|id| {
+                    self.current_tree()
+                        .and_then(|tree| tree.get(*id))
+                        .is_some_and(|m| m.role == Role::User)
+                });
+                if message.role != Role::User
+                    || latest_user != Some(msg_id)
+                    || self.message_has_active_generation(conv, msg_id)
+                {
+                    return Task::none();
+                }
+                // 进入编辑模式:普通草稿保持不动,编辑缓冲独立保存。
+                if let Err(e) =
+                    self.drafts
+                        .begin_edit(conv, msg_id, &message.content, &message.attachments)
+                {
+                    tracing::error!(%e, "编辑缓冲保存失败");
+                    self.toast_error = Some(i18n::f(
+                        "toast.draft_save_failed",
+                        &[("error", &e.to_string())],
+                    ));
+                    return Task::none();
+                }
+                self.editing_latest = Some(LatestEdit {
+                    message_id: msg_id,
+                    parent_id: message.parent_id,
+                    old_leaf: self.current_conv().and_then(|c| c.main_leaf_id),
+                });
+                self.branch_selection.clear();
+                self.orphan_edit = None;
+                self.editor = text_editor::Content::with_text(&message.content);
+                self.pending_attachments = message.attachments;
+                Task::none()
+            }
+            Message::CancelEdit => {
+                if self.pending_send.is_some() {
+                    return Task::none();
+                }
+                if self.editing_latest.take().is_none() {
+                    return Task::none();
+                }
+                // 退出编辑模式:清除编辑缓冲,恢复普通草稿。
+                if let Some(conv) = self.current {
+                    if let Err(e) = self.drafts.clear_edit(conv) {
+                        tracing::error!(%e, "编辑缓冲清除失败");
+                        self.toast_error = Some(i18n::f(
+                            "toast.draft_save_failed",
+                            &[("error", &e.to_string())],
+                        ));
+                    }
+                    self.restore_composer(conv);
+                }
+                Task::none()
+            }
+            Message::RestoreEditDraft => {
+                // 恢复路径:编辑目标已删除时,仍可取回保留的编辑缓冲。
+                let Some(conv) = self.orphan_edit else {
+                    return Task::none();
+                };
+                let Some((text, attachments, target)) = self.drafts.edit_buffer(conv) else {
+                    return Task::none();
+                };
+                self.editing_latest = Some(LatestEdit {
+                    message_id: target,
+                    parent_id: self
+                        .trees
+                        .get(&conv)
+                        .and_then(|tree| tree.get(target))
+                        .and_then(|m| m.parent_id),
+                    old_leaf: self
+                        .conversations
+                        .iter()
+                        .find(|c| c.id == conv)
+                        .and_then(|c| c.main_leaf_id),
+                });
+                self.orphan_edit = None;
+                self.editor = text_editor::Content::with_text(text);
+                self.pending_attachments = attachments.to_vec();
+                Task::none()
+            }
             Message::Viewport {
                 content,
                 view,
@@ -1427,12 +1885,27 @@ impl App {
                 }
             }
             Message::NewConversation => {
+                // 优先回到未发送的新会话槽位(连点 New 不制造多个空壳;
+                // 从别的会话切回来点 New 仍是同一个槽位与同一份正文)。
+                if let Some(id) = self.drafts.pending_new() {
+                    let exists = self.conversations.iter().any(|c| c.id == id);
+                    let unsent = self
+                        .trees
+                        .get(&id)
+                        .map(|t| t.messages.is_empty())
+                        .unwrap_or(false);
+                    if exists && unsent {
+                        return self.set_current(Some(id));
+                    }
+                    let _ = self.drafts.clear_pending_new(Some(id));
+                }
                 let conv = Conversation::new(ConversationId::new(), crate::storage::now_dt());
                 let _ = self.db.upsert_conversation(&conv);
                 let id = conv.id;
                 self.conversations.insert(0, conv);
                 self.trees.insert(id, MessageTree::new());
                 self.generations.insert(id, Vec::new());
+                let _ = self.drafts.set_pending_new(id);
                 self.set_current(Some(id))
             }
             Message::SelectConversation(id) => self.set_current(Some(id)),
@@ -1505,6 +1978,14 @@ impl App {
                 self.aux_usage_cache.remove(&id);
                 self.expanded_user.remove(&id);
                 self.scroll.forget(id);
+                self.drafts.forget(id);
+                // 删除 New 槽位:指针不得悬空。
+                if self.drafts.pending_new() == Some(id) {
+                    let _ = self.drafts.clear_pending_new(Some(id));
+                }
+                if self.orphan_edit == Some(id) {
+                    self.orphan_edit = None;
+                }
                 if self.current == Some(id) {
                     let next = self.conversations.first().map(|c| c.id);
                     return self.set_current(next);
@@ -1621,10 +2102,6 @@ impl App {
             }
             Message::ToggleExportMenu => {
                 self.export_menu_open = !self.export_menu_open;
-                Task::none()
-            }
-            Message::ToggleUsage => {
-                self.usage_expanded = !self.usage_expanded;
                 Task::none()
             }
             Message::KeyInput(k) => {
@@ -1914,11 +2391,16 @@ impl App {
                     }
                     self.toast = Some(msg);
                 }
+                if added > 0 {
+                    // 附件变化属于草稿变化:落盘。
+                    self.on_composer_changed();
+                }
                 Task::none()
             }
             Message::RemoveAttachment(i) => {
                 if i < self.pending_attachments.len() {
                     self.pending_attachments.remove(i);
+                    self.on_composer_changed();
                 }
                 Task::none()
             }
@@ -1947,6 +2429,16 @@ impl App {
                         // Esc 取消弹窗:丢弃当前 intent,避免 modal 堆叠
                         self.pending_send = None;
                         return Task::none();
+                    }
+                    if self.model_sel.picker_open {
+                        self.model_sel.picker_open = false;
+                        self.picker_search.clear();
+                        let operation =
+                            iced::advanced::widget::operation::focusable::unfocus::<Message>();
+                        return iced_runtime::task::widget(operation).map(|_| Message::Nop);
+                    }
+                    if self.editing_latest.is_some() {
+                        return self.update(Message::CancelEdit);
                     }
                     if self.renaming_conv.take().is_some() || self.renaming_group.take().is_some() {
                         return Task::none();
@@ -1998,11 +2490,15 @@ impl App {
         if self.tick_count.is_multiple_of(60) && self.toast_error.is_some() {
             self.toast_error = None;
         }
-        if tasks.is_empty() {
-            Task::none()
-        } else {
-            Task::batch(tasks)
-        }
+        tasks.push(self.check_composer_focus());
+        Task::batch(tasks)
+    }
+
+    fn check_composer_focus(&self) -> Task<Message> {
+        let operation = iced::advanced::widget::operation::focusable::is_focused(
+            iced::widget::Id::new(COMPOSER_ID),
+        );
+        iced_runtime::task::widget(operation).map(Message::ComposerFocus)
     }
 
     fn on_provider_event(&mut self, ev: ChatEvent) -> Task<Message> {
@@ -2032,7 +2528,11 @@ impl App {
                     self.dirty_stream.insert(msg);
                 }
             }
-            GenEvent::UsageUpdated { .. } => {}
+            GenEvent::UsageUpdated { .. } => {
+                // Usage may arrive after Finished (or after a delayed generation lookup).
+                self.refresh_costs(conv);
+            }
+            GenEvent::RemoteGenerationId { .. } => {}
             GenEvent::Finished { .. } => {
                 // main_leaf 由服务层 CAS 移动;此处只对账
                 self.streaming.remove(&msg);
@@ -2121,15 +2621,12 @@ impl App {
             }
         }
 
-        // 会话不存在则创建
+        // 会话不存在则创建(输入时已物化;这里兜底)。
         if self.current.is_none() {
-            let conv = Conversation::new(ConversationId::new(), crate::storage::now_dt());
-            let _ = self.db.upsert_conversation(&conv);
-            let id = conv.id;
-            self.conversations.insert(0, conv);
-            self.trees.insert(id, MessageTree::new());
-            self.generations.insert(id, Vec::new());
-            self.current = Some(id);
+            let Some(id) = self.ensure_current_conversation() else {
+                return Task::none();
+            };
+            let _ = id;
         }
         let conv_id = self.current.unwrap();
 
@@ -2146,7 +2643,11 @@ impl App {
             ));
         }
 
-        let leaf = self.current_conv().and_then(|c| c.main_leaf_id);
+        let leaf = self
+            .editing_latest
+            .as_ref()
+            .map(|edit| edit.parent_id)
+            .unwrap_or_else(|| self.current_conv().and_then(|c| c.main_leaf_id));
         let system_prompt = self
             .current_conv()
             .map(|c| c.system_prompt.clone())
@@ -2224,11 +2725,21 @@ impl App {
         // 事务前不插树/不清草稿/不动 leaf —— 预检或落库失败零回滚(5.3)。
         self.intent_seq += 1;
         let intent = self.intent_seq;
+        // 冻结真实的内容版本与 composer 模式:回执只消费这一版,
+        // 用户在提交后又输入的内容不受影响。
+        let mode = self.composer_mode();
+        let submitted_revision = self.drafts.revision(conv_id);
         self.pending_send = Some(PendingSend {
             conv: conv_id,
             plan: plan.clone(),
             submitted_text: prompt,
             submitted_attachments: self.pending_attachments.clone(),
+            submitted_revision,
+            mode,
+            replacement: self
+                .editing_latest
+                .as_ref()
+                .map(|edit| (edit.message_id, edit.old_leaf)),
             intent,
         });
 
@@ -2260,21 +2771,32 @@ impl App {
             return Task::none();
         };
         let conv = pending.conv;
-        // 清编辑器:仅当内容仍是已提交 revision(A10:预检期间的新内容不清除)
-        if self.current == Some(conv) && self.editor.text() == pending.submitted_text {
+        // 清编辑器:仅当会话与版本都仍是已提交的那一版
+        // (A10:预检期间的新内容不清除;迟到回执不抹新草稿)。
+        if self.current == Some(conv) && self.drafts.revision(conv) == pending.submitted_revision {
             self.editor = text_editor::Content::new();
             self.pending_attachments.clear();
+            // 编辑模式保持到回执确认:期间的新输入仍落在编辑缓冲,
+            // 不覆盖普通草稿(两者互不覆盖)。
         }
         let chat = self.chat.clone();
         let titles = self.titles.clone();
         let turn_prompt = pending.plan.prompt.clone();
         let turn_attachments = pending.plan.attachments.clone();
         let turn_user = pending.plan.branches[0].user_message_id;
+        let replacement = pending.replacement;
+        // 草稿消费与批次同事务(按冻结版本 CAS)。
+        let draft_consumption = self.drafts.consumption(conv, pending.mode);
         Task::perform(
             async move {
-                chat.submit_with_permit(pending.plan, permit)
-                    .await
-                    .map_err(|e| e.to_string())
+                chat.submit_with_permit_replacing(
+                    pending.plan,
+                    permit,
+                    replacement,
+                    draft_consumption,
+                )
+                .await
+                .map_err(|e| e.to_string())
             },
             move |r| {
                 if let Ok(receipt) = &r {
@@ -2396,6 +2918,10 @@ impl App {
     }
 
     /// submit 回执:按 DB 权威状态对账(不把已终态请求写成 Queued)。
+    ///
+    /// 草稿清空由发送事务按版本 CAS 完成(见
+    /// [`crate::storage::DraftConsumptionRequest`]);此处**不再**无条件
+    /// 清空草稿,迟到回执不会抹掉用户在提交后输入的新内容。
     fn on_send_result(
         &mut self,
         conv: ConversationId,
@@ -2403,25 +2929,62 @@ impl App {
     ) -> Task<Message> {
         match result {
             Ok(receipt) => {
-                // 草稿字段级清空(仅已提交 revision)
-                if self.pending_send.as_ref().is_some_and(|p| p.conv == conv) {
+                let pending = self.pending_send.clone();
+                let same_conv = pending.as_ref().is_some_and(|p| p.conv == conv);
+                let was_edit = matches!(
+                    pending.as_ref().map(|p| p.mode),
+                    Some(ComposerMode::Edit(_))
+                );
+                if same_conv {
                     self.pending_send = None;
                 }
-                let _ = self.db.set_conversation_draft(
-                    conv,
-                    "",
-                    &serde_json::to_string(&Vec::<Attachment>::new()).unwrap_or_default(),
-                );
+                // 草稿镜像与权威行同步(事务已按版本 CAS 消费草稿)。
+                self.sync_draft_state(conv);
+                if was_edit && same_conv && self.current == Some(conv) {
+                    let unchanged = pending
+                        .as_ref()
+                        .map(|p| self.drafts.revision(conv) == p.submitted_revision)
+                        .unwrap_or(false);
+                    if unchanged {
+                        // 编辑缓冲已消费:退出编辑模式,普通草稿回到输入框。
+                        self.editing_latest = None;
+                        self.orphan_edit = None;
+                        let text = self.drafts.normal_text(conv).to_string();
+                        let attachments = self.drafts.normal_attachments(conv).to_vec();
+                        self.editor = text_editor::Content::with_text(&text);
+                        self.pending_attachments = attachments;
+                    } else {
+                        // 用户在提交后又输入了内容(版本已变):编辑缓冲保留
+                        // 新内容,不覆盖新输入;编辑模式继续,可自行取消。
+                        self.toast = Some(i18n::t("toast.draft_kept_after_send").to_string());
+                    }
+                }
                 self.on_submitted(conv, receipt)
             }
             Err(e) => {
                 // 落库失败:无假消息/假 leaf;恢复草稿与附件(B11)
                 tracing::error!(%e, "提交失败(草稿保留)");
                 if let Some(p) = self.pending_send.take() {
-                    if p.conv == conv && self.current == Some(conv) && self.editor.text().is_empty()
-                    {
+                    let same_conv = p.conv == conv && self.current == Some(conv);
+                    // 只在没有后续输入时恢复原稿;不拿旧文本覆盖新稿。
+                    if same_conv && self.editor.text().is_empty() {
                         self.editor = text_editor::Content::with_text(&p.submitted_text);
                         self.pending_attachments = p.submitted_attachments;
+                        if let ComposerMode::Edit(target) = p.mode {
+                            self.editing_latest = Some(LatestEdit {
+                                message_id: target,
+                                parent_id: self
+                                    .trees
+                                    .get(&conv)
+                                    .and_then(|tree| tree.get(target))
+                                    .and_then(|m| m.parent_id),
+                                old_leaf: self
+                                    .conversations
+                                    .iter()
+                                    .find(|c| c.id == conv)
+                                    .and_then(|c| c.main_leaf_id),
+                            });
+                        }
                     }
                 }
                 self.toast_error = Some(i18n::f("toast.send_failed", &[("error", &e)]));
@@ -2598,6 +3161,16 @@ fn button<'a, M: Clone + 'a>(content: impl Into<Element<'a, M>>) -> iced::widget
     iced_button(content).style(design::quiet_button)
 }
 
+fn tooltip<'a>(
+    content: impl Into<Element<'a, Message>>,
+    hint: impl Into<Element<'a, Message>>,
+    position: iced::widget::tooltip::Position,
+) -> iced::widget::Tooltip<'a, Message> {
+    iced::widget::tooltip(content, hint, position)
+        .padding(8.0)
+        .style(design::tooltip_style)
+}
+
 fn save_config(config: storage::repo::AppConfig) -> Task<Message> {
     Task::perform(
         async move { tokio::task::spawn_blocking(move || config.save()).await },
@@ -2652,27 +3225,50 @@ impl App {
     fn view_main(&self) -> Element<'_, Message> {
         let header = self.view_header();
         let messages = self.view_messages();
-        let input = self.view_input();
-        column![
+        let (input, picker) = self.view_input();
+        let base: Element<'_, Message> = column![
             header,
             container(messages).width(Length::Fill).height(Length::Fill),
             input,
         ]
-        .into()
+        .into();
+        if let Some(picker) = picker {
+            let dismiss: Element<'_, Message> = mouse_area(
+                container(Space::new().width(Length::Fill).height(Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::TogglePicker)
+            .into();
+            let panel = iced::widget::opaque(picker);
+            let placed: Element<'_, Message> = container(panel)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::Alignment::Start)
+                .align_y(iced::Alignment::End)
+                .padding(Padding {
+                    top: 0.0,
+                    bottom: 92.0,
+                    left: 16.0,
+                    right: 0.0,
+                })
+                .into();
+            iced::widget::stack![base, dismiss, placed].into()
+        } else {
+            base
+        }
     }
 
     fn view_header(&self) -> Element<'_, Message> {
-        let back: Element<'_, Message> = if self.scroll.mode() == scroll::Mode::Reading {
-            // Reading 才出现;Following 不占位(固定位置图标,不随 token 重排)
-            row![iced::widget::tooltip(
-                button(icons::icon("down")).on_press(Message::BackToBottom),
-                text(i18n::t("panel.back_bottom_tooltip")).size(12),
-                iced::widget::tooltip::Position::Bottom,
-            )]
-            .into()
-        } else {
-            row![].into()
-        };
+        let cost_label = self.cost_label();
+        let cost_tooltip = self.cost_tooltip();
+        let usage = tooltip(
+            text(cost_label)
+                .size(11)
+                .color(crate::ui_style::palette::TEXT_MUTED),
+            text(cost_tooltip).size(11),
+            iced::widget::tooltip::Position::Bottom,
+        );
 
         // 可编辑标题(主区;Enter 保存 / Esc 取消;与侧栏同一组件形态)
         let title_el: Element<'_, Message> = if let Some((id, buf)) = &self.renaming_conv {
@@ -2691,7 +3287,7 @@ impl App {
             match self.current_conv() {
                 Some(conv) => row![
                     text(self.title_text()).size(16),
-                    iced::widget::tooltip(
+                    tooltip(
                         button(icons::icon("edit")).on_press(Message::RenameStart(conv.id)),
                         text(i18n::t("title.edit_tooltip")).size(12),
                         iced::widget::tooltip::Position::Bottom,
@@ -2717,7 +3313,7 @@ impl App {
             row![].into()
         };
         let export_row = row![
-            iced::widget::tooltip(
+            tooltip(
                 button(
                     row![
                         icons::icon("export"),
@@ -2729,7 +3325,7 @@ impl App {
                 text(i18n::t("panel.export_tooltip")).size(12),
                 iced::widget::tooltip::Position::Bottom,
             ),
-            iced::widget::tooltip(
+            tooltip(
                 button(icons::icon("panel")).on_press(Message::ToggleSidebar),
                 text(i18n::t("panel.sidebar_collapse_tooltip")).size(12),
                 iced::widget::tooltip::Position::Bottom,
@@ -2740,9 +3336,14 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         container(
-            row![title_el, Space::new().width(Length::Fill), back, export_row]
-                .spacing(design::SPACING_S)
-                .align_y(iced::Alignment::Center),
+            row![
+                title_el,
+                Space::new().width(Length::Fill),
+                usage,
+                export_row
+            ]
+            .spacing(design::SPACING_S)
+            .align_y(iced::Alignment::Center),
         )
         .width(Length::Fill)
         .height(Length::Fixed(52.0))
@@ -2761,6 +3362,93 @@ impl App {
                 }
             })
             .unwrap_or_else(|| i18n::t("app.title").to_string())
+    }
+
+    fn cost_label(&self) -> String {
+        let Some(conv) = self.current else {
+            return "No cost".into();
+        };
+        let usage = self
+            .usage_cache
+            .get(&conv)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let generations = self
+            .generations
+            .get(&conv)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let auxiliary = self
+            .aux_usage_cache
+            .get(&conv)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let summary = summarize_conversation_cost(usage, generations, auxiliary);
+        if summary.requests == 0 {
+            return "No cost".into();
+        }
+        if summary.known_requests == 0 {
+            return if summary.pending > 0 {
+                "Cost pending".into()
+            } else {
+                "Cost unavailable".into()
+            };
+        }
+        format!(
+            "${}{}",
+            crate::domain::money::format_usd(summary.total),
+            if summary.pending + summary.unavailable > 0 {
+                " *"
+            } else {
+                ""
+            }
+        )
+    }
+
+    fn cost_tooltip(&self) -> String {
+        let Some(conv) = self.current else {
+            return "No requests".into();
+        };
+        let usage = self
+            .usage_cache
+            .get(&conv)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let generations = self
+            .generations
+            .get(&conv)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let auxiliary = self
+            .aux_usage_cache
+            .get(&conv)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let summary = summarize_conversation_cost(usage, generations, auxiliary);
+        let confirmed = if summary.known_requests > 0 {
+            format!(
+                "confirmed subtotal ${}",
+                crate::domain::money::format_usd(summary.total)
+            )
+        } else {
+            "no confirmed amount yet".into()
+        };
+        let mut lines = vec![format!(
+            "{} requests · {} · {} pending · {} unavailable",
+            summary.requests, confirmed, summary.pending, summary.unavailable,
+        )];
+        for (day, costs) in summary.days.into_iter().rev() {
+            let daily_total = if costs.known_requests > 0 {
+                format!("${}", crate::domain::money::format_usd(costs.known))
+            } else {
+                "no confirmed amount".into()
+            };
+            lines.push(format!(
+                "{day}: {daily_total} · {} pending · {} unavailable",
+                costs.pending, costs.unavailable
+            ));
+        }
+        lines.join("\n")
     }
 
     fn view_messages(&self) -> Element<'_, Message> {
@@ -2824,6 +3512,38 @@ impl App {
             }
             cards.push(self.view_message_card(*id));
         }
+        // A deleted parallel user can leave visible answers whose generation
+        // still points at that user. Keep those answers visible as a group.
+        let already_rendered: HashSet<MessageId> = path.iter().copied().collect();
+        if let Some(conv) = self.current {
+            let mut orphan_groups: HashMap<MessageId, Vec<Element<Message>>> = HashMap::new();
+            let mut orphan_rendered = HashSet::new();
+            if let Some(generations) = self.generations.get(&conv) {
+                for generation in generations {
+                    if (tree.get(generation.user_message_id).is_none()
+                        || self.current_conv().and_then(|c| c.main_leaf_id)
+                            == Some(generation.user_message_id))
+                        && !already_rendered.contains(&generation.assistant_message_id)
+                        && orphan_rendered.insert(generation.assistant_message_id)
+                        && tree
+                            .get(generation.assistant_message_id)
+                            .is_some_and(|m| m.role == Role::Assistant)
+                    {
+                        orphan_groups
+                            .entry(generation.user_message_id)
+                            .or_default()
+                            .push(self.view_message_card(generation.assistant_message_id));
+                    }
+                }
+            }
+            for answers in orphan_groups.into_values() {
+                cards.push(
+                    container(row(answers).spacing(design::SPACING_XS))
+                        .width(Length::Fill)
+                        .into(),
+                );
+            }
+        }
         if cards.is_empty() {
             let configure: Element<Message> = if self.enabled_models().is_empty() {
                 button(
@@ -2870,7 +3590,25 @@ impl App {
                 offset,
             }
         });
-        scroll.into()
+        let latest: Element<'_, Message> = if self.scroll.mode() == scroll::Mode::Reading {
+            container(tooltip(
+                button(icons::icon("down"))
+                    .on_press(Message::BackToBottom)
+                    .style(design::active_button)
+                    .padding(8),
+                text(i18n::t("panel.back_bottom_tooltip")).size(12),
+                iced::widget::tooltip::Position::Top,
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::End)
+            .align_y(iced::Alignment::End)
+            .padding(16)
+            .into()
+        } else {
+            Space::new().width(Length::Fill).height(Length::Fill).into()
+        };
+        iced::widget::stack![scroll, latest].into()
     }
 
     fn view_message_card(&self, id: MessageId) -> Element<'_, Message> {
@@ -2884,6 +3622,11 @@ impl App {
 
         let stream = self.status_of(id);
         let is_user = m.role == Role::User;
+        let latest_user = self.main_path().into_iter().rev().find(|message_id| {
+            self.current_tree()
+                .and_then(|tree| tree.get(*message_id))
+                .is_some_and(|message| message.role == Role::User)
+        });
         let gen = if is_user {
             None
         } else {
@@ -2961,11 +3704,14 @@ impl App {
             .color(crate::ui_style::palette::TEXT_MUTED)]
         .spacing(design::SPACING_XS)
         .align_y(iced::Alignment::Center);
+        let mut actions = row![]
+            .spacing(design::SPACING_XS)
+            .align_y(iced::Alignment::Center);
         // raw ID tooltip(消除正文里的 anthropic/… 噪音;审计可见)
         if let Some(mid) = &raw_model_id {
             if let Some(name) = &model_name {
                 if name != mid {
-                    header = header.push(iced::widget::tooltip(
+                    header = header.push(tooltip(
                         text(i18n::t("models.id_tooltip").replace("{id}", mid))
                             .size(10)
                             .color(crate::ui_style::palette::TEXT_MUTED),
@@ -2983,7 +3729,7 @@ impl App {
         }
         if let Some(reason) = short_reason {
             let err_el: Element<Message> = if let Some(full) = &full_error {
-                iced::widget::tooltip(
+                tooltip(
                     text(reason).size(11).color(crate::ui_style::palette::ERROR),
                     text(full.clone()).size(11),
                     iced::widget::tooltip::Position::Bottom,
@@ -2997,15 +3743,36 @@ impl App {
             };
             header = header.push(err_el);
         }
-        header = header.push(Space::new().width(Length::Fill));
-        header = header.push(iced::widget::tooltip(
+        actions = actions.push(tooltip(
             button(icons::icon("copy")).on_press(Message::Copy(id)),
             text(i18n::t("message.copy_tooltip")).size(12),
             iced::widget::tooltip::Position::Top,
         ));
+        let can_remove = !streaming_now
+            && self.pending_send.is_none()
+            && self.egress_modal.is_none()
+            && !self.message_has_active_generation(conv_id, id);
+        actions = actions.push(tooltip(
+            button(icons::icon("trash"))
+                .on_press_maybe(can_remove.then_some(Message::RemoveMessage(id))),
+            text("Remove message from conversation").size(12),
+            iced::widget::tooltip::Position::Top,
+        ));
+        if is_user
+            && latest_user == Some(id)
+            && !self.message_has_active_generation(conv_id, id)
+            && self.pending_send.is_none()
+            && self.egress_modal.is_none()
+        {
+            actions = actions.push(tooltip(
+                button(icons::icon("edit")).on_press(Message::EditLatest(id)),
+                text("Edit latest question").size(12),
+                iced::widget::tooltip::Position::Top,
+            ));
+        }
         if streaming_now {
             let req = stream.as_ref().unwrap().request_id;
-            header = header.push(iced::widget::tooltip(
+            actions = actions.push(tooltip(
                 button(icons::icon("stop")).on_press(Message::Stop(req)),
                 text(i18n::t("message.stop")).size(12),
                 iced::widget::tooltip::Position::Top,
@@ -3071,13 +3838,13 @@ impl App {
             if allowed {
                 retry_btn = retry_btn.on_press(Message::Retry(id));
             }
-            header = header.push(iced::widget::tooltip(
+            actions = actions.push(tooltip(
                 retry_btn,
                 text(retry_tip).size(12),
                 iced::widget::tooltip::Position::Top,
             ));
             if completed && self.current_conv().and_then(|c| c.main_leaf_id) != Some(id) {
-                header = header.push(iced::widget::tooltip(
+                actions = actions.push(tooltip(
                     button(icons::icon("continue")).on_press(Message::ContinueFrom(id)),
                     text(i18n::t("message.continue_tooltip")).size(12),
                     iced::widget::tooltip::Position::Top,
@@ -3085,7 +3852,7 @@ impl App {
             }
             if completed {
                 let checked = self.branch_selection.contains(&id);
-                header = header.push(iced::widget::tooltip(
+                actions = actions.push(tooltip(
                     checkbox(checked)
                         .on_toggle(move |_| Message::ToggleBranchSelect(id))
                         .size(14),
@@ -3120,6 +3887,7 @@ impl App {
         };
 
         let collapsible = is_user && should_collapse(&m.content);
+        let mut expand_action: Option<Element<Message>> = None;
         let expanded = collapsible
             && self
                 .expanded_user
@@ -3143,19 +3911,15 @@ impl App {
                     .clip(true)
                     .into()
             };
-            column![
-                clipped,
-                container(iced::widget::tooltip(
+            expand_action = Some(
+                tooltip(
                     button(icons::icon(chevron)).on_press(expand_msg),
                     text(tip).size(12),
                     iced::widget::tooltip::Position::Top,
-                ))
-                .center_x(Length::Fill)
-                .height(Length::Fixed(24.0)),
-            ]
-            .spacing(design::SPACING_XS)
-            .width(Length::Fill)
-            .into()
+                )
+                .into(),
+            );
+            clipped
         } else {
             body
         };
@@ -3185,17 +3949,41 @@ impl App {
             card = card.push(chips);
         }
 
-        container(card)
+        if let Some(expand_action) = expand_action {
+            card = card.push(
+                container(expand_action)
+                    .width(Length::Fill)
+                    .align_x(iced::Alignment::Center),
+            );
+        }
+        card = card.push(
+            container(actions)
+                .width(Length::Fill)
+                .align_x(iced::Alignment::End),
+        );
+        let bubble = container(card)
             .width(Length::Fill)
             .padding(Padding::new(design::SPACING_M))
-            .style(design::card_style(is_user))
+            .style(design::card_style(is_user));
+        if is_user {
+            row![
+                Space::new().width(Length::FillPortion(38)),
+                container(bubble).width(Length::FillPortion(62)),
+            ]
+            .width(Length::Fill)
             .into()
+        } else {
+            container(bubble)
+                .width(Length::Fill)
+                .align_x(iced::Alignment::Start)
+                .into()
+        }
     }
 
-    fn view_input(&self) -> Element<'_, Message> {
+    fn view_input(&self) -> (Element<'_, Message>, Option<Element<'_, Message>>) {
         // 门禁弹窗打开时:主区底部显示弹窗卡片(替代输入区;Esc/取消关闭)
         if self.egress_modal.is_some() {
-            return self.view_egress_modal();
+            return (self.view_egress_modal(), None);
         }
         let snapshot = self.normalized_selection();
         let enabled = self.enabled_models();
@@ -3241,7 +4029,7 @@ impl App {
             ))
             .size(12)
         };
-        let selector_button = iced::widget::tooltip(
+        let selector_button = tooltip(
             button(
                 row![
                     icons::icon("models"),
@@ -3330,7 +4118,7 @@ impl App {
                                     text("").size(10)
                                 },
                                 Space::new().width(Length::Fill),
-                                iced::widget::tooltip(
+                                tooltip(
                                     button(icons::icon("star"))
                                         .on_press(Message::SetPrimary(m_owned.clone())),
                                     text(i18n::t("composer.primary_tooltip")).size(12),
@@ -3379,32 +4167,36 @@ impl App {
                 i18n::t("selector.single_hint")
             };
             // 自适应高度:桌面约 150–300,按窗口高度缩放(6.2;D04/D07)
-            let picker_height = (self.window_size.1 * 0.35).clamp(150.0, 300.0);
-            column![
-                row![
-                    checkbox(self.model_sel.parallel)
-                        .label(i18n::t("composer.parallel"))
-                        .on_toggle(|_| Message::ToggleParallelMode)
-                        .size(14)
-                        .text_size(12),
-                    Space::new().width(Length::Fill),
-                    text(hint)
-                        .size(10)
-                        .color(crate::ui_style::palette::TEXT_MUTED),
+            let picker_height = ((self.window_size.1 - 170.0) * 0.35).clamp(80.0, 300.0);
+            let picker_width = (self.window_size.0 - 300.0).clamp(240.0, 430.0);
+            container(
+                column![
+                    row![
+                        checkbox(self.model_sel.parallel)
+                            .label(i18n::t("composer.parallel"))
+                            .on_toggle(|_| Message::ToggleParallelMode)
+                            .size(14)
+                            .text_size(12),
+                        Space::new().width(Length::Fill),
+                        text(hint)
+                            .size(10)
+                            .color(crate::ui_style::palette::TEXT_MUTED),
+                    ]
+                    .spacing(design::SPACING_XS)
+                    .align_y(iced::Alignment::Center),
+                    text_input(i18n::t("selector.search_placeholder"), &self.picker_search,)
+                        .on_input(Message::PickerSearchChanged)
+                        .size(12)
+                        .style(design::text_input_style),
+                    scrollable(list)
+                        .width(Length::Fill)
+                        .height(Length::Fixed(picker_height)),
                 ]
                 .spacing(design::SPACING_XS)
-                .align_y(iced::Alignment::Center),
-                text_input(i18n::t("selector.search_placeholder"), &self.picker_search,)
-                    .on_input(Message::PickerSearchChanged)
-                    .size(12)
-                    .style(design::text_input_style),
-                scrollable(list)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(picker_height)),
-            ]
-            .spacing(design::SPACING_XS)
-            .padding(Padding::new(design::SPACING_XS))
-            .width(Length::Fill)
+                .padding(Padding::new(design::SPACING_XS))
+                .width(Length::Fixed(picker_width)),
+            )
+            .style(design::picker_panel_style)
             .into()
         } else {
             column![].into()
@@ -3413,9 +4205,17 @@ impl App {
         let editor = container(
             text_editor(&self.editor)
                 .on_action(Message::InputEdited)
+                .style(design::text_editor_style)
                 .height(Length::Shrink)
-                .min_height(COMPOSER_MIN)
-                .max_height((self.window_size.1 * 0.30).min(COMPOSER_MAX))
+                .min_height(if self.composer_focused || !self.editor.text().is_empty() {
+                    COMPOSER_MIN
+                } else {
+                    23.0
+                })
+                .max_height(
+                    ((self.window_size.1 * 0.30).min(COMPOSER_MAX) - COMPOSER_EDITOR_PADDING_Y)
+                        .max(0.0),
+                )
                 .padding(8)
                 .line_height(iced::advanced::text::LineHeight::Relative(
                     crate::ui_style::BODY_LINE_HEIGHT,
@@ -3463,7 +4263,7 @@ impl App {
             let mut col = column![];
             for s in self.streaming.values() {
                 if !s.status.is_terminal() {
-                    col = col.push(iced::widget::tooltip(
+                    col = col.push(tooltip(
                         button(
                             row![icons::icon("stop"), text(i18n::t("message.stop")).size(13)]
                                 .spacing(design::SPACING_XS),
@@ -3479,9 +4279,19 @@ impl App {
         } else {
             let sendable = snapshot.invalid_reason.is_none();
             let mut btn = button(
-                row![icons::icon("send"), text(i18n::t("composer.send")).size(13)]
+                container(
+                    row![
+                        icons::icon_with_color("send", iced::Color::WHITE),
+                        text(i18n::t("composer.send"))
+                            .size(13)
+                            .color(iced::Color::WHITE)
+                    ]
                     .spacing(design::SPACING_XS),
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill),
             )
+            .width(Length::Fixed(112.0))
             .style(design::accent_button);
             if sendable {
                 btn = btn.on_press(Message::Send);
@@ -3490,22 +4300,10 @@ impl App {
                 Some(reason) => text(i18n::t(reason)).size(12),
                 None => text(i18n::t("composer.send_tooltip")).size(12),
             };
-            iced::widget::tooltip(btn, tip, iced::widget::tooltip::Position::Top).into()
+            tooltip(btn, tip, iced::widget::tooltip::Position::Top).into()
         };
 
-        let usage_button = iced::widget::tooltip(
-            button(
-                row![
-                    icons::icon("usage"),
-                    text(i18n::t("composer.usage")).size(12)
-                ]
-                .spacing(5),
-            )
-            .on_press(Message::ToggleUsage),
-            text(i18n::t("composer.usage_tooltip")).size(12),
-            iced::widget::tooltip::Position::Top,
-        );
-        let attach_button = iced::widget::tooltip(
+        let attach_button = tooltip(
             button(
                 row![
                     icons::icon("attach"),
@@ -3517,13 +4315,39 @@ impl App {
             text(i18n::t("composer.attach_tooltip")).size(12),
             iced::widget::tooltip::Position::Top,
         );
+        let edit_cancel: Element<'_, Message> = if self.editing_latest.is_some() {
+            tooltip(
+                button(text(i18n::t("composer.cancel_edit")).size(12))
+                    .on_press(Message::CancelEdit)
+                    .style(design::quiet_button),
+                text(i18n::t("composer.cancel_edit_tooltip")).size(12),
+                iced::widget::tooltip::Position::Top,
+            )
+            .into()
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
+        // 编辑目标已被删除:保留的编辑缓冲提供恢复入口(不静默丢弃输入)。
+        let restore_edit: Element<'_, Message> = if self.orphan_edit.is_some() {
+            tooltip(
+                button(text(i18n::t("composer.restore_edit")).size(12))
+                    .on_press(Message::RestoreEditDraft)
+                    .style(design::quiet_button),
+                text(i18n::t("composer.restore_edit_tooltip")).size(12),
+                iced::widget::tooltip::Position::Top,
+            )
+            .into()
+        } else {
+            Space::new().width(Length::Fixed(0.0)).into()
+        };
 
         let toolbar = container(
             row![
                 selector_button,
                 Space::new().width(Length::Fill),
+                edit_cancel,
+                restore_edit,
                 attach_button,
-                usage_button,
                 action,
             ]
             .spacing(design::SPACING_M)
@@ -3546,54 +4370,26 @@ impl App {
         } else {
             text("").size(11).into()
         };
-        let usage_panel: Element<Message> = if self.usage_expanded {
-            let usage = self.current.and_then(|conv| self.usage_cache.get(&conv));
-            let summary = usage
-                .map(|items| crate::domain::CostSummary::from_records(items.iter()))
-                .unwrap_or_default();
-            let aux = self
-                .current
-                .and_then(|conv| self.aux_usage_cache.get(&conv))
-                .copied()
-                .unwrap_or((0, 0));
-            column![
-                text(i18n::f(
-                    "usage.known_pending",
-                    &[
-                        ("known", &summary.known_total.to_string()),
-                        ("pending", &summary.pending_count.to_string()),
-                        ("unavailable", &summary.unavailable_count.to_string()),
-                    ],
-                ))
-                .size(11),
-                text(i18n::f(
-                    "settings.title_requests",
-                    &[
-                        ("known", &aux.0.to_string()),
-                        ("unknown", &aux.1.to_string())
-                    ],
-                ))
-                .size(11)
-                .color(crate::ui_style::palette::TEXT_MUTED),
-                text(self.key_status_detail.clone())
-                    .size(11)
-                    .color(crate::ui_style::palette::TEXT_MUTED),
-            ]
-            .spacing(3)
-            .into()
-        } else {
-            column![].into()
-        };
-
-        let input = column![editor, chips, toolbar, picker, toast_el, usage_panel,]
+        let input = column![editor, chips, toolbar, toast_el,]
             .spacing(design::SPACING_XS)
             .padding(Padding::new(10.0))
             .height(Length::Shrink);
-        container(input)
+        let base: Element<'_, Message> = container(input)
             .width(Length::Fill)
             .height(Length::Shrink)
             .style(design::composer_style)
-            .into()
+            .into();
+        if self.model_sel.picker_open && !enabled.is_empty() {
+            let picker_width = (self.window_size.0 - 300.0).clamp(240.0, 430.0);
+            let panel: Element<'_, Message> = container(picker)
+                .padding(8)
+                .width(Length::Fixed(picker_width + 16.0))
+                .style(design::picker_panel_style)
+                .into();
+            (base, Some(panel))
+        } else {
+            (base, None)
+        }
     }
 
     /// Anthropic 出口门禁弹窗(替代输入区渲染;Esc/Cancel 关闭)。
@@ -3745,7 +4541,8 @@ impl App {
         let filter = |c: &Conversation| {
             self.conv_search.is_empty()
                 || c.title.contains(&self.conv_search)
-                || c.draft.contains(&self.conv_search)
+                // 草稿正文取协调器镜像(权威来源是数据库行)。
+                || self.drafts.normal_text(c.id).contains(&self.conv_search)
         };
         for (name, group_id) in std::iter::once((i18n::t("conversation.group_ungrouped"), None))
             .chain(self.groups.iter().map(|g| (g.name.as_str(), Some(g.id))))
@@ -3765,12 +4562,12 @@ impl App {
             .padding(2);
             if let Some(id) = group_id {
                 g = g.push(Space::new().width(Length::Fill));
-                g = g.push(iced::widget::tooltip(
+                g = g.push(tooltip(
                     button(icons::icon("edit")).on_press(Message::RenameGroupStart(id)),
                     text(i18n::t("group.rename")).size(12),
                     iced::widget::tooltip::Position::Left,
                 ));
-                g = g.push(iced::widget::tooltip(
+                g = g.push(tooltip(
                     button(icons::icon("x"))
                         .on_press(Message::DeleteGroup(id))
                         .style(design::danger_button),
@@ -3799,7 +4596,7 @@ impl App {
                             design::quiet_button
                         }),
                     Space::new().width(Length::Fill),
-                    iced::widget::tooltip(
+                    tooltip(
                         button(icons::icon("edit")).on_press(Message::RenameStart(c.id)),
                         text(i18n::t("title.edit_tooltip")).size(12),
                         iced::widget::tooltip::Position::Left,
@@ -3948,12 +4745,12 @@ impl App {
             ]
             .spacing(design::SPACING_XS)
             .align_y(iced::Alignment::Center);
-            r = r.push(iced::widget::tooltip(
+            r = r.push(tooltip(
                 button(icons::icon("up")).on_press(Message::MoveModel(m.clone(), -1)),
                 text(i18n::t("models.move_up_tooltip")).size(12),
                 iced::widget::tooltip::Position::Left,
             ));
-            r = r.push(iced::widget::tooltip(
+            r = r.push(tooltip(
                 button(icons::icon("down")).on_press(Message::MoveModel(m.clone(), 1)),
                 text(i18n::t("models.move_down_tooltip")).size(12),
                 iced::widget::tooltip::Position::Left,
@@ -4030,7 +4827,7 @@ impl App {
                     .size(14)
                     .text_size(13),
                 Space::new().width(Length::Fill),
-                iced::widget::tooltip(
+                tooltip(
                     text(i18n::t("models.price"))
                         .size(10)
                         .color(crate::ui_style::palette::TEXT_MUTED),
@@ -4408,5 +5205,122 @@ mod tests {
         assert!(ellipsize("abcdef", 3).ends_with('…'));
         assert_eq!(size_label(512), "512 B");
         assert_eq!(size_label(2048), "2.0 KB");
+    }
+
+    #[test]
+    fn conversation_cost_uses_started_dates_and_counts_auxiliary_cost_and_unknowns() {
+        use crate::domain::{CostSource, GenerationId, UsageRecord, UsageStatus};
+        use chrono::TimeZone;
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let day_one = chrono::Utc.with_ymd_and_hms(2024, 3, 1, 12, 0, 0).unwrap();
+        let day_two = chrono::Utc.with_ymd_and_hms(2024, 3, 2, 12, 0, 0).unwrap();
+        let first = GenerationId::new();
+        let zero = GenerationId::new();
+        let pending = GenerationId::new();
+        let unknown = GenerationId::new();
+        let mut first_usage = UsageRecord::pending(first);
+        first_usage.merge_known(
+            None,
+            None,
+            Some(Decimal::from_str("0.004").unwrap()),
+            CostSource::ApiReported,
+            None,
+            day_two,
+        );
+        first_usage.queried_at = Some(day_two); // calendar date must follow started_at
+        let mut zero_usage = UsageRecord::pending(zero);
+        zero_usage.merge_known(
+            None,
+            None,
+            Some(Decimal::ZERO),
+            CostSource::ApiReported,
+            None,
+            day_two,
+        );
+        let mut unavailable = UsageRecord::pending(unknown);
+        unavailable.status = UsageStatus::Unavailable;
+        let generations = vec![
+            cost_test_generation(first, day_one),
+            cost_test_generation(zero, day_one),
+            cost_test_generation(pending, day_two),
+            cost_test_generation(unknown, day_two),
+        ];
+        let auxiliary = storage::AuxRequestRecord {
+            request_token: "title-token".into(),
+            purpose: "title".into(),
+            turn_id: None,
+            provider: "test".into(),
+            model: "test/model".into(),
+            status: "completed".into(),
+            started_at: day_two.timestamp_millis(),
+            finished_at: Some(day_two.timestamp_millis()),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cost_text: Some("0.001".into()),
+            cost_status: "known".into(),
+            error_kind: None,
+        };
+        let result = summarize_conversation_cost(
+            &[
+                first_usage,
+                zero_usage,
+                UsageRecord::pending(pending),
+                unavailable,
+            ],
+            &generations,
+            std::slice::from_ref(&auxiliary),
+        );
+        assert_eq!(result.total.to_string(), "0.005");
+        assert_eq!(result.requests, 5);
+        assert_eq!(result.pending, 1);
+        assert_eq!(result.unavailable, 1);
+        assert_eq!(result.days.len(), 2);
+        assert_eq!(
+            result
+                .days
+                .values()
+                .map(|day| day.known.to_string())
+                .collect::<Vec<_>>(),
+            vec!["0.004", "0.001"]
+        );
+        assert_eq!(
+            result
+                .days
+                .values()
+                .map(|day| day.pending + day.unavailable)
+                .sum::<usize>(),
+            2
+        );
+    }
+
+    fn cost_test_generation(
+        request_id: crate::domain::GenerationId,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::domain::Generation {
+        crate::domain::Generation {
+            request_id,
+            batch_id: crate::domain::BatchId::new(),
+            user_message_id: crate::domain::MessageId::new(),
+            assistant_message_id: crate::domain::MessageId::new(),
+            provider_id: crate::domain::ProviderId::new(),
+            model_id: "test/model".into(),
+            status: crate::domain::GenerationStatus::Completed,
+            params: None,
+            system_prompt: None,
+            context_snapshot: Vec::new(),
+            price_snapshot: None,
+            remote_generation_id: None,
+            error: None,
+            retry_of: None,
+            retry_root_id: None,
+            failure: None,
+            request_snapshot: None,
+            retry_not_before_ms: None,
+            dispatch_phase: crate::domain::DispatchPhase::RemoteAccepted,
+            started_at: Some(started_at),
+            finished_at: None,
+        }
     }
 }

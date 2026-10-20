@@ -331,6 +331,8 @@ mod tests {
             generations: vec![gen],
             usage: vec![],
             intended_main_leaf: None,
+            replacement: None,
+            draft_consumption: None,
         })
         .unwrap();
         let msgs = db.messages_of(conv.id).unwrap();
@@ -346,6 +348,45 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].draft_attachments.len(), 1);
         assert_eq!(back[0].draft_attachments[0].name, "a.txt");
+    }
+
+    #[test]
+    fn removed_message_is_hidden_and_visible_descendants_are_reparented() {
+        use crate::domain::{Conversation, ConversationId, Message, MessageId, Role};
+        let db = crate::storage::open_in_memory().unwrap();
+        let conv = Conversation::new(ConversationId::new(), chrono::Utc::now());
+        db.upsert_conversation(&conv).unwrap();
+        let root = MessageId::new();
+        let removed = MessageId::new();
+        let leaf = MessageId::new();
+        for (id, parent, role, content) in [
+            (root, None, Role::User, "first"),
+            (removed, Some(root), Role::Assistant, "removed answer"),
+            (leaf, Some(removed), Role::User, "followup"),
+        ] {
+            db.insert_message(&Message {
+                id,
+                conversation_id: conv.id,
+                parent_id: parent,
+                role,
+                content: content.into(),
+                attachments: Vec::new(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        }
+        db.remove_message(removed).unwrap();
+        let visible = db.messages_of(conv.id).unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(!visible.iter().any(|m| m.content == "removed answer"));
+        assert_eq!(
+            visible.iter().find(|m| m.id == leaf).unwrap().parent_id,
+            Some(root)
+        );
+        db.set_conversation_main_leaf(conv.id, Some(leaf)).unwrap();
+        db.remove_message(root).unwrap();
+        db.remove_message(leaf).unwrap();
+        assert_eq!(db.main_leaf_of(conv.id).unwrap(), None);
     }
 
     #[test]

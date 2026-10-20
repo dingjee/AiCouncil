@@ -28,14 +28,16 @@ pub const BODY_SIZE_MIN: f32 = 12.0;
 pub const BODY_SIZE_MAX: f32 = 22.0;
 pub const BODY_SIZE_DEFAULT: f32 = 15.0;
 
-/// 标题倍率:H1=φ² … H6=1(3.2 表;相邻顶部层级 ≈27% 差异)。
+/// 标题倍率:H1=φ、H2=φ^(3/4)、H3=√φ、H4=∜φ、H5=⁸√φ、H6=1。
 pub fn heading_ratio(level: u8) -> f32 {
+    let sqrt_phi = PHI.sqrt();
+    let fourth_root_phi = sqrt_phi.sqrt();
     match level {
-        1 => PHI * PHI,
-        2 => PHI * PHI.sqrt(),
-        3 => PHI,
-        4 => PHI.sqrt(),
-        5 => PHI.sqrt().sqrt(),
+        1 => PHI,
+        2 => sqrt_phi * fourth_root_phi,
+        3 => sqrt_phi,
+        4 => fourth_root_phi,
+        5 => fourth_root_phi.sqrt(),
         _ => 1.0,
     }
 }
@@ -156,11 +158,13 @@ mod tests {
 
     #[test]
     fn golden_heading_ratios() {
-        let (r1, r2, r3) = (heading_ratio(1), heading_ratio(2), heading_ratio(3));
-        assert!((r1 - 2.618).abs() < 1e-3);
-        assert!((r2 - 2.058).abs() < 1e-3);
-        assert!((r3 - 1.618).abs() < 1e-3);
-        assert!((r1 / r2 - 1.0).abs() > 0.25, "H1/H2 差异应明显大于旧版 18%");
+        let actual: Vec<_> = (1..=6).map(heading_ratio).collect();
+        let expected = [1.618_034, 1.434_976, 1.272_02, 1.127_838, 1.062_091, 1.0];
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-3);
+        }
+        assert!(actual.windows(2).all(|pair| pair[0] > pair[1]));
+        assert!((actual[0] / actual[1] - 1.0).abs() < 0.14);
         assert_eq!(heading_ratio(6), 1.0);
         assert_eq!(heading_ratio(0), heading_ratio(6));
     }
@@ -190,9 +194,10 @@ mod tests {
         const {
             assert!(BODY_SIZE_MIN < BODY_SIZE_DEFAULT && BODY_SIZE_DEFAULT < BODY_SIZE_MAX);
         }
+        // 标题倍率取 φ 的根次幂:H3 = √φ(见 heading_ratio 与 golden_heading_ratios)。
         assert_eq!(
             heading_ratio(3) * BODY_SIZE_DEFAULT,
-            PHI * BODY_SIZE_DEFAULT
+            PHI.sqrt() * BODY_SIZE_DEFAULT
         );
     }
 }

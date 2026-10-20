@@ -21,10 +21,18 @@ pub struct Conversation {
     pub system_prompt: String,
     /// 当前主分支叶子(下一轮默认继续位置)。
     pub main_leaf_id: Option<MessageId>,
-    /// 输入框草稿。
+    /// 输入框草稿(普通 composer 正文;权威副本)。
     pub draft: String,
-    /// 输入区待发送附件草稿(P7B)。
+    /// 输入区待发送附件草稿(P7B;普通 composer 附件)。
     pub draft_attachments: Vec<super::attachment::Attachment>,
+    /// composer 内容版本(用户编辑计数;发送事务按此 CAS 消费草稿)。
+    pub draft_revision: i64,
+    /// “编辑最新问题”缓冲正文(与普通草稿相互独立)。
+    pub edit_draft: String,
+    /// “编辑最新问题”缓冲附件。
+    pub edit_draft_attachments: Vec<super::attachment::Attachment>,
+    /// “编辑最新问题”针对的消息(为空即不在编辑模式)。
+    pub edit_target_id: Option<MessageId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// 标题来源(自动标题服务,PLAN 7.1)。
@@ -120,6 +128,10 @@ impl Conversation {
             main_leaf_id: None,
             draft: String::new(),
             draft_attachments: Vec::new(),
+            draft_revision: 0,
+            edit_draft: String::new(),
+            edit_draft_attachments: Vec::new(),
+            edit_target_id: None,
             created_at: now,
             updated_at: now,
             title_source: TitleSource::Empty,

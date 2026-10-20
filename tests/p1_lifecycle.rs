@@ -87,6 +87,8 @@ fn persist_plan(db: &Db, plan: &aicouncil::domain::SendPlan) -> BatchId {
         generations,
         usage,
         intended_main_leaf: None,
+        replacement: None,
+        draft_consumption: None,
     })
     .expect("批次落库");
     batch
@@ -351,6 +353,8 @@ fn transaction_rollback_on_bad_parent() {
         generations: vec![],
         usage: vec![],
         intended_main_leaf: None,
+        replacement: None,
+        draft_consumption: None,
     };
     assert!(db.save_send_batch(&rec).is_err(), "外键应拒绝");
     // 整体回滚:批次未写入

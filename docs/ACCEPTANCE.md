@@ -250,6 +250,147 @@ injection) are listed as limitations; "all passed" is not claimed.
 - Paragraph unit tests cover 90/180/360px widths, checking that the actually drawn line coordinates match selection hit testing; also verifies English word wrapping, centered/right alignment, and heading text/formula font sizes.
 - `rustfmt --edition 2021 --check src/render/flow.rs src/render/view.rs tests/render_layout.rs examples/render_probe.rs` and `git diff --check` pass.
 - Root cause and reproduction commands are in section 0.1.5 of `docs/RENDERING.md`.
+
 - Visual evidence: 9 whole-document renders (3 font sizes × 3 widths), generated directly by the same tiny-skia renderer and full `view_message` layout as the app via `AICOUNCIL_RENDER_CAPTURE_DIR` (captured locally, not kept in the repo). Visual inspection of regular size/medium width (15px/760px), large text on a narrow screen (22px/360px), and large text on a wide screen (22px/1100px) shows no paragraph overlap, gray broken blocks, or dividers cutting through text. The window capture tool timed out twice; this round's visual evidence is renderer offscreen output and does not count as real window screenshots.
 - `cargo build --release --bin aicouncil --example render_probe` passes; delivered `dist/aicouncil.exe` (0.1.5); SHA256: `D638CBF8DAF110D3898B3199AFAA0542FC36EE27C4940C39CCCD94A5EBA5D213`.
 - `target/` was not automatically cleaned up this round and is left for manual deletion (build artifact and delivered EXE hashes verified identical; the acceptance window process has been closed).
+
+## 0.1.6: Conversation Editing and Usage Summary
+
+- Message removal is stored with `removed_at`; the projected visible tree reconnects descendants and excludes removed content from new request context. Generations and usage remain in the ledger.
+- Editing the latest visible question uses its original parent and atomically replaces the old subtree with the persisted replacement batch. CAS failure leaves the old branch visible; parallel answers are hidden together and historical charges remain.
+- A shared Decimal summary drives the compact top-bar cost and per-local-day tooltip, including title-helper requests and distinguishing known zero, pending and unavailable. `UsageUpdated` and title events refresh the cache.
+- The UI changes include opaque padded tooltips, the white wide Send action, message actions below bubbles, right-aligned user messages, floating Jump to latest, a full-main-area opaque model-picker overlay, and a focus-aware auto-growing composer.
+- Automated checks and implementation test results are recorded in `docs/IMPLEMENTATION_STATUS.md`. The parent task performs final screenshot and interactive acceptance using the isolated fixture; capture files are removed after review.
+
+### 0.1.6 Verification and delivery
+
+```text
+cargo fmt --all -- --check                 # ✅ Passed
+cargo clippy --all-targets -- -D warnings  # ✅ Passed
+cargo test --all-targets -j 1              # ✅ 212 passed, 0 failed
+git diff --check                            # ✅ Passed
+cargo build --release                      # ✅ Passed
+Copy-Item target\release\aicouncil.exe dist\aicouncil.exe -Force
+Get-FileHash dist\aicouncil.exe -Algorithm SHA256
+# A4F48F1BBB79497D3D0DCA8726E63F03236B354F7FCFD2FDFC4B5B0B1DE08739
+```
+
+### Parent acceptance (2026-10-20)
+
+- Reviewed the delivered `dist/aicouncil.exe` using the existing PowerShell
+  window-capture scripts, with isolated data and a loopback-only provider URL.
+  No Computer Use session or real billed request was used.
+- At 1500 × 900, verified user bubbles occupy 62% of the message column and
+  align right, assistant bubbles fill the column, controls sit below content,
+  and the white Send icon/text group is horizontally centered.
+- The exact fixture total of USD 0.1250 (two chat requests plus title-helper
+  cost) displays as `$0.13` immediately after startup. Unit tests separately
+  cover daily grouping, pending/unavailable, known zero and rounding.
+- Verified the model picker overlays the conversation without moving the
+  composer. At 1342 × 836, a 24-line draft stays inside a bounded editor and
+  leaves the model selector, Attach and Send controls visible. The empty
+  editor has rounded corners and a single-line height; Jump to latest appears
+  above its upper-right corner while reading.
+- Focus querying, modal event capture and dismissal were reviewed in source;
+  a native keyboard/hover/click walkthrough was not performed. Automated
+  storage/planner tests cover deletion, replacement, conflict rollback and
+  retained usage; screenshots do not substitute for those tests.
+- Confirmed release and delivered executable SHA256 match the value above.
+  Temporary captures, isolated data and `target/` are removed at task close.
+
+## 0.1.7: Composer Draft Persistence and Editor Clip Fix
+
+### What changed
+
+- Composer drafts are persisted per conversation and survive close/restart. The
+  authoritative store is the `conversations` row; `src/app/drafts.rs` is the
+  single writer for the draft columns (plain draft, attachment draft, latest-
+  question edit buffer, content revision).
+- `draft_revision` counts user edits of either buffer and is the CAS token the
+  send transaction uses to consume a draft. A late receipt can therefore never
+  erase text typed after the send, and re-typing the same text counts as a new
+  revision instead of the old draft.
+- The "edit the latest question" flow uses an independent buffer
+  (`edit_draft*`), so the normal draft is never overwritten while editing, and
+  an edited question whose target was removed keeps a recoverable buffer.
+- "New chat" is backed by a persisted `ui_state.pending_new_conversation`
+  pointer: repeated clicks return to the same unsent slot, the slot is
+  released by the first send that lands, and startup repairs a dangling
+  pointer.
+- `vendor/iced_tiny_skia` now clips editor glyphs to the editor viewport
+  instead of the widget content area, so a retained (damage-driven) frame
+  matches a full redraw of the same tree.
+
+### Draft acceptance matrix
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| Draft with CJK/newlines/leading and trailing spaces survives close and reopen | ✅ Passed | `draft_persistence::draft_survives_close_and_reopen_with_exact_text` (real SQLite file, reopened) |
+| Each conversation keeps its own draft across repeated switches | ✅ Passed | `draft_persistence::each_conversation_keeps_its_own_draft` |
+| New-chat slot returns to the same unsent draft, also after restart | ✅ Passed | `draft_persistence::new_conversation_slot_is_reused_and_survives_reopen` |
+| Dangling New-slot pointer repaired at startup | ✅ Passed | `draft_persistence::startup_repairs_a_dangling_pending_new_pointer` |
+| Deleting all content does not revive the old draft | ✅ Passed | `draft_persistence::deleting_all_content_does_not_revive_the_old_draft` |
+| Attachment name and order restored | ✅ Passed | `draft_persistence::attachments_keep_name_and_order_across_reopen` |
+| Late receipt keeps input typed after the send | ✅ Passed | `draft_persistence::late_receipt_keeps_input_typed_after_the_send` |
+| Re-typing the same text is distinguished from the old draft | ✅ Passed | `draft_persistence::retyping_the_same_text_after_send_is_not_treated_as_the_old_draft` |
+| Cursor/selection/scroll only: no write, no revision growth | ✅ Passed | `draft_persistence::cursor_only_changes_do_not_write_or_bump_the_revision` |
+| Latest-question edit buffer is independent; submit consumes only it | ✅ Passed | `draft_persistence::latest_edit_buffer_is_independent_from_the_normal_draft` |
+| Cancelling the edit restores the normal draft | ✅ Passed | `draft_persistence::cancelling_the_edit_restores_the_normal_draft` |
+| Edited-question draft survives reopen without auto-submitting | ✅ Passed | `draft_persistence::edited_question_draft_survives_reopen_without_auto_submitting` |
+| First send releases only the matching New slot | ✅ Passed | `draft_persistence::first_send_releases_only_the_matching_new_slot` |
+| Deleting the slot clears the pointer | ✅ Passed | `draft_persistence::deleting_the_slot_clears_the_pointer` |
+| Title/leaf/group updates do not overwrite the draft | ✅ Passed | `draft_persistence::title_and_leaf_updates_do_not_overwrite_the_draft` |
+| Consumption request cannot affect another conversation | ✅ Passed | `draft_persistence::consumption_request_targets_the_same_conversation_only` |
+
+### Editor clip fix
+
+- `tests/editor_render.rs::retained_pixmap_scroll_matches_full_frame_at_high_dpi`
+  compares the retained damage frame with a fresh full frame after scrolling
+  CJK editor text at 1.5× DPI over nine editor heights and five scroll steps.
+- Fail-before (upstream `iced_tiny_skia` 0.14.1): 9,121 differing pixels at
+  editor height 44, scroll step 0.
+- Pass-after (vendored patch): 0 differing pixels, and no glyph ink below the
+  text viewport.
+- `tests/editor_render.rs::picker_surface_covers_message_pixels_in_its_bounds`
+  verifies that the model picker panel really covers message pixels.
+- `tests/code_flow_render.rs` covers the code-block horizontal scrollbar
+  regression (finite scroll offset, text still present after scrolling).
+
+### Other regressions fixed in this round
+
+- `tests/p2_mock_stream.rs::attachments_composed_into_request_prompt` captured
+  the last HTTP request; the usage backfill `GET /generation?id=…` overwrote the
+  captured chat body. The mock now records only the chat POST.
+- `src/ui_style.rs::body_size_range_sane` still asserted the old H3 = φ
+  relation; the documented scale is H3 = √φ, so the assertion was corrected.
+
+### 0.1.7 Verification and delivery
+
+```text
+cargo fmt --all -- --check                 # ✅ Passed
+cargo clippy --all-targets -- -D warnings  # ✅ Passed
+cargo test --all-targets -j 1              # ✅ 244 passed, 0 failed
+cargo build --release                      # ✅ Passed
+Copy-Item target\release\aicouncil.exe dist\aicouncil.exe -Force
+Get-FileHash dist\aicouncil.exe -Algorithm SHA256
+# 506CE50E250272EA9E21B8924DBF4049C213A1F5B05FF378B89EDD38A39BB590
+```
+
+Delivered `dist/aicouncil.exe` (0.1.7); SHA256:
+`506CE50E250272EA9E21B8924DBF4049C213A1F5B05FF378B89EDD38A39BB590`.
+The previous release (0.1.6, SHA256
+`A4F48F1BBB79497D3D0DCA8726E63F03236B354F7FCFD2FDFC4B5B0B1DE08739`) is
+superseded; no `aicouncil.exe` process was running at delivery time, so the
+file was replaced in place. `dist/data/` (the user's live database and
+credentials) was not read, written or copied.
+
+### 0.1.7 Remaining manual coverage
+
+- The draft mechanism is covered by automated tests at the storage,
+  coordinator and send-transaction layers against a real SQLite file. The
+  interactive walkthrough (typing in a live window, closing the app, opening
+  it again, and switching conversations) was not performed in this round.
+- The editor clip fix is verified by headless pixel comparison
+  (retained frame versus full frame). A live-window scroll of the composer
+  was not re-captured this round.

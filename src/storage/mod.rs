@@ -12,6 +12,8 @@ pub mod repo;
 use std::path::Path;
 use std::sync::Mutex;
 
+use rusqlite::OptionalExtension;
+
 use crate::domain::{
     BatchId, Conversation, ConversationId, Generation, GenerationId, Group, GroupId, Message,
     MessageId, UsageRecord,
@@ -34,6 +36,14 @@ pub enum StorageError {
 
 pub type Result<T> = std::result::Result<T, StorageError>;
 
+/// `ui_state` 键:未发送的新会话槽位指针。
+pub const PENDING_NEW_KEY: &str = "pending_new_conversation";
+
+/// `ui_state` 的字符串值编码(与 [`Db::set_ui_state`] 的 JSON 形式一致)。
+fn json_string(value: &str) -> String {
+    serde_json::json!(value).to_string()
+}
+
 const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", include_str!("../../migrations/0001_init.sql")),
     (
@@ -47,6 +57,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
     (
         "0004_request_recovery",
         include_str!("../../migrations/0004_request_recovery.sql"),
+    ),
+    (
+        "0005_message_removal",
+        include_str!("../../migrations/0005_message_removal.sql"),
+    ),
+    (
+        "0006_composer_drafts",
+        include_str!("../../migrations/0006_composer_drafts.sql"),
     ),
 ];
 
@@ -137,6 +155,29 @@ pub struct SendBatchRecord {
     /// 事务内一并落库的 main_leaf 意图(CAS;None 不动 leaf)。
     /// (期望当前值, 新值):期望不匹配则不移动,保护用户后续选择。
     pub intended_main_leaf: Option<(Option<MessageId>, MessageId)>,
+    /// `(old turn root, expected current leaf)`, committed with replacement batch.
+    pub replacement: Option<(MessageId, Option<MessageId>)>,
+    /// 事务内一并消费的草稿(按 revision CAS;版本已变则保留新内容)。
+    pub draft_consumption: Option<DraftConsumptionRequest>,
+}
+
+/// 草稿消费方式(发送事务内)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftConsumption {
+    /// 消费普通草稿(正文与附件清空)。
+    Normal,
+    /// 消费“编辑最新问题”缓冲(普通草稿保留不动)。
+    LatestEdit,
+}
+
+/// 发送事务内的草稿消费指令。
+#[derive(Debug, Clone)]
+pub struct DraftConsumptionRequest {
+    /// 草稿所属会话(必须与批次的会话一致)。
+    pub conversation_id: ConversationId,
+    /// 提交时冻结的草稿版本;行内版本已变则不消费(保留用户新输入)。
+    pub expected_revision: i64,
+    pub mode: DraftConsumption,
 }
 
 impl Db {
@@ -185,7 +226,9 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, title, group_id, system_prompt, main_leaf_id, draft,
-                    draft_attachments_json, created_at, updated_at,
+                    draft_attachments_json, draft_revision,
+                    edit_draft, edit_draft_attachments_json, edit_target_id,
+                    created_at, updated_at,
                     title_source, title_status, title_revision, title_attempt_count
              FROM conversations ORDER BY updated_at DESC",
         )?;
@@ -195,6 +238,24 @@ impl Db {
         Ok(rows)
     }
 
+    /// 读取单会话的**权威行**(切换/恢复用;不读内存副本)。
+    pub fn conversation_of(&self, id: ConversationId) -> Result<Option<Conversation>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, title, group_id, system_prompt, main_leaf_id, draft,
+                        draft_attachments_json, draft_revision,
+                        edit_draft, edit_draft_attachments_json, edit_target_id,
+                        created_at, updated_at,
+                        title_source, title_status, title_revision, title_attempt_count
+                 FROM conversations WHERE id = ?1",
+                [id.as_str()],
+                row_to_conversation,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// 插入或更新会话的**非标题**字段。
     ///
     /// 标题只经 [`Db::rename_conversation_title`] /
@@ -202,15 +263,26 @@ impl Db {
     /// 更新不得携带旧 title 全量覆盖)。
     pub fn upsert_conversation(&self, c: &Conversation) -> Result<()> {
         let conn = self.lock();
+        let attachments_json = serde_json::to_string(&c.draft_attachments)?;
         conn.execute(
             "INSERT INTO conversations
                 (id, title, group_id, system_prompt, main_leaf_id, draft,
-                 draft_attachments_json, created_at, updated_at,
+                 draft_attachments_json, draft_revision,
+                 edit_draft, edit_draft_attachments_json, edit_target_id,
+                 created_at, updated_at,
                  title_source, title_status, title_revision, title_attempt_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                 group_id = ?3, system_prompt = ?4,
-                main_leaf_id = ?5, draft = ?6, draft_attachments_json = ?7, updated_at = ?9",
+                main_leaf_id = ?5,
+                draft = CASE WHEN draft <> ?6 OR draft_attachments_json <> ?7
+                             THEN ?6 ELSE draft END,
+                draft_attachments_json = CASE WHEN draft <> ?6 OR draft_attachments_json <> ?7
+                             THEN ?7 ELSE draft_attachments_json END,
+                draft_revision = draft_revision + CASE
+                             WHEN draft <> ?6 OR draft_attachments_json <> ?7 THEN 1 ELSE 0 END,
+                updated_at = ?13",
             rusqlite::params![
                 c.id.as_str(),
                 c.title,
@@ -218,7 +290,11 @@ impl Db {
                 c.system_prompt,
                 c.main_leaf_id.map(|m| m.as_str()),
                 c.draft,
-                serde_json::to_string(&c.draft_attachments)?,
+                attachments_json,
+                c.draft_revision,
+                c.edit_draft,
+                serde_json::to_string(&c.edit_draft_attachments)?,
+                c.edit_target_id.map(|m| m.as_str()),
                 c.created_at.timestamp_millis(),
                 chrono::Utc::now().timestamp_millis(),
                 c.title_source.as_str(),
@@ -489,6 +565,111 @@ impl Db {
         Ok(())
     }
 
+    // ----- Composer 草稿(字段级;单一写入点) -----
+
+    /// 保存普通 composer 草稿。
+    ///
+    /// `changed` 表示本次调用代表一次**真实的内容变化**(版本 +1):
+    /// 即使用户重新输入了与库中相同的正文,也视为一次变化(否则发送
+    /// 事务的 CAS 会把新输入误当旧草稿清掉)。
+    /// `changed = false` 且内容与库中一致时不写库、不涨版本
+    /// (纯光标/选区/滚动与冗余 flush)。
+    /// 返回写入后的版本号。
+    pub fn save_draft_content(
+        &self,
+        id: ConversationId,
+        text: &str,
+        attachments_json: &str,
+        changed: bool,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        let current: (String, String, i64) = conn.query_row(
+            "SELECT draft, draft_attachments_json, draft_revision
+             FROM conversations WHERE id = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        let differs = current.0 != text || current.1 != attachments_json;
+        if !differs && !changed {
+            return Ok(current.2);
+        }
+        conn.execute(
+            "UPDATE conversations SET draft = ?2, draft_attachments_json = ?3,
+                draft_revision = draft_revision + ?4, updated_at = ?5
+             WHERE id = ?1",
+            rusqlite::params![
+                id.as_str(),
+                text,
+                attachments_json,
+                if differs || changed { 1 } else { 0 },
+                now_ms()
+            ],
+        )?;
+        Ok(current.2 + i64::from(differs || changed))
+    }
+
+    /// 保存“编辑最新问题”缓冲(与普通草稿相互独立)。
+    ///
+    /// 语义与 [`Db::save_draft_content`] 相同。
+    pub fn save_edit_buffer(
+        &self,
+        id: ConversationId,
+        text: &str,
+        attachments_json: &str,
+        target: Option<MessageId>,
+        changed: bool,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        let current: (String, String, Option<String>, i64) = conn.query_row(
+            "SELECT edit_draft, edit_draft_attachments_json, edit_target_id, draft_revision
+             FROM conversations WHERE id = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        let target_text = target.map(|t| t.as_str());
+        let differs = current.0 != text
+            || current.1 != attachments_json
+            || current.2.as_deref() != target_text.as_deref();
+        if !differs && !changed {
+            return Ok(current.3);
+        }
+        conn.execute(
+            "UPDATE conversations SET edit_draft = ?2, edit_draft_attachments_json = ?3,
+                edit_target_id = ?4, draft_revision = draft_revision + ?5, updated_at = ?6
+             WHERE id = ?1",
+            rusqlite::params![
+                id.as_str(),
+                text,
+                attachments_json,
+                target_text,
+                if differs || changed { 1 } else { 0 },
+                now_ms()
+            ],
+        )?;
+        Ok(current.3 + i64::from(differs || changed))
+    }
+
+    /// 清空“编辑最新问题”缓冲(普通草稿不动)。已为空则不写库、不涨版本。
+    pub fn clear_edit_buffer(&self, id: ConversationId) -> Result<i64> {
+        let conn = self.lock();
+        let current: (String, String, Option<String>, i64) = conn.query_row(
+            "SELECT edit_draft, edit_draft_attachments_json, edit_target_id, draft_revision
+             FROM conversations WHERE id = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        if current.0.is_empty() && current.1 == "[]" && current.2.is_none() {
+            return Ok(current.3);
+        }
+        conn.execute(
+            "UPDATE conversations SET edit_draft = '', edit_draft_attachments_json = '[]',
+                edit_target_id = NULL, draft_revision = draft_revision + 1, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![id.as_str(), now_ms()],
+        )?;
+        Ok(current.3 + 1)
+    }
+
     pub fn set_conversation_main_leaf(
         &self,
         id: ConversationId,
@@ -544,29 +725,114 @@ impl Db {
     pub fn messages_of(&self, conversation: ConversationId) -> Result<Vec<Message>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, conversation_id, parent_id, role, content, attachments_json, created_at
+            "SELECT id, conversation_id, parent_id, role, content, attachments_json, created_at, removed_at
              FROM messages WHERE conversation_id = ?1 ORDER BY created_at, id",
         )?;
         let rows = stmt
             .query_map([conversation.as_str()], |r| {
-                Ok(Message {
-                    id: MessageId::from_uuid_str(r.get::<_, String>(0)?.as_str()),
-                    conversation_id: ConversationId::from_uuid_str(r.get::<_, String>(1)?.as_str()),
-                    parent_id: r
-                        .get::<_, Option<String>>(2)?
-                        .map(|s| MessageId::from_uuid_str(s.as_str())),
-                    role: crate::domain::Role::from_str(&r.get::<_, String>(3)?)
-                        .unwrap_or(crate::domain::Role::User),
-                    content: r.get(4)?,
-                    attachments: r
-                        .get::<_, Option<String>>(5)?
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default(),
-                    created_at: ms_to_dt(r.get(6)?),
-                })
+                Ok((
+                    Message {
+                        id: MessageId::from_uuid_str(r.get::<_, String>(0)?.as_str()),
+                        conversation_id: ConversationId::from_uuid_str(
+                            r.get::<_, String>(1)?.as_str(),
+                        ),
+                        parent_id: r
+                            .get::<_, Option<String>>(2)?
+                            .map(|s| MessageId::from_uuid_str(s.as_str())),
+                        role: crate::domain::Role::from_str(&r.get::<_, String>(3)?)
+                            .unwrap_or(crate::domain::Role::User),
+                        content: r.get(4)?,
+                        attachments: r
+                            .get::<_, Option<String>>(5)?
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                            .unwrap_or_default(),
+                        created_at: ms_to_dt(r.get(6)?),
+                    },
+                    r.get::<_, Option<i64>>(7)?,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        let parents: std::collections::HashMap<_, _> =
+            rows.iter().map(|(m, _)| (m.id, m.parent_id)).collect();
+        let removed: std::collections::HashSet<_> = rows
+            .iter()
+            .filter(|(_, removed_at)| removed_at.is_some())
+            .map(|(m, _)| m.id)
+            .collect();
+        Ok(rows
+            .into_iter()
+            .filter_map(|(mut message, removed_at)| {
+                if removed_at.is_some() {
+                    return None;
+                }
+                while message
+                    .parent_id
+                    .is_some_and(|parent| removed.contains(&parent))
+                {
+                    message.parent_id = parents.get(&message.parent_id?).copied().flatten();
+                }
+                Some(message)
+            })
+            .collect())
+    }
+
+    /// Hide one message from future context while retaining its generations and usage ledger.
+    pub fn remove_message(&self, id: MessageId) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let conversation: String = tx.query_row(
+            "SELECT conversation_id, parent_id FROM messages WHERE id = ?1 AND removed_at IS NULL",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM generations WHERE (user_message_id = ?1 OR assistant_message_id = ?1) AND status IN ('queued','connecting','streaming'))",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        if active {
+            return Err(StorageError::NotFound(
+                "cannot remove a message with an active request".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE messages SET removed_at = ?2 WHERE id = ?1",
+            rusqlite::params![id.as_str(), now_ms()],
+        )?;
+        let conv = ConversationId::from_uuid_str(&conversation);
+        let leaf: Option<String> = tx.query_row(
+            "SELECT main_leaf_id FROM conversations WHERE id = ?1",
+            [conversation.as_str()],
+            |r| r.get(0),
+        )?;
+        if leaf.as_deref() == Some(id.as_str().as_str()) {
+            let mut ancestor: Option<String> = tx.query_row(
+                "SELECT parent_id FROM messages WHERE id = ?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )?;
+            while let Some(candidate) = ancestor.clone() {
+                let removed_at: Option<i64> = tx.query_row(
+                    "SELECT removed_at FROM messages WHERE id = ?1",
+                    [candidate.as_str()],
+                    |r| r.get(0),
+                )?;
+                if removed_at.is_none() {
+                    break;
+                }
+                ancestor = tx.query_row(
+                    "SELECT parent_id FROM messages WHERE id = ?1",
+                    [candidate.as_str()],
+                    |r| r.get(0),
+                )?;
+            }
+            tx.execute(
+                "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![conv.as_str(), ancestor, now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// 流式增量:整体替换 assistant 内容(幂等,服务层负责节流)。
@@ -585,6 +851,79 @@ impl Db {
     pub fn save_send_batch(&self, rec: &SendBatchRecord) -> Result<()> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        // 本批之前该会话已有的消息数(0 = 该会话的首发,用于释放 New 槽位)。
+        let prior_messages: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+            [rec.conversation_id.as_str()],
+            |r| r.get(0),
+        )?;
+        if let Some((old_root, expected_leaf)) = &rec.replacement {
+            let root_role: String = tx
+                .query_row(
+                    "SELECT role FROM messages WHERE id = ?1 AND conversation_id = ?2 AND removed_at IS NULL",
+                    rusqlite::params![old_root.as_str(), rec.conversation_id.as_str()],
+                    |r| r.get(0),
+                )
+                .map_err(|_| StorageError::NotFound("edited question no longer exists".into()))?;
+            if root_role != "user" {
+                return Err(StorageError::NotFound(
+                    "only a user question can be edited".into(),
+                ));
+            }
+            let current_leaf: Option<String> = tx.query_row(
+                "SELECT main_leaf_id FROM conversations WHERE id = ?1",
+                [rec.conversation_id.as_str()],
+                |r| r.get(0),
+            )?;
+            let expected_leaf_text = expected_leaf.as_ref().map(|id| id.as_str().to_string());
+            if current_leaf != expected_leaf_text {
+                return Err(StorageError::NotFound(
+                    "conversation moved while editing the question".into(),
+                ));
+            }
+            let active: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM generations WHERE user_message_id = ?1 AND status IN ('queued','connecting','streaming'))",
+                [old_root.as_str()],
+                |r| r.get(0),
+            )?;
+            if active {
+                return Err(StorageError::NotFound(
+                    "the edited question still has an active request".into(),
+                ));
+            }
+            if let Some(leaf) = expected_leaf {
+                let latest_user: Option<String> = tx.query_row(
+                    "WITH RECURSIVE path(id,parent_id,role,removed_at,depth) AS (
+                        SELECT id,parent_id,role,removed_at,0 FROM messages WHERE id = ?1 AND conversation_id = ?2
+                        UNION ALL SELECT p.id,p.parent_id,p.role,p.removed_at,path.depth+1 FROM messages p JOIN path ON p.id = path.parent_id
+                     ) SELECT id FROM path WHERE role = 'user' AND removed_at IS NULL ORDER BY depth LIMIT 1",
+                    rusqlite::params![leaf.as_str(), rec.conversation_id.as_str()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+                if latest_user.as_deref() != Some(old_root.as_str().as_str()) {
+                    return Err(StorageError::NotFound(
+                        "only the latest question can be edited".into(),
+                    ));
+                }
+                let has_later_question: bool = tx.query_row(
+                    "WITH RECURSIVE descendants(id) AS (
+                        SELECT id FROM messages WHERE parent_id = ?1 AND conversation_id = ?2
+                        UNION ALL SELECT m.id FROM messages m JOIN descendants d ON m.parent_id = d.id
+                     ) SELECT EXISTS(
+                        SELECT 1 FROM messages m JOIN descendants d ON d.id = m.id
+                        WHERE m.role = 'user' AND m.removed_at IS NULL
+                     )",
+                    rusqlite::params![old_root.as_str(), rec.conversation_id.as_str()],
+                    |r| r.get(0),
+                )?;
+                if has_later_question {
+                    return Err(StorageError::NotFound(
+                        "the edited question has a later visible question in another branch".into(),
+                    ));
+                }
+            }
+        }
         tx.execute(
             "INSERT INTO send_batches(id, conversation_id, primary_request_id, sent_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -664,8 +1003,35 @@ impl Db {
                 rusqlite::params![u.request_id.as_str(), u.remote_generation_id],
             )?;
         }
-        // 事务内一并保存 intended main_leaf(CAS;失败不移动)
-        if let Some((expected, new)) = &rec.intended_main_leaf {
+        if let Some((old_root, expected_leaf)) = &rec.replacement {
+            let Some((_, new_leaf)) = &rec.intended_main_leaf else {
+                return Err(StorageError::Migration(
+                    "replacement batch has no new leaf".into(),
+                ));
+            };
+            let updated = match expected_leaf {
+                Some(expected) => tx.execute(
+                    "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3 WHERE id = ?1 AND main_leaf_id = ?4",
+                    rusqlite::params![rec.conversation_id.as_str(), new_leaf.as_str(), now_ms(), expected.as_str()],
+                )?,
+                None => tx.execute(
+                    "UPDATE conversations SET main_leaf_id = ?2, updated_at = ?3 WHERE id = ?1 AND main_leaf_id IS NULL",
+                    rusqlite::params![rec.conversation_id.as_str(), new_leaf.as_str(), now_ms()],
+                )?,
+            };
+            if updated != 1 {
+                return Err(StorageError::NotFound(
+                    "conversation changed before the edited turn could be replaced".into(),
+                ));
+            }
+            tx.execute(
+                "WITH RECURSIVE subtree(id) AS (
+                    SELECT id FROM messages WHERE id = ?1 AND conversation_id = ?2 AND removed_at IS NULL
+                    UNION ALL SELECT m.id FROM messages m JOIN subtree s ON m.parent_id = s.id
+                 ) UPDATE messages SET removed_at = ?3 WHERE id IN (SELECT id FROM subtree)",
+                rusqlite::params![old_root.as_str(), rec.conversation_id.as_str(), now_ms()],
+            )?;
+        } else if let Some((expected, new)) = &rec.intended_main_leaf {
             match expected {
                 Some(exp) => {
                     tx.execute(
@@ -687,6 +1053,50 @@ impl Db {
                     )?;
                 }
             }
+        }
+        // 草稿消费(与批次同事务):版本仍等于提交时冻结的版本才清空,
+        // 用户在提交后又输入了新内容则保留(CAS;不因草稿变化而回滚发送)。
+        if let Some(request) = &rec.draft_consumption {
+            if request.conversation_id == rec.conversation_id {
+                match request.mode {
+                    DraftConsumption::Normal => {
+                        tx.execute(
+                            "UPDATE conversations SET draft = '', draft_attachments_json = '[]',
+                                updated_at = ?2
+                             WHERE id = ?1 AND draft_revision = ?3",
+                            rusqlite::params![
+                                rec.conversation_id.as_str(),
+                                now_ms(),
+                                request.expected_revision
+                            ],
+                        )?;
+                    }
+                    DraftConsumption::LatestEdit => {
+                        tx.execute(
+                            "UPDATE conversations SET edit_draft = '',
+                                    edit_draft_attachments_json = '[]',
+                                    edit_target_id = NULL, updated_at = ?2
+                             WHERE id = ?1 AND draft_revision = ?3",
+                            rusqlite::params![
+                                rec.conversation_id.as_str(),
+                                now_ms(),
+                                request.expected_revision
+                            ],
+                        )?;
+                    }
+                }
+            }
+        }
+        // 首次发送落库成功 → 释放与该会话匹配的 New 槽位指针
+        // (只清除匹配的指针;不影响后来创建的另一个新会话)。
+        if prior_messages == 0 {
+            tx.execute(
+                "DELETE FROM ui_state WHERE key = ?1 AND value = ?2",
+                rusqlite::params![
+                    PENDING_NEW_KEY,
+                    json_string(rec.conversation_id.as_str().as_str())
+                ],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -988,6 +1398,20 @@ impl Db {
         Ok(rows)
     }
 
+    pub fn usage_record(&self, request: GenerationId) -> Result<Option<UsageRecord>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT request_id, prompt_tokens, completion_tokens, total_tokens,
+                        cost_text, cost_source, status, remote_generation_id, queried_at
+                 FROM usage_records WHERE request_id = ?1",
+                [request.as_str()],
+                row_to_usage,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// 幂等入账:UPSERT 单行,已 Known 且新数据无费用时不回退。
     pub fn upsert_usage(&self, rec: &UsageRecord) -> Result<()> {
         /// (request_id, prompt, completion, cost, cost_source, status)
@@ -1044,9 +1468,17 @@ impl Db {
                     ],
                 )?;
             }
-            Some((_, _ex_prompt, _ex_completion, ex_cost, _ex_src, ex_status)) => {
+            Some((_, _ex_prompt, _ex_completion, ex_cost, ex_source, ex_status)) => {
                 // 不回退:已知费用优先
-                let final_cost = rec.cost.map(|c| c.to_string()).or(ex_cost);
+                let incoming_is_api =
+                    rec.cost_source == Some(crate::domain::CostSource::ApiReported);
+                let existing_is_api = ex_source.as_deref() == Some("api");
+                let keep_existing = ex_cost.is_some() && (!incoming_is_api && existing_is_api);
+                let final_cost = if keep_existing {
+                    ex_cost
+                } else {
+                    rec.cost.map(|c| c.to_string()).or(ex_cost)
+                };
                 let final_status = if final_cost.is_some() {
                     "known"
                 } else if ex_status == "unavailable" {
@@ -1054,7 +1486,13 @@ impl Db {
                 } else {
                     rec.status.as_str()
                 };
-                let final_source = rec.cost_source.map(|s| s.as_str().to_string()).or(_ex_src);
+                let final_source = if keep_existing {
+                    ex_source
+                } else {
+                    rec.cost_source
+                        .map(|s| s.as_str().to_string())
+                        .or(ex_source)
+                };
                 tx.execute(
                     "UPDATE usage_records SET
                         prompt_tokens = COALESCE(?2, prompt_tokens),
@@ -1098,6 +1536,51 @@ impl Db {
             .query_map([], row_to_usage)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 最多补查的终态用量。包含远端 ID 尚未取到的记录,由服务层标记 unavailable。
+    pub fn terminal_pending_usage(&self, limit: usize) -> Result<Vec<UsageRecord>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT u.request_id, u.prompt_tokens, u.completion_tokens, u.total_tokens,
+                    u.cost_text, u.cost_source, u.status,
+                    COALESCE(u.remote_generation_id, g.remote_generation_id), u.queried_at
+             FROM usage_records u JOIN generations g ON g.request_id = u.request_id
+             WHERE u.status = 'pending'
+               AND g.status IN ('completed','cancelled','failed','interrupted')
+               AND (u.queried_at IS NULL OR u.queried_at <= ?1)
+             ORDER BY COALESCE(g.finished_at, g.started_at, 0) LIMIT ?2",
+        )?;
+        let cutoff = now_ms() - 60_000;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![cutoff, limit.min(50) as i64],
+                row_to_usage,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 立即保存远端 ID,覆盖 generation 与 usage 中缺失值,永不替换首个值。
+    pub fn record_remote_generation_id(
+        &self,
+        request: GenerationId,
+        remote_generation_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE generations SET remote_generation_id = COALESCE(remote_generation_id, ?2)
+             WHERE request_id = ?1",
+            rusqlite::params![request.as_str(), remote_generation_id],
+        )?;
+        tx.execute(
+            "UPDATE usage_records SET remote_generation_id = COALESCE(remote_generation_id, ?2)
+             WHERE request_id = ?1",
+            rusqlite::params![request.as_str(), remote_generation_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ----- 目录与偏好 -----
@@ -1269,6 +1752,41 @@ impl Db {
 
     // ----- UI 状态 -----
 
+    /// 未成功提交首条提问的“新会话槽位”指针。
+    ///
+    /// New 按钮优先回到该槽位(连点不制造多个空壳);首次发送落库成功后
+    /// 由发送事务释放;删除会话或启动校验失败时清理。
+    pub fn pending_new_conversation(&self) -> Result<Option<ConversationId>> {
+        Ok(self
+            .get_ui_state(PENDING_NEW_KEY)?
+            .and_then(|v| v.as_str().map(ConversationId::from_uuid_str)))
+    }
+
+    /// 记录新会话槽位。
+    pub fn set_pending_new_conversation(&self, id: ConversationId) -> Result<()> {
+        self.set_ui_state(PENDING_NEW_KEY, &serde_json::json!(id.as_str()))
+    }
+
+    /// 清除新会话槽位。
+    ///
+    /// `Some(id)` 只在指针指向该会话时清除(不影响后来创建的另一个槽位);
+    /// `None` 无条件清除(删除会话/启动校验修复)。
+    pub fn clear_pending_new_conversation(&self, id: Option<ConversationId>) -> Result<()> {
+        let conn = self.lock();
+        match id {
+            Some(id) => {
+                conn.execute(
+                    "DELETE FROM ui_state WHERE key = ?1 AND value = ?2",
+                    rusqlite::params![PENDING_NEW_KEY, json_string(id.as_str().as_str())],
+                )?;
+            }
+            None => {
+                conn.execute("DELETE FROM ui_state WHERE key = ?1", [PENDING_NEW_KEY])?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_ui_state(&self, key: &str, value: &serde_json::Value) -> Result<()> {
         let conn = self.lock();
         conn.execute(
@@ -1331,14 +1849,23 @@ fn row_to_conversation(r: &rusqlite::Row<'_>) -> rusqlite::Result<Conversation> 
             .get::<_, Option<String>>(6)?
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default(),
-        created_at: ms_to_dt(r.get(7)?),
-        updated_at: ms_to_dt(r.get(8)?),
-        title_source: crate::domain::TitleSource::from_str(&r.get::<_, String>(9)?)
+        draft_revision: r.get(7)?,
+        edit_draft: r.get(8)?,
+        edit_draft_attachments: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default(),
-        title_status: crate::domain::TitleStatus::from_str(&r.get::<_, String>(10)?)
+        edit_target_id: r
+            .get::<_, Option<String>>(10)?
+            .map(|s| MessageId::from_uuid_str(s.as_str())),
+        created_at: ms_to_dt(r.get(11)?),
+        updated_at: ms_to_dt(r.get(12)?),
+        title_source: crate::domain::TitleSource::from_str(&r.get::<_, String>(13)?)
             .unwrap_or_default(),
-        title_revision: r.get(11)?,
-        title_attempt_count: r.get(12)?,
+        title_status: crate::domain::TitleStatus::from_str(&r.get::<_, String>(14)?)
+            .unwrap_or_default(),
+        title_revision: r.get(15)?,
+        title_attempt_count: r.get(16)?,
     })
 }
 
@@ -1349,7 +1876,9 @@ fn read_conversation(
 ) -> rusqlite::Result<Conversation> {
     tx.query_row(
         "SELECT id, title, group_id, system_prompt, main_leaf_id, draft,
-                draft_attachments_json, created_at, updated_at,
+                draft_attachments_json, draft_revision,
+                edit_draft, edit_draft_attachments_json, edit_target_id,
+                created_at, updated_at,
                 title_source, title_status, title_revision, title_attempt_count
          FROM conversations WHERE id = ?1",
         [id.as_str()],

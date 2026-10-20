@@ -19,6 +19,10 @@ English UI, local SQLite persistence, no telemetry.
   called; non-Anthropic models are unaffected.
 - Failure recovery: failed rounds don't lock the conversation; eligibility-
   gated retry with cooldowns; attempts aggregate per card.
+- Composer drafts persist per chat and survive closing the app: non-blank input
+  is restored exactly (whitespace and line breaks included), every chat keeps
+  its own text and attachments, and "New chat" returns to the same unsent
+  slot instead of creating empty shells.
 - Automatic chat titles via DeepSeek (optional); manual renames always win.
 - Soft Sage reading theme, draggable right pane, Markdown export, exact cost
   labels.

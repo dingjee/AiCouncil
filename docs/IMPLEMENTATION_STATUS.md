@@ -371,7 +371,7 @@ follow-up investigation to pick up.
   Expand/Collapse question tooltip; per-conversation expanded set held in
   memory). Actual layout-height measurement not done (heuristic; known
   limitation).
-- **5 Font size**: φ type scale (2.618/2.058/1.618/1.272/1.128/1) + body
+- **5 Font size**: φ-root type scale (1.618/1.435/1.272/1.128/1.062/1) + body
   12–22 slider persisted; heading/body line-height and block-spacing rules
   implemented in the view layer.
 - **6 Tables**: empty cells preserved + missing columns padded; row height
@@ -586,3 +586,81 @@ see the ACCEPTANCE 0.1.4 acceptance matrix).
 5. B14 broadcast-backlog reconciliation is a throttled full refresh; C08
    keepalive 10-minute no-progress cap has no timing test (constant is
    tunable).
+
+## 0.1.6 Conversation Editing and Usage Summary (2026-10-20)
+
+- Implemented persisted message removal, visible-tree context projection, and
+  latest-question editing with replacement committed atomically alongside the
+  replacement send batch. Historical generation and usage rows remain in the
+  ledger; parallel answers for the replaced question are hidden together.
+- Added one Decimal cost summary for the conversation header and local-date
+  tooltip, including auxiliary title requests, late usage refresh, cached cost
+  initialization on startup/conversation switch, known zero, pending and
+  unavailable states. Display amounts round to two places after aggregation.
+- Updated message layout, per-message action placement, floating Jump to
+  latest, opaque model picker, padded tooltips, white centered Send action and
+  focus-aware expanding composer. The picker overlays the full main area;
+  user messages use 62% of available width and assistant messages fill it.
+- Verification: `cargo fmt --all -- --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets -j 1`
+  (212 passed, 0 failed), and `git diff --check` passed. The parent task owns
+  final source and ordinary PowerShell screenshot acceptance with the isolated fixture.
+- The release build and delivered binary hash are recorded in section 0.1.6
+  of `docs/ACCEPTANCE.md` after packaging.
+
+Parent acceptance on 2026-10-20 verified the delivered executable at normal and
+narrow window sizes, the 62%/100% message widths, centered Send content, `$0.13`
+rounding example, overlay picker and bounded long composer. Native focus/hover/
+click walkthrough coverage remains separate from this screenshot review; see
+`ACCEPTANCE.md`. Build output and local screenshot fixtures are cleaned up at
+task close.
+
+## 0.1.7 Composer Draft Persistence and Editor Clip Fix (2026-10-20)
+
+### Completed Items
+
+- Added migration `0006_composer_drafts.sql`: `draft_revision` (user-edit
+  counter, CAS token for draft consumption), an independent latest-question
+  edit buffer (`edit_draft`, `edit_draft_attachments_json`, `edit_target_id`),
+  and the `ui_state.pending_new_conversation` pointer for the unsent New-chat
+  slot.
+- Added `src/app/drafts.rs` as the single writer for the composer columns:
+  content change detection, snapshots, save/restore, buffer isolation and the
+  New-slot pointer. `src/app/mod.rs` routes every composer event (typing,
+  attachments, long paste, New, conversation switch, startup restore, send
+  receipt, latest-question edit) through it.
+- Send flow: `PendingSend` freezes the submitted content revision and the
+  composer mode; the batch transaction (`save_send_batch`) consumes the draft
+  by revision CAS and releases the matching New slot on the first send. A
+  late receipt therefore cannot clear text typed after the send, and the
+  editor is only cleared when the conversation and revision still match.
+- Latest-question editing keeps the normal draft intact: the edit buffer is
+  written to its own columns, cancelling restores the normal draft, and an
+  edited question whose target was removed keeps a recoverable buffer with a
+  visible "Restore edit draft" action instead of silently dropping input.
+- Fixed the vendored `iced_tiny_skia` editor clipping: glyphs are clipped to
+  the editor viewport (`editor.bounds`) rather than the widget content area,
+  which is the same rectangle the renderer reports as damaged. Retained frames
+  now match full redraws.
+- Fixed the `p2_mock_stream` attachment mock (it stored the last HTTP request,
+  so the usage-backfill GET overwrote the captured chat body) and the stale
+  H3 ratio assertion in `src/ui_style.rs`.
+
+### Verification
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed (zero warnings).
+- `cargo test --all-targets -j 1` — passed, 0 failed (see `docs/ACCEPTANCE.md`
+  0.1.7 for the per-scenario matrix).
+- `tests/draft_persistence.rs` — 17 scenarios against a real SQLite file that is
+  closed and reopened, plus the send transaction and the late-receipt path.
+- `tests/editor_render.rs` — fail-before 9,121 differing pixels with upstream
+  `iced_tiny_skia` 0.14.1, pass-after 0 with the vendored patch.
+
+### Known Gaps
+
+- The draft mechanism is verified at the storage/coordinator layer and through
+  the send transaction; the final interactive walkthrough (typing in a real
+  window, closing the app, reopening) was not performed in this round.
+- CJK glyphs inside a code block still fall back to the system monospace font;
+  the horizontal scrollbar regression itself is fixed and covered.

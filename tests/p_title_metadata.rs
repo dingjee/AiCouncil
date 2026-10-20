@@ -233,6 +233,8 @@ fn mk_generation(
         generations: vec![gen],
         usage: vec![],
         intended_main_leaf: None,
+        replacement: None,
+        draft_consumption: None,
     })
     .unwrap();
 }

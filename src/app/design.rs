@@ -243,11 +243,62 @@ pub fn composer_style(_t: &Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(palette::COMPOSER)),
         border: Border {
-            radius: 0.0.into(),
+            radius: RADIUS_CARD.into(),
             width: 1.0,
             color: palette::LINE_SUBTLE,
         },
         ..Default::default()
+    }
+}
+
+/// Opaque, readable tooltip surface shared by every hint in the UI.
+pub fn tooltip_style(_t: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(palette::SURFACE)),
+        text_color: Some(palette::TEXT),
+        border: Border {
+            radius: RADIUS_CONTROL.into(),
+            width: 1.0,
+            color: palette::LINE_INTERACTIVE,
+        },
+        ..Default::default()
+    }
+}
+
+/// Model selector overlay surface, so the backdrop cannot receive clicks through it.
+pub fn picker_panel_style(_t: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(palette::SURFACE)),
+        border: Border {
+            radius: RADIUS_CARD.into(),
+            width: 1.0,
+            color: palette::LINE_INTERACTIVE,
+        },
+        ..Default::default()
+    }
+}
+
+/// Rounded composer editor with a visible focus border.
+pub fn text_editor_style(
+    _t: &Theme,
+    status: iced::widget::text_editor::Status,
+) -> iced::widget::text_editor::Style {
+    use iced::widget::text_editor::{Status, Style};
+    let border_color = match status {
+        Status::Focused { .. } => palette::FOCUS,
+        Status::Hovered => palette::LINE_INTERACTIVE,
+        _ => palette::LINE_SUBTLE,
+    };
+    Style {
+        background: Background::Color(palette::SURFACE),
+        border: Border {
+            radius: RADIUS_CARD.into(),
+            width: 1.0,
+            color: border_color,
+        },
+        placeholder: palette::TEXT_MUTED,
+        value: palette::TEXT,
+        selection: palette::SELECTION,
     }
 }
 

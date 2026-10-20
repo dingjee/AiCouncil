@@ -9,7 +9,7 @@
 //! - retry:同 user 下 assistant 兄弟;lineage 唯一活动约束(索引兜底)
 //!   + 冷却 + 最新持久数据计算资格(连点只产生一个有效尝试)。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -114,6 +114,7 @@ pub struct ChatService<P: Provider> {
     semaphore: Arc<Semaphore>,
     throttle: Throttle,
     cancels: Arc<tokio::sync::Mutex<HashMap<GenerationId, CancellationToken>>>,
+    usage_repairs: Arc<tokio::sync::Mutex<HashSet<GenerationId>>>,
     events: broadcast::Sender<ChatEvent>,
     system_prompt: Option<String>,
     guard: Arc<dyn EgressGuard>,
@@ -147,6 +148,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
             semaphore: Arc::new(Semaphore::new(max_concurrent.max(1))),
             throttle: Throttle::default(),
             cancels: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            usage_repairs: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             events,
             system_prompt: None,
             // 生产默认 GeoIP 门禁;无"关闭地域检查"的通用开关
@@ -172,6 +174,40 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
 
     pub fn set_system_prompt(&mut self, sp: Option<String>) {
         self.system_prompt = sp;
+    }
+
+    /// Repair terminal pending usage records without replaying chat generations.
+    /// Call this at startup and after switching conversations; each call is bounded.
+    pub async fn repair_pending_usage(&self) -> Result<usize, StorageError> {
+        let db = self.db.clone();
+        let candidates = tokio::task::spawn_blocking(move || db.terminal_pending_usage(20))
+            .await
+            .map_err(|e| StorageError::Migration(e.to_string()))??;
+        let mut known = 0;
+        for mut rec in candidates {
+            let Some(remote_id) = rec.remote_generation_id.clone() else {
+                rec.mark_unavailable(chrono::Utc::now());
+                db_usage(&self.db, &rec).await;
+                continue;
+            };
+            if !self.usage_repairs.lock().await.insert(rec.request_id) {
+                continue;
+            }
+            let request_id = rec.request_id;
+            let result = query_and_record_usage(
+                self.provider.clone(),
+                self.db.clone(),
+                rec,
+                remote_id,
+                None,
+            )
+            .await;
+            self.usage_repairs.lock().await.remove(&request_id);
+            if result.0 {
+                known += 1;
+            }
+        }
+        Ok(known)
     }
 
     /// admission:目标含 Anthropic 模型时校验出口许可。
@@ -216,6 +252,22 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
         &self,
         plan: SendPlan,
         permit: Option<EgressPermit>,
+    ) -> Result<SubmitReceipt, SubmitError> {
+        self.submit_with_permit_replacing(plan, permit, None, None)
+            .await
+    }
+
+    /// 提交(含“替换旧轮回答”与草稿消费)。
+    ///
+    /// `draft_consumption` 与批次落在同一事务:草稿版本仍等于冻结值时
+    /// 才清空;用户提交后又输入的新内容被保留(迟到回执不抹草稿)。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_with_permit_replacing(
+        &self,
+        plan: SendPlan,
+        permit: Option<EgressPermit>,
+        replacement: Option<(MessageId, Option<MessageId>)>,
+        draft_consumption: Option<crate::storage::DraftConsumptionRequest>,
     ) -> Result<SubmitReceipt, SubmitError> {
         let models: Vec<String> = plan
             .branches
@@ -313,6 +365,9 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
             usage,
             // 事务内一并保存 intended main_leaf(CAS;用户后续选择不被覆盖)
             intended_main_leaf: Some((expected_leaf, primary_assistant)),
+            replacement,
+            // 事务内一并消费草稿(按冻结版本 CAS;版本已变则保留新内容)
+            draft_consumption,
         };
         // spawn_blocking:rusqlite 连接非 async
         let db = self.db.clone();
@@ -371,6 +426,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
         let sem = self.semaphore.clone();
         let events = self.events.clone();
         let cancels = self.cancels.clone();
+        let usage_repairs = self.usage_repairs.clone();
         let throttle = self.throttle;
         let guard = self.guard.clone();
         let anthropic = is_anthropic(&immutable.model);
@@ -481,6 +537,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
             let mut last_flush = tokio::time::Instant::now();
             let mut final_state_written = false;
             let mut remote_accepted = false;
+            let mut remote_generation_id: Option<String> = None;
 
             while let Some(item) = stream.next().await {
                 let event = match item {
@@ -543,6 +600,31 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                     GenEvent::Started => {
                         db_status(&db, request_id, GenerationStatus::Connecting).await;
                     }
+                    GenEvent::RemoteGenerationId {
+                        remote_generation_id: id,
+                    } => {
+                        if remote_generation_id.is_none() {
+                            remote_generation_id = Some(id.clone());
+                            let dbp = db.clone();
+                            let persist_id = id.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                dbp.record_remote_generation_id(request_id, &persist_id)
+                            })
+                            .await;
+                        }
+                        remote_accepted = true;
+                        mark_remote_accepted(&db, request_id);
+                        emit(
+                            &events,
+                            conversation_id,
+                            batch_id,
+                            request_id,
+                            assistant_message_id,
+                            GenEvent::RemoteGenerationId {
+                                remote_generation_id: id,
+                            },
+                        );
+                    }
                     GenEvent::TextDelta(text) => {
                         if !remote_accepted {
                             remote_accepted = true;
@@ -596,9 +678,18 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                         );
                     }
                     GenEvent::Finished {
-                        remote_generation_id,
+                        remote_generation_id: remote_id,
                         finish_state,
                     } => {
+                        let final_remote_id = remote_id.or_else(|| remote_generation_id.clone());
+                        if let Some(id) = final_remote_id.as_deref() {
+                            let dbp = db.clone();
+                            let id = id.to_string();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                dbp.record_remote_generation_id(request_id, &id)
+                            })
+                            .await;
+                        }
                         if !remote_accepted {
                             remote_accepted = true;
                             mark_remote_accepted(&db, request_id);
@@ -627,7 +718,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                                 assistant_message_id,
                                 GenerationStatus::Completed,
                                 failure,
-                                remote_generation_id.as_deref(),
+                                final_remote_id.as_deref(),
                             )
                             .await;
                             final_state_written = true;
@@ -652,7 +743,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                             request_id,
                             assistant_message_id,
                             GenEvent::Finished {
-                                remote_generation_id,
+                                remote_generation_id: final_remote_id.clone(),
                                 finish_state,
                             },
                         );
@@ -770,6 +861,18 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                     },
                 );
             }
+            settle_usage(
+                &provider,
+                &db,
+                &usage_repairs,
+                &events,
+                conversation_id,
+                batch_id,
+                assistant_message_id,
+                request_id,
+                remote_generation_id.clone(),
+            )
+            .await;
             cancels.lock().await.remove(&request_id);
         });
     }
@@ -920,6 +1023,9 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
             }],
             usage: vec![UsageRecord::pending(new_request)],
             intended_main_leaf: None,
+            replacement: None,
+            // 重试不消费 composer 草稿(草稿属于新一轮输入)
+            draft_consumption: None,
         };
         let db = self.db.clone();
         let old_card = original.assistant_message_id;
@@ -1214,5 +1320,322 @@ async fn db_usage(db: &Arc<Db>, rec: &UsageRecord) {
     let r = tokio::task::spawn_blocking(move || db.upsert_usage(&rec)).await;
     if let Ok(Err(e)) = r {
         tracing::error!(%e, "用量入账失败");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_usage<P: Provider + Send + Sync + 'static>(
+    provider: &Arc<P>,
+    db: &Arc<Db>,
+    in_flight: &Arc<tokio::sync::Mutex<HashSet<GenerationId>>>,
+    events: &broadcast::Sender<ChatEvent>,
+    conversation: ConversationId,
+    batch: BatchId,
+    assistant: MessageId,
+    request: GenerationId,
+    remote_id: Option<String>,
+) {
+    let db_read = db.clone();
+    let status = tokio::task::spawn_blocking(move || db_read.usage_record(request))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten()
+        .map(|record| record.status);
+    if !matches!(status, Some(crate::domain::UsageStatus::Pending)) {
+        return;
+    }
+    if let Some(remote_id) = remote_id {
+        schedule_usage_repair(
+            provider,
+            db,
+            in_flight,
+            Some((events.clone(), conversation, batch, assistant)),
+            request,
+            remote_id,
+        );
+    } else {
+        let db_mark = db.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db_mark.mark_usage_unavailable(request, "终态没有远端 generation id")
+        })
+        .await;
+        let _ = events.send(ChatEvent {
+            conversation_id: conversation,
+            batch_id: batch,
+            request_id: request,
+            assistant_message_id: assistant,
+            event: GenEvent::UsageUpdated {
+                prompt_tokens: None,
+                completion_tokens: None,
+                cost: None,
+            },
+        });
+    }
+}
+
+fn schedule_usage_repair<P: Provider + Send + Sync + 'static>(
+    provider: &Arc<P>,
+    db: &Arc<Db>,
+    in_flight: &Arc<tokio::sync::Mutex<HashSet<GenerationId>>>,
+    event_context: Option<(
+        broadcast::Sender<ChatEvent>,
+        ConversationId,
+        BatchId,
+        MessageId,
+    )>,
+    request: GenerationId,
+    remote_id: String,
+) {
+    let provider = provider.clone();
+    let db = db.clone();
+    let in_flight = in_flight.clone();
+    tokio::spawn(async move {
+        if !in_flight.lock().await.insert(request) {
+            return;
+        }
+        let rec = UsageRecord::pending(request);
+        let _ = query_and_record_usage(provider, db, rec, remote_id, event_context).await;
+        in_flight.lock().await.remove(&request);
+    });
+}
+
+async fn query_and_record_usage<P: Provider + Send + Sync + 'static>(
+    provider: Arc<P>,
+    db: Arc<Db>,
+    mut rec: UsageRecord,
+    remote_id: String,
+    event_context: Option<(
+        broadcast::Sender<ChatEvent>,
+        ConversationId,
+        BatchId,
+        MessageId,
+    )>,
+) -> (bool, GenerationId) {
+    // Transient 404/401 and network failures stay pending. Short retries catch
+    // generation metadata that becomes visible shortly after the SSE stream.
+    let delays = [
+        std::time::Duration::from_millis(250),
+        std::time::Duration::from_millis(750),
+        std::time::Duration::from_secs(2),
+    ];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut result = None;
+    for attempt in 0..=delays.len() {
+        let query = tokio::time::timeout_at(deadline, provider.query_usage(&remote_id)).await;
+        match query {
+            Err(_) => break,
+            Ok(Ok(Some(usage))) if usage.cost.is_some() => {
+                result = Some(usage);
+                break;
+            }
+            Ok(Ok(Some(usage))) => result = Some(usage),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                tracing::debug!(%error, request_id = %rec.request_id, "generation usage 补查稍后重试");
+                if matches!(
+                    error,
+                    ProviderError::Unauthorized(_)
+                        | ProviderError::Forbidden(_)
+                        | ProviderError::PaymentRequired(_)
+                        | ProviderError::RateLimited { .. }
+                ) {
+                    break;
+                }
+            }
+        }
+        if attempt < delays.len()
+            && tokio::time::timeout_at(deadline, tokio::time::sleep(delays[attempt]))
+                .await
+                .is_err()
+        {
+            break;
+        }
+    }
+    rec.merge_known(
+        result.as_ref().and_then(|u| u.prompt_tokens),
+        result.as_ref().and_then(|u| u.completion_tokens),
+        result.as_ref().and_then(|u| u.cost),
+        crate::domain::CostSource::GenerationQuery,
+        Some(remote_id),
+        chrono::Utc::now(),
+    );
+    if rec.cost.is_none() {
+        rec.cost_source = None;
+    }
+    let known = rec.status == crate::domain::UsageStatus::Known;
+    let request_id = rec.request_id;
+    let prompt_tokens = rec.prompt_tokens;
+    let completion_tokens = rec.completion_tokens;
+    let cost = rec.cost;
+    db_usage(&db, &rec).await;
+    if let Some((events, conversation, batch, assistant)) = event_context {
+        let db_read = db.clone();
+        let persisted = tokio::task::spawn_blocking(move || db_read.usage_record(request_id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten();
+        let prompt_tokens = persisted
+            .as_ref()
+            .and_then(|record| record.prompt_tokens)
+            .or(prompt_tokens);
+        let completion_tokens = persisted
+            .as_ref()
+            .and_then(|record| record.completion_tokens)
+            .or(completion_tokens);
+        let cost = persisted.and_then(|record| record.cost).or(cost);
+        let _ = events.send(ChatEvent {
+            conversation_id: conversation,
+            batch_id: batch,
+            request_id,
+            assistant_message_id: assistant,
+            event: GenEvent::UsageUpdated {
+                prompt_tokens,
+                completion_tokens,
+                cost,
+            },
+        });
+    }
+    (known, request_id)
+}
+
+#[cfg(test)]
+mod usage_repair_tests {
+    use super::*;
+    use crate::domain::Conversation;
+    use crate::providers::{CatalogSnapshot, EventStream, KeyStatus, UsageResult};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DelayedCostProvider(AtomicUsize);
+
+    impl Provider for DelayedCostProvider {
+        fn id(&self) -> crate::domain::ProviderId {
+            crate::domain::ProviderId::new()
+        }
+
+        async fn list_models(&self) -> Result<CatalogSnapshot, ProviderError> {
+            Err(ProviderError::Protocol("unused".into()))
+        }
+
+        fn stream(
+            &self,
+            _req: ImmutableRequest,
+            _cancel: CancellationToken,
+        ) -> crate::providers::EventStream {
+            Box::pin(futures_util::stream::empty()) as EventStream
+        }
+
+        async fn query_usage(
+            &self,
+            _remote_generation_id: &str,
+        ) -> Result<Option<UsageResult>, ProviderError> {
+            let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(UsageResult {
+                prompt_tokens: Some(15),
+                completion_tokens: Some(4),
+                cost: (attempt > 0).then_some(rust_decimal::Decimal::new(491, 5)),
+            }))
+        }
+
+        async fn query_key_status(&self) -> Result<KeyStatus, ProviderError> {
+            Ok(KeyStatus::Unsupported)
+        }
+
+        async fn test_connection(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_query_retries_tokens_only_until_cost_arrives() {
+        let db = Arc::new(crate::storage::open_in_memory().unwrap());
+        let request = GenerationId::new();
+        let conversation = ConversationId::new();
+        let batch = BatchId::new();
+        let user = MessageId::new();
+        let assistant = MessageId::new();
+        let provider_id = crate::domain::ProviderId::new();
+        let now = chrono::Utc::now();
+        let generation = Generation {
+            request_id: request,
+            batch_id: batch,
+            user_message_id: user,
+            assistant_message_id: assistant,
+            provider_id,
+            model_id: "test-model".into(),
+            status: GenerationStatus::Completed,
+            params: None,
+            system_prompt: None,
+            context_snapshot: Vec::new(),
+            price_snapshot: None,
+            remote_generation_id: Some("gen-delayed".into()),
+            error: None,
+            retry_of: None,
+            retry_root_id: Some(request),
+            failure: None,
+            request_snapshot: None,
+            retry_not_before_ms: None,
+            dispatch_phase: DispatchPhase::RemoteAccepted,
+            started_at: Some(now),
+            finished_at: Some(now),
+        };
+        db.upsert_conversation(&Conversation::new(conversation, now))
+            .unwrap();
+        db.save_send_batch(&SendBatchRecord {
+            batch_id: batch,
+            conversation_id: conversation,
+            primary_request_id: request,
+            user_messages: vec![Message {
+                id: user,
+                conversation_id: conversation,
+                parent_id: None,
+                role: crate::domain::Role::User,
+                content: "question".into(),
+                attachments: Vec::new(),
+                created_at: now,
+            }],
+            assistant_messages: vec![Message {
+                id: assistant,
+                conversation_id: conversation,
+                parent_id: Some(user),
+                role: crate::domain::Role::Assistant,
+                content: String::new(),
+                attachments: Vec::new(),
+                created_at: now,
+            }],
+            generations: vec![generation],
+            usage: vec![UsageRecord::pending(request)],
+            intended_main_leaf: None,
+            replacement: None,
+            draft_consumption: None,
+        })
+        .unwrap();
+        let provider = Arc::new(DelayedCostProvider(AtomicUsize::new(0)));
+        let (events, _rx) = broadcast::channel(16);
+        let service = ChatService::new(provider.clone(), db.clone(), events, 1);
+        assert_eq!(service.repair_pending_usage().await.unwrap(), 1);
+        assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+        let record = db.usage_record(request).unwrap().unwrap();
+        assert_eq!(record.status, crate::domain::UsageStatus::Known);
+        assert_eq!(record.prompt_tokens, Some(15));
+        assert_eq!(record.cost, Some(rust_decimal::Decimal::new(491, 5)));
+        settle_usage(
+            &provider,
+            &db,
+            &service.usage_repairs,
+            &service.events,
+            conversation,
+            batch,
+            assistant,
+            request,
+            Some("gen-delayed".into()),
+        )
+        .await;
+        assert_eq!(
+            provider.0.load(Ordering::SeqCst),
+            2,
+            "Known 账目不应再次 GET"
+        );
     }
 }

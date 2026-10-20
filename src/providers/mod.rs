@@ -10,6 +10,7 @@ pub mod deepseek;
 pub mod openrouter;
 pub mod sse;
 
+use std::future::Future;
 use std::pin::Pin;
 
 use futures_util::Stream;
@@ -30,6 +31,10 @@ pub enum GenEvent {
         prompt_tokens: Option<u64>,
         completion_tokens: Option<u64>,
         cost: Option<Decimal>,
+    },
+    /// 远端 generation id 在任意首帧出现时尽早持久化,便于中断后补查。
+    RemoteGenerationId {
+        remote_generation_id: String,
     },
     Finished {
         remote_generation_id: Option<String>,
@@ -468,10 +473,10 @@ pub trait Provider {
     /// 流式聊天;`http` 便于测试注入 mock 客户端。
     fn stream(&self, req: ImmutableRequest, cancel: cancel::CancellationToken) -> EventStream;
 
-    async fn query_usage(
-        &self,
-        remote_generation_id: &str,
-    ) -> Result<Option<UsageResult>, ProviderError>;
+    fn query_usage<'a>(
+        &'a self,
+        remote_generation_id: &'a str,
+    ) -> impl Future<Output = Result<Option<UsageResult>, ProviderError>> + Send + 'a;
 
     async fn query_key_status(&self) -> Result<KeyStatus, ProviderError>;
 

@@ -107,7 +107,12 @@ async fn spawn_capturing_mock(
                     }
                     buf.extend_from_slice(&chunk[..n]);
                 }
-                *captured.lock().await = String::from_utf8_lossy(&buf[header_end..]).to_string();
+                // 只捕获聊天请求体:费用补查会另发 GET /generation?id=…,
+                // 不能覆盖同一个槽位。
+                if buf[..header_end].starts_with(b"POST") {
+                    *captured.lock().await =
+                        String::from_utf8_lossy(&buf[header_end..]).to_string();
+                }
                 for c in body.chunks(64) {
                     let _ = sock.write_all(c).await;
                 }

@@ -75,6 +75,7 @@ impl OpenRouter {
         let base = &self.base_url;
         if path == "/models"
             || path.starts_with("/chat")
+            || path.starts_with("/generation")
             || path.starts_with("/generations")
             || path == "/key"
             || path == "/credits"
@@ -213,6 +214,7 @@ impl Provider for OpenRouter {
             let mut finish: Option<FinishState> = None;
             let mut done_marker = false;
             let mut got_text = false;
+            let mut first_remote_id: Option<String> = None;
             // 内容进展时钟:keepalive 注释不重置(C08)
             let mut last_progress = tokio::time::Instant::now();
             let mut terminal_err: Option<ProviderError> = None;
@@ -252,6 +254,14 @@ impl Provider for OpenRouter {
                                 done_marker = true;
                                 break;
                             }
+                            if first_remote_id.is_none() {
+                                if let Some(id) = extract_remote_generation_id(&data) {
+                                    first_remote_id = Some(id.clone());
+                                    yield GenEvent::RemoteGenerationId {
+                                        remote_generation_id: id,
+                                    };
+                                }
+                            }
                             // 一个 JSON 帧可同时含文本/usage/finish/error(5.4)
                             let events = match decode_chat_events(&data) {
                                 Ok(evts) => evts,
@@ -278,7 +288,7 @@ impl Provider for OpenRouter {
                                         if finish.is_none() {
                                             finish = Some(state.clone());
                                             yield GenEvent::Finished {
-                                                remote_generation_id,
+                                                remote_generation_id: first_remote_id.clone().or(remote_generation_id),
                                                 finish_state: state,
                                             };
                                         }
@@ -328,23 +338,37 @@ impl Provider for OpenRouter {
         &self,
         remote_generation_id: &str,
     ) -> Result<Option<UsageResult>, ProviderError> {
-        let json = self
-            .get_json(&self.url(&format!("/generations?id={remote_generation_id}")))
-            .await?;
-        let gen = json
-            .get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|a| a.first());
+        let mut url = reqwest::Url::parse(&self.url("/generation"))
+            .map_err(|e| ProviderError::Protocol(e.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("id", remote_generation_id);
+        let json = self.get_json(url.as_str()).await?;
+        let gen = json.get("data");
         let Some(gen) = gen else {
             return Ok(None);
         };
-        let totals = gen.get("totals").cloned().unwrap_or_default();
-        let get_num =
-            |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64()).map(|f| f as u64);
-        let cost = gen.pointer("/cost/total").and_then(json_decimal);
+        let nested_usage = gen.get("usage").filter(|u| u.is_object());
+        let get_num = |keys: &[&str]| {
+            keys.iter().find_map(|k| {
+                gen.get(*k)
+                    .or_else(|| nested_usage.and_then(|u| u.get(*k)))
+                    .and_then(|x| {
+                        x.as_u64()
+                            .or_else(|| x.as_str().and_then(|s| s.parse::<u64>().ok()))
+                    })
+            })
+        };
+        let cost = gen
+            .get("total_cost")
+            .and_then(json_decimal)
+            .or_else(|| gen.get("usage").and_then(json_decimal));
         Ok(Some(UsageResult {
-            prompt_tokens: get_num(&totals, "prompt_tokens"),
-            completion_tokens: get_num(&totals, "completion_tokens"),
+            prompt_tokens: get_num(&["tokens_prompt", "native_tokens_prompt", "prompt_tokens"]),
+            completion_tokens: get_num(&[
+                "tokens_completion",
+                "native_tokens_completion",
+                "completion_tokens",
+            ]),
             cost,
         }))
     }
@@ -427,7 +451,10 @@ fn decode_chat_events(data: &str) -> Result<Vec<ChatStreamEvent>, ProviderError>
     // usage(可与文本/finish 同帧;也可作为末尾独立 chunk)
     if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
         let get = |k: &str| usage.get(k).and_then(|x| x.as_u64());
-        let cost = v.get("cost").and_then(json_decimal);
+        let cost = usage
+            .get("cost")
+            .and_then(json_decimal)
+            .or_else(|| v.get("cost").and_then(json_decimal));
         out.push(ChatStreamEvent::Usage(UsageResult {
             prompt_tokens: get("prompt_tokens"),
             completion_tokens: get("completion_tokens"),
@@ -496,6 +523,15 @@ fn decode_chat_events(data: &str) -> Result<Vec<ChatStreamEvent>, ProviderError>
     Ok(out)
 }
 
+fn extract_remote_generation_id(data: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// SSE 错误载荷 → ProviderError(数字/字符串 code 兼容;保留原因)。
 fn sse_error_to_provider_error(err: &serde_json::Value) -> ProviderError {
     let message = err
@@ -558,12 +594,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(evts.len(), 3, "{evts:?}");
-        assert!(matches!(&evts[0], ChatStreamEvent::Usage(u) if u.prompt_tokens == Some(10)));
+        assert!(
+            matches!(&evts[0], ChatStreamEvent::Usage(u) if u.prompt_tokens == Some(10) && u.cost == Some(Decimal::new(12, 4)))
+        );
         assert!(matches!(&evts[1], ChatStreamEvent::Delta(t) if t == "尾段"));
         assert!(matches!(
             &evts[2],
             ChatStreamEvent::Finish { remote_generation_id: Some(r), state: FinishState::Stop } if r == "gen-x"
         ));
+
+        let nested = decode_chat_events(
+            r#"{"id":"gen-nested","usage":{"prompt_tokens":3,"completion_tokens":2,"cost":"0.00491"},"choices":[]}"#,
+        ).unwrap();
+        assert!(
+            matches!(&nested[0], ChatStreamEvent::Usage(u) if u.cost == Some(Decimal::new(491, 5)))
+        );
+        assert_eq!(
+            extract_remote_generation_id(r#"{"id":"gen-nested","error":{"message":"x"}}"#)
+                .as_deref(),
+            Some("gen-nested")
+        );
+
+        // Older mocks/providers used a top-level cost; keep compatibility.
+        let legacy = decode_chat_events(r#"{"usage":{"prompt_tokens":1},"cost":"0.02"}"#).unwrap();
+        assert!(
+            matches!(&legacy[0], ChatStreamEvent::Usage(u) if u.cost == Some(Decimal::new(2, 2)))
+        );
 
         let evts = decode_chat_events(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).unwrap();
         assert!(matches!(&evts[0], ChatStreamEvent::Delta(t) if t == "你好"));
@@ -651,5 +707,94 @@ mod tests {
         let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
         assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
         assert_eq!(msgs.last().unwrap()["content"].as_str(), Some("Q2"));
+    }
+
+    #[tokio::test]
+    async fn query_usage_uses_generation_endpoint_and_official_schema() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 2048];
+            let n = socket.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..n]).to_string();
+            let body = r#"{"data":{"total_cost":"0.012345","tokens_prompt":123,"tokens_completion":45,"native_tokens_prompt":120,"native_tokens_completion":43}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let provider = OpenRouter::with_base_url(
+            ProviderId::new(),
+            format!("http://{addr}/v1"),
+            "test".into(),
+        );
+        let usage = provider
+            .query_usage("gen-1&other=bad")
+            .await
+            .unwrap()
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("GET /v1/generation?id=gen-1%26other%3Dbad "),
+            "{request}"
+        );
+        assert_eq!(usage.cost, Some(Decimal::new(12345, 6)));
+        assert_eq!(usage.prompt_tokens, Some(123));
+        assert_eq!(usage.completion_tokens, Some(45));
+    }
+
+    #[tokio::test]
+    async fn stream_keeps_first_frame_id_when_finish_and_usage_omit_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = concat!(
+                "data: {\"id\":\"gen-first\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"cost\":\"0.00491\"},\"choices\":[]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let provider = OpenRouter::with_base_url(
+            ProviderId::new(),
+            format!("http://{addr}/v1"),
+            "test".into(),
+        );
+        let req = ImmutableRequest {
+            conversation_id: ConversationId::new(),
+            batch_id: BatchId::new(),
+            request_id: GenerationId::new(),
+            assistant_message_id: MessageId::new(),
+            model: "test-model".into(),
+            params: None,
+            system_prompt: None,
+            history: Vec::new(),
+            prompt: "hello".into(),
+        };
+        let mut stream = provider.stream(req, CancellationToken::new());
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
+        server.await.unwrap();
+        assert!(events.iter().any(|event| matches!(event,
+            crate::providers::GenEvent::RemoteGenerationId { remote_generation_id } if remote_generation_id == "gen-first")));
+        assert!(events.iter().any(|event| matches!(event,
+            crate::providers::GenEvent::Finished { remote_generation_id: Some(id), .. } if id == "gen-first")));
+        assert!(events.iter().any(|event| matches!(event,
+            crate::providers::GenEvent::UsageUpdated { cost: Some(cost), .. } if *cost == Decimal::new(491, 5))));
     }
 }

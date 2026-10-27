@@ -1,6 +1,6 @@
 [package]
 name = "aicouncil"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "AiCouncil - minimal native AI chat with parallel model branches"
@@ -14,11 +14,15 @@ path = "src/lib.rs"
 name = "aicouncil"
 path = "src/main.rs"
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
-# UI(默认含 wgpu/tiny-skia/thread-pool;附加 markdown/代码高亮/SVG/tokio/advanced)
-iced = { version = "0.14", default-features = false, features = ["markdown", "highlighter", "svg", "tokio", "advanced", "tiny-skia", "crisp", "thread-pool", "linux-theme-detection", "x11", "wayland"] }
-iced_math = "0.5"
-iced_runtime = "0.14"
+# Tauri 2 桌面壳(macOS 唯一支持平台)
+tauri = { version = "2", features = [] }
+# 原生保存对话框(导出 Markdown:先落盘再报成功)
+tauri-plugin-dialog = "2"
 
 # 异步与网络
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
@@ -31,11 +35,9 @@ serde_json = "1"
 
 # 存储
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
 
 # 平台
 directories = "5"
-rfd = "0.15"
 
 # 领域
 uuid = { version = "1", features = ["v4"] }
@@ -43,17 +45,8 @@ chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1", features = ["serde"] }
 thiserror = "2"
 
-# Markdown 解析(公式定界符识别在此层完成)
-pulldown-cmark = "0.12"
-
-# grapheme 级文本选择边界(与 iced/cosmic 同一实现)
-unicode-segmentation = "1"
-
-# .env 解析(标题服务 DEEPSEEK_API_KEY;只取命名变量,不导入全局)
+# .env 命名变量解析(仅取 OPENROUTER_API_KEY / DEEPSEEK_API_KEY,不导入全局)
 dotenvy = "0.15"
-
-# 代码块语法高亮(与 iced markdown 组件同一引擎)
-iced_highlighter = "0.14"
 
 # 异步流构造
 async-stream = "0.3"
@@ -62,22 +55,11 @@ async-stream = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# 窗口图标(assets/icons/logo.png → RGBA)
-png = "0.17"
-
 [build-dependencies]
-# Windows exe 资源(资源管理器/任务栏图标)
-winresource = "0.1"
-
-[patch.crates-io]
-iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
+tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 tempfile = "3"
-# SVG 栅格化(gen_icon 示例生成 assets/icons 产物;产物已提交)
-resvg = "0.48"
-iced_tiny_skia = "0.14"
-tiny-skia = "0.11"
 
 [profile.release]
 lto = "thin"

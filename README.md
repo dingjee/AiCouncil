@@ -1,7 +1,9 @@
 # AiCouncil
 
-A minimal native Rust desktop AI chat client for OpenRouter, built with iced.
-English UI, local SQLite persistence, no telemetry.
+A minimal native AI chat client for OpenRouter. English UI, local SQLite
+persistence, no telemetry. Version 0.2.0 ships as a Tauri 2 desktop app for
+macOS (Apple Silicon); the previous Windows/iced build is superseded on this
+branch (historical sources remain recoverable via git).
 
 ## Features
 
@@ -30,60 +32,79 @@ English UI, local SQLite persistence, no telemetry.
 - Soft Sage reading theme, draggable right pane, Markdown export, exact cost
   labels.
 
-Details: [implementation status](docs/IMPLEMENTATION_STATUS.md) ·
-[rendering notes](docs/RENDERING.md) ·
-[acceptance matrix](docs/ACCEPTANCE.md).
+## Run on macOS (Apple Silicon)
 
-## Run (Windows 10/11)
-
-Requires Rust (toolchain pinned by rust-toolchain.toml).
+Prerequisites: Xcode Command Line Tools, Rust stable (via
+[rustup](https://rustup.rs); the toolchain pin lives in `rust-toolchain.toml`),
+and [Bun](https://bun.sh) for the frontend build.
 
 ```sh
-cargo run --release
+(cd frontend && bun install --frozen-lockfile && bun run build)
+cargo build --release
 ```
 
-The data directory is created automatically next to the exe on first launch:
-
-- `data\aicouncil.db` — chats, message tree, generation records, cost ledger
-  (SQLite/WAL; old databases migrate automatically; a missing local database
-  is migrated one-way from legacy `%APPDATA%\AiCouncil`)
-- `data\config.json` — non-sensitive settings
-- `data\credentials.dpapi` — API keys, DPAPI-encrypted for the current
-  Windows user; never written to plain config, the database, or exports
-
-## Offline development and checks
+Or use the repeatable scripts:
 
 ```sh
-# local mock (catalog + SSE streaming + costs), no real spend
-cargo run --example mock_openrouter -- 8901
-# another terminal
-AICOUNCIL_BASE_URL=http://127.0.0.1:8901/v1 cargo run
-
-# rendering acceptance window (formulas / CJK-mixed / stress samples)
-cargo run --example render_probe
-
-# automated E2E against the mock (=multi adds parallel, =multi2 adds
-# multi-branch follow-ups)
-AICOUNCIL_E2E=multi cargo run
-
-# routine checks
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+scripts/macos_check.sh              # fmt + clippy + tests (isolated data dir)
+scripts/macos_build.sh              # cargo build --release, exe staged in dist/
+scripts/macos_release_check.sh      # verify dist artifacts (arch/signature/deps)
 ```
 
-(On memory-constrained machines, add `-j 2` to cargo commands.)
+## Data location (macOS)
+
+- Bundled app: `~/Library/Application Support/AiCouncil/`
+  - `aicouncil.db` — chats, message tree, generation records, cost ledger
+    (SQLite/WAL; schema migrations apply automatically)
+  - `config.json` — non-sensitive settings
+  - `.env` — your API keys (see below; maintained by you, read-only to the app)
+- First launch of the bundled app imports a legacy PC database found next to
+  the `.app` bundle (`<bundle dir>/../data/aicouncil.db`, e.g. `dist/data`)
+  via a WAL-safe SQLite snapshot: never overwrites an existing database,
+  idempotent on later launches, source file left byte-identical.
+- Tests and isolated runs: set `AICOUNCIL_DATA_DIR=/some/tmp/dir` — the app
+  then uses exactly that directory and performs no legacy import.
+
+## API keys (.env is the single source)
+
+Put your keys in the data-directory `.env` (copy `.env.example` there):
+
+```
+OPENROUTER_API_KEY=...
+DEEPSEEK_API_KEY=...
+```
+
+The app reads only these named variables, re-reads the file on every lookup,
+and never writes, logs, or exports them. After placing or changing `.env`,
+call the in-app reload (or restart): the OpenRouter and DeepSeek title clients
+are rebuilt from the file. There is no Keychain or DPAPI storage in 0.2.0.
+
+## Windows → macOS migration notes
+
+- Chats/settings: the bundled app auto-imports the legacy PC `data/` directory
+  that sits next to it (non-overwriting; see above). A byte-identical labeled
+  backup of the original PC data is kept in `dist/pc-data-backup/`.
+- API keys: the existing private `.env` (already containing both named keys)
+  is copied to the runtime data directory; the app's reload then rebuilds both
+  provider clients from it. The Windows `credentials.dpapi` ciphertext cannot
+  be decrypted on macOS and is NOT imported — it stays only in the archived
+  backup (`dist/pc-data-backup/`) for reference.
+
+## Verification
+
+- `docs/MACOS_ACCEPTANCE.md` — macOS migration/acceptance report with actual
+  commands and results.
+- `scripts/macos_migrate_selfcheck.sh` — verifies the real PC backup via
+  hashes and a temp-dir copy (counts, integrity, idempotent import) without
+  touching the original.
 
 ## Known limitations
 
-- tiny-skia software rendering (wgpu produces no frames in remote-desktop
-  sessions; on GPU machines the wgpu feature can be re-enabled in Cargo.toml)
-- in-message selection only; continuous drag-select across messages is not
-  implemented
-- macOS / Linux unverified; real OpenRouter / DeepSeek integration not yet
-  executed — everything is verified against the local mock
-
-See docs/ACCEPTANCE.md for the full verified / not-run matrix.
+- macOS-only on this branch; no Windows/Linux build support.
+- Native UI behaviors (IME composition, window management) are covered by the
+  frontend scope; browser-level checks supplement but do not replace native
+  verification — see the acceptance report for exactly what was run.
+- Ad-hoc local codesigning only; no Apple notarization is claimed.
 
 ## License
 

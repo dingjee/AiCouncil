@@ -133,6 +133,86 @@ fn usage_chunk() -> String {
     "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":7},\"cost\":\"0.0049\"}\n\n".to_string()
 }
 
+/// 计数 mock:统计被接收的连接数(= 真实 POST 次数);可选响应头延迟。
+async fn spawn_counting_mock_server(
+    addr: SocketAddr,
+    body: &'static [u8],
+    chunk_delay_ms: u64,
+    header_delay_ms: u64,
+) -> Arc<std::sync::atomic::AtomicUsize> {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = counter.clone();
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = body;
+            let delay = chunk_delay_ms;
+            let header_delay = header_delay_ms;
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_millis(300), sock.read(&mut buf)).await;
+                if header_delay > 0 {
+                    // 响应头延迟:客户端停在 send() 阶段(取消必须能打断)
+                    tokio::time::sleep(Duration::from_millis(header_delay)).await;
+                }
+                use tokio::io::AsyncWriteExt;
+                for chunk in body.chunks(7) {
+                    let _ = sock.write_all(chunk).await;
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            });
+        }
+    });
+    counter
+}
+
+/// 并发上限可配的服务(便于构造“排队中取消”场景)。
+fn make_service_with_concurrency(
+    base_url: String,
+    db: Arc<Db>,
+    max_concurrent: usize,
+) -> (ChatService<OpenRouter>, broadcast::Receiver<ChatEvent>) {
+    let provider = Arc::new(OpenRouter::with_base_url(
+        ProviderId::new(),
+        base_url,
+        "test-key".into(),
+    ));
+    let (tx, rx) = tokio::sync::broadcast::channel(4096);
+    let svc = ChatService::new(provider, db, tx, max_concurrent);
+    (svc, rx)
+}
+
+/// 单模型发送计划。
+fn single_plan(conv: ConversationId, db: &Db, model: &str) -> aicouncil::domain::SendPlan {
+    db.upsert_conversation(&Conversation::new(conv, chrono::Utc::now()))
+        .unwrap();
+    let target = ModelTarget {
+        provider_id: ProviderId::new(),
+        model_id: model.into(),
+        params: None,
+        price: None,
+    };
+    Planner::prepare(
+        conv,
+        &ContinuationSelection::SameQuestionMulti {
+            leaf: None,
+            targets: vec![target],
+            primary: 0,
+        },
+        "你好",
+        &[],
+        None,
+        &MessageTree::new(),
+        chrono::Utc::now(),
+    )
+    .unwrap()
+}
+
 fn make_service(
     base_url: String,
     db: Arc<Db>,
@@ -851,4 +931,116 @@ async fn c10_first_terminal_wins() {
         "首终态保留"
     );
     e.mock.handle.abort();
+}
+
+/// 回归:submit 返回回执后**立即**取消不得丢失。
+///
+/// 令牌必须在 submit 返回前注册(否则取消落在注册窗口内被丢弃)。
+/// 场景:并发上限 1 → 第一个请求占住名额 → 第二个请求排队 →
+/// 立即取消第二个 → 必须是 Cancelled 终态,且**从未发出 HTTP**(不派发、不计费)。
+#[tokio::test]
+async fn immediate_cancel_after_submit_is_not_lost_and_never_dispatches() {
+    let mut long = String::new();
+    for _ in 0..40 {
+        long.push_str(&delta("慢"));
+    }
+    long.push_str(&finish("gen-slow"));
+    long.push_str("data: [DONE]\n\n");
+    let body: &'static [u8] = Box::leak(sse(&long).into_boxed_slice());
+
+    let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = la.local_addr().unwrap().port();
+    drop(la);
+    let counter = spawn_counting_mock_server(([127, 0, 0, 1], port).into(), body, 40, 0).await;
+
+    let db = Arc::new(open_in_memory().unwrap());
+    let (svc, mut rx) =
+        make_service_with_concurrency(format!("http://127.0.0.1:{port}/v1"), db.clone(), 1);
+    let conv = ConversationId::new();
+
+    // 第一个请求:占住唯一名额(慢流)。
+    let first = svc
+        .submit(single_plan(conv, &db, "mock/slow"))
+        .await
+        .unwrap();
+    // 第二个请求:排队(不会立刻发出)。
+    let second = svc
+        .submit(single_plan(conv, &db, "mock/queued"))
+        .await
+        .unwrap();
+
+    // 立即取消排队中的第二个请求(不等任何 chunk)。
+    svc.cancel(second.primary_request_id).await;
+
+    let mut cancelled = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !cancelled {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(ev)) => {
+                if ev.request_id == second.primary_request_id
+                    && matches!(ev.event, aicouncil::providers::GenEvent::Cancelled)
+                {
+                    cancelled = true;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => break,
+            _ => continue,
+        }
+    }
+    assert!(
+        cancelled,
+        "立即取消必须产生 Cancelled 终态(令牌注册竞态回归)"
+    );
+
+    // 被取消的请求从未派发:连接数只应来自第一个请求。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let posts = counter.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(posts, 1, "排队中取消的请求不得发出 HTTP(不派发、不计费)");
+
+    // 第一个请求仍在跑:取消它以便测试收尾。
+    svc.cancel(first.primary_request_id).await;
+}
+
+/// 回归:响应头延迟期间取消必须立即生效(不能等到响应头到达)。
+///
+/// 服务端接受连接后 30 s 才发响应头 → 客户端停在 `send()` →
+/// 取消必须打断等待并产生 Cancelled 终态。
+#[tokio::test]
+async fn cancel_while_response_headers_delayed_stops_promptly() {
+    let body: &'static [u8] = Box::leak(sse("data: [DONE]\n\n").into_boxed_slice());
+    let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = la.local_addr().unwrap().port();
+    drop(la);
+    spawn_counting_mock_server(([127, 0, 0, 1], port).into(), body, 10, 30_000).await;
+
+    let db = Arc::new(open_in_memory().unwrap());
+    let (svc, mut rx) =
+        make_service_with_concurrency(format!("http://127.0.0.1:{port}/v1"), db.clone(), 4);
+    let conv = ConversationId::new();
+    let receipt = svc
+        .submit(single_plan(conv, &db, "mock/slow-headers"))
+        .await
+        .unwrap();
+
+    svc.cancel(receipt.primary_request_id).await;
+
+    let mut cancelled = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !cancelled {
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Ok(ev)) => {
+                if matches!(ev.event, aicouncil::providers::GenEvent::Cancelled) {
+                    cancelled = true;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(_)) => break,
+            _ => continue,
+        }
+    }
+    assert!(
+        cancelled,
+        "响应头延迟期间的取消必须立即生效(不能等 30s 响应头)"
+    );
 }

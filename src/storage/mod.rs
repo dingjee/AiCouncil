@@ -1365,6 +1365,36 @@ impl Db {
         Ok(rows.pop())
     }
 
+    /// 按请求 ID 读取单条 generation(IPC 重试入口定位原请求)。
+    pub fn generation(&self, request: GenerationId) -> Result<Option<Generation>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT g.request_id, g.batch_id, g.user_message_id, g.assistant_message_id,
+                    g.provider_id, g.model_id, g.status, g.params_json, g.system_prompt,
+                    g.context_json, g.price_json, g.remote_generation_id, g.error, g.retry_of,
+                    g.started_at, g.finished_at, g.failure_json, g.request_snapshot_json,
+                    g.retry_root_id, g.retry_not_before_ms, g.dispatch_phase
+             FROM generations g WHERE g.request_id = ?1",
+        )?;
+        let mut rows = stmt
+            .query_map([request.as_str()], row_to_generation)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.pop())
+    }
+
+    /// 消息所属会话(IPCI 事件路由;消息可能已被移除)。
+    pub fn conversation_of_message(&self, message: MessageId) -> Result<Option<ConversationId>> {
+        let conn = self.lock();
+        let v: Option<String> = conn
+            .query_row(
+                "SELECT conversation_id FROM messages WHERE id = ?1",
+                [message.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.map(|s| ConversationId::from_uuid_str(s.as_str())))
+    }
+
     /// 启动恢复:遗留 Queued/Connecting/Streaming -> Interrupted。
     /// 返回受影响请求数。
     pub fn recover_interrupted(&self) -> Result<usize> {

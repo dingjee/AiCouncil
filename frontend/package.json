@@ -1,0 +1,37 @@
+{
+  "name": "aicouncil-frontend",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "description": "AiCouncil macOS frontend (Tauri 2 webview)",
+  "scripts": {
+    "dev": "vite",
+    "dev:mock": "vite --mode mock --port 5174",
+    "build": "tsc --noEmit && vite build",
+    "build:only": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "highlight.js": "^11.11.1",
+    "katex": "^0.16.15",
+    "markdown-it": "^14.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "^15.11.7",
+    "@types/bun": "^1.4.4",
+    "@types/katex": "^0.16.7",
+    "@types/markdown-it": "^14.1.2",
+    "@types/node": "^26.6.5",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "happy-dom": "^15.11.7",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.7"
+  }
+}

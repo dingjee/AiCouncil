@@ -14,3 +14,9 @@ Thumbs.db
 .zcode/
 .idea/
 .vscode/
+# Frontend build output and dependencies (MM-F scope)
+node_modules/
+frontend/dist/
+# macOS packaging artifacts
+*.dmg
+*.app

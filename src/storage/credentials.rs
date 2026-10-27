@@ -1,364 +1,174 @@
-//! API Key 凭据存储:Windows 使用 DPAPI 加密文件并可导入旧 keyring；
-//! 其他平台仅保留于当前进程。任何情况下不落明文文件。
+//! API Key 凭据来源(macOS,0.2.0 起):稳定数据目录下的 `.env` 是**唯一**来源。
+//!
+//! - 具名变量:`OPENROUTER_API_KEY`、`DEEPSEEK_API_KEY`(白名单;文件由
+//!   用户/部署方放置,应用只读不写,绝不打印/记录其值)。
+//! - 定位与 desktop env_keys 一致(`repo::env_file_candidates`):
+//!   `AICOUNCIL_ENV_PATH` > 数据目录 `.env` > exe 同级;`AICOUNCIL_DATA_DIR`
+//!   设置时严格隔离、绝不回退。**第一个存在的文件**即唯一权威文件;
+//!   键为空/缺失即为“未配置”,不再尝试其他文件。
+//! - 每次查询即时重读文件(外部更新无需重启)。
+//! - 无 Keychain/keyring/DPAPI;无写入/删除 API(0.1.x 的保存/删除入口
+//!   已随 iced UI 移除,`.env` 为外部只读来源)。
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::PathBuf;
 
-const SERVICE: &str = "AiCouncil";
+/// `.env` 具名变量白名单:provider_ref → 环境变量名。仅这两个具名来源。
+const ENV_PROVIDERS: [(&str, &str); 2] = [
+    ("openrouter", "OPENROUTER_API_KEY"),
+    ("deepseek", "DEEPSEEK_API_KEY"),
+];
 
-/// 凭据存取。
-pub trait CredentialStore: Send + Sync {
-    fn save(&self, provider_ref: &str, key: &str) -> Result<(), CredentialError>;
-    fn load(&self, provider_ref: &str) -> Result<Option<String>, CredentialError>;
-    fn delete(&self, provider_ref: &str) -> Result<(), CredentialError>;
+/// provider_ref 对应的 `.env` 具名变量(白名单外返回 None)。
+pub fn env_var_for_provider(provider_ref: &str) -> Option<&'static str> {
+    ENV_PROVIDERS
+        .iter()
+        .find(|(ref_name, _)| *ref_name == provider_ref)
+        .map(|(_, var)| *var)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CredentialError {
-    /// 加密存储不可用；仅当前进程缓存有效。
-    #[error("安全凭据存储不可用: {0}")]
-    Backend(String),
-    #[error("未找到条目")]
-    NotFound,
+/// 凭据当前是否由 `.env` 提供(不返回值本身;供 UI 显示“已配置”状态)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStatus {
+    /// 权威 `.env` 中该具名变量存在且非空。
+    EnvFile,
+    /// 无任何来源。
+    NotConfigured,
 }
 
-/// 旧版系统凭据库读取适配器，仅用于 Windows 首次导入。
-pub struct SystemCredentials;
+/// 唯一权威 `.env` 文件:候选中**第一个存在**者;都不存在则 None。
+/// 之后的一切读取都只针对该文件(不因键缺失而回退到其他候选)。
+pub fn authoritative_env_file() -> Option<PathBuf> {
+    crate::storage::repo::env_file_candidates()
+        .ok()?
+        .into_iter()
+        .find(|p| p.is_file())
+}
 
-impl CredentialStore for SystemCredentials {
-    fn save(&self, provider_ref: &str, key: &str) -> Result<(), CredentialError> {
-        keyring::Entry::new(SERVICE, provider_ref)
-            .and_then(|e| e.set_password(key))
-            .map_err(|e| CredentialError::Backend(e.to_string()))
-    }
-
-    fn load(&self, provider_ref: &str) -> Result<Option<String>, CredentialError> {
-        match keyring::Entry::new(SERVICE, provider_ref).and_then(|e| e.get_password()) {
-            Ok(k) => Ok(Some(k)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(CredentialError::Backend(e.to_string())),
+/// 读取权威 `.env` 中该 provider 的具名变量值;只读,值不落日志。
+/// 权威文件缺失、键缺失或为空 → None(不回退到其他候选文件)。
+pub fn named_env_value(provider_ref: &str) -> Option<String> {
+    let var = env_var_for_provider(provider_ref)?;
+    let path = authoritative_env_file()?;
+    let iter = dotenvy::from_path_iter(&path).ok()?;
+    for (key, value) in iter.flatten() {
+        if key == var && !value.trim().is_empty() {
+            return Some(value);
         }
     }
-
-    fn delete(&self, provider_ref: &str) -> Result<(), CredentialError> {
-        match keyring::Entry::new(SERVICE, provider_ref).and_then(|e| e.delete_credential()) {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(CredentialError::Backend(e.to_string())),
-        }
-    }
+    None
 }
 
-/// 仅当前进程有效的内存凭据(凭据库不可用时的回退;重启后需重新输入)。
-#[derive(Default)]
-pub struct ProcessCredentials {
-    inner: Mutex<HashMap<String, String>>,
-}
-
-impl ProcessCredentials {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl CredentialStore for ProcessCredentials {
-    fn save(&self, provider_ref: &str, key: &str) -> Result<(), CredentialError> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(provider_ref.to_string(), key.to_string());
-        Ok(())
-    }
-
-    fn load(&self, provider_ref: &str) -> Result<Option<String>, CredentialError> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(provider_ref)
-            .cloned())
-    }
-
-    fn delete(&self, provider_ref: &str) -> Result<(), CredentialError> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(provider_ref);
-        Ok(())
-    }
-}
-
-/// Windows 使用本地 DPAPI 文件，其他平台使用仅进程内存储。
-pub struct CredentialVault {
-    system: SystemCredentials,
-    process: ProcessCredentials,
-    /// 系统库是否可用(首次探测结果缓存)。
-    system_available: Mutex<Option<bool>>,
-    /// DPAPI 文件路径;仅 Windows 构建读取(非 Windows 目标上无读者)。
-    #[cfg_attr(not(windows), allow(dead_code))]
-    local_file: Option<std::path::PathBuf>,
-}
-
-impl CredentialVault {
-    pub fn new() -> Self {
-        Self {
-            system: SystemCredentials,
-            process: ProcessCredentials::new(),
-            system_available: Mutex::new(None),
-            local_file: crate::storage::repo::data_dir()
-                .ok()
-                .map(|p| p.join("credentials.dpapi")),
-        }
-    }
-
-    #[cfg(windows)]
-    fn read_local(&self) -> Result<Option<HashMap<String, String>>, CredentialError> {
-        let Some(path) = &self.local_file else {
-            return Ok(None);
-        };
-        let encrypted = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(CredentialError::Backend(e.to_string())),
-        };
-        let plain = dpapi_unprotect(&encrypted).map_err(CredentialError::Backend)?;
-        serde_json::from_slice(&plain)
-            .map(Some)
-            .map_err(|e| CredentialError::Backend(e.to_string()))
-    }
-
-    #[cfg(windows)]
-    fn write_local(&self, values: &HashMap<String, String>) -> Result<(), CredentialError> {
-        let Some(path) = &self.local_file else {
-            return Err(CredentialError::Backend("exe 数据目录不可用".into()));
-        };
-        let plain =
-            serde_json::to_vec(values).map_err(|e| CredentialError::Backend(e.to_string()))?;
-        let encrypted = dpapi_protect(&plain).map_err(CredentialError::Backend)?;
-        let tmp = path.with_extension("dpapi.tmp");
-        std::fs::write(&tmp, encrypted).map_err(|e| CredentialError::Backend(e.to_string()))?;
-        std::fs::rename(tmp, path).map_err(|e| CredentialError::Backend(e.to_string()))
-    }
-
-    /// 检测旧版凭据后端是否可用。
-    pub fn system_available(&self) -> bool {
-        let mut flag = self
-            .system_available
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if let Some(v) = *flag {
-            return v;
-        }
-        let probe = "__probe__";
-        let ok = self
-            .system
-            .save(probe, "1")
-            .and_then(|_| self.system.delete(probe))
-            .is_ok();
-        *flag = Some(ok);
-        ok
-    }
-
-    pub fn save(&self, provider_ref: &str, key: &str) -> Result<bool, CredentialError> {
-        #[cfg(windows)]
-        {
-            self.process.save(provider_ref, key)?;
-            let mut values = match self.read_local() {
-                Ok(Some(values)) => values,
-                Ok(None) => HashMap::new(),
-                Err(_) => return Ok(false),
-            };
-            values.insert(provider_ref.to_string(), key.to_string());
-            Ok(self.write_local(&values).is_ok())
-        }
-        #[cfg(not(windows))]
-        {
-            self.process.save(provider_ref, key)?;
-            Ok(false)
-        }
-    }
-
-    /// 读取:进程内优先(用户本次显式输入),否则系统库。
-    pub fn load(&self, provider_ref: &str) -> Result<Option<String>, CredentialError> {
-        #[cfg(windows)]
-        {
-            if let Some(key) = self.process.load(provider_ref)? {
-                return Ok(Some(key));
-            }
-            if let Ok(Some(values)) = self.read_local() {
-                return Ok(values.get(provider_ref).cloned());
-            }
-            if std::env::var_os("AICOUNCIL_DATA_DIR").is_some()
-                || std::env::var_os("AICOUNCIL_DEMO_MODE").is_some()
-            {
-                return Ok(None);
-            }
-            // One-time import from the legacy Windows Credential Manager. The
-            // encrypted local file becomes authoritative after the first save.
-            let legacy = self.system.load(provider_ref)?;
-            if let Some(key) = &legacy {
-                let _ = self.save(provider_ref, key)?;
-            }
-            Ok(legacy)
-        }
-        #[cfg(not(windows))]
-        {
-            if let Some(k) = self.process.load(provider_ref)? {
-                return Ok(Some(k));
-            }
-            Ok(None)
-        }
-    }
-
-    pub fn delete(&self, provider_ref: &str) -> Result<(), CredentialError> {
-        self.process.delete(provider_ref)?;
-        #[cfg(windows)]
-        {
-            let mut values = match self.read_local() {
-                Ok(Some(values)) => values,
-                Ok(None) => HashMap::new(),
-                Err(error) => return Err(error),
-            };
-            values.remove(provider_ref);
-            self.write_local(&values)
-        }
-        #[cfg(not(windows))]
-        {
-            Ok(())
-        }
-    }
-}
-
-#[cfg(windows)]
-#[repr(C)]
-struct DataBlob {
-    size: u32,
-    data: *mut u8,
-}
-
-#[cfg(windows)]
-#[link(name = "Crypt32")]
-unsafe extern "system" {
-    fn CryptProtectData(
-        input: *const DataBlob,
-        description: *const u16,
-        entropy: *const DataBlob,
-        reserved: *mut std::ffi::c_void,
-        prompt: *mut std::ffi::c_void,
-        flags: u32,
-        output: *mut DataBlob,
-    ) -> i32;
-    fn CryptUnprotectData(
-        input: *const DataBlob,
-        description: *mut *mut u16,
-        entropy: *const DataBlob,
-        reserved: *mut std::ffi::c_void,
-        prompt: *mut std::ffi::c_void,
-        flags: u32,
-        output: *mut DataBlob,
-    ) -> i32;
-}
-#[cfg(windows)]
-#[link(name = "Kernel32")]
-unsafe extern "system" {
-    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-}
-
-#[cfg(windows)]
-fn dpapi_protect(input: &[u8]) -> Result<Vec<u8>, String> {
-    dpapi(input, true)
-}
-#[cfg(windows)]
-fn dpapi_unprotect(input: &[u8]) -> Result<Vec<u8>, String> {
-    dpapi(input, false)
-}
-#[cfg(windows)]
-fn dpapi(input: &[u8], protect: bool) -> Result<Vec<u8>, String> {
-    let source = DataBlob {
-        size: input.len() as u32,
-        data: input.as_ptr() as *mut u8,
-    };
-    let mut output = DataBlob {
-        size: 0,
-        data: std::ptr::null_mut(),
-    };
-    let ok = unsafe {
-        if protect {
-            CryptProtectData(
-                &source,
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-                &mut output,
-            )
-        } else {
-            CryptUnprotectData(
-                &source,
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-                &mut output,
-            )
-        }
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(output.data, output.size as usize).to_vec() };
-    unsafe {
-        LocalFree(output.data.cast());
-    }
-    Ok(bytes)
-}
-
-impl Default for CredentialVault {
-    fn default() -> Self {
-        Self::new()
+/// 当前生效状态(不返回值)。优先级语义与 `named_env_value` 一致。
+pub fn status(provider_ref: &str) -> CredentialStatus {
+    if named_env_value(provider_ref).is_some() {
+        CredentialStatus::EnvFile
+    } else {
+        CredentialStatus::NotConfigured
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::repo::test_sync::ENV_LOCK;
+    use std::sync::MutexGuard;
 
-    #[test]
-    fn process_credentials_roundtrip() {
-        let c = ProcessCredentials::new();
-        c.save("p1", "sk-test").unwrap();
-        assert_eq!(c.load("p1").unwrap().as_deref(), Some("sk-test"));
-        assert_eq!(c.load("p2").unwrap(), None);
-        c.delete("p1").unwrap();
-        assert_eq!(c.load("p1").unwrap(), None);
+    fn env_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    #[test]
-    fn vault_prefers_process_input() {
-        // CI/无钥匙串环境下 system_available() 为 false,进程内路径生效
+    /// 在隔离临时目录写入**假** .env fixture(绝不触碰真实凭据文件)。
+    fn fixture_env(content: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let v = CredentialVault {
-            system: SystemCredentials,
-            process: ProcessCredentials::new(),
-            system_available: Mutex::new(Some(false)),
-            local_file: Some(dir.path().join("credentials.dpapi")),
-        };
-        v.save("p1", "sk-x").unwrap();
-        assert_eq!(v.load("p1").unwrap().as_deref(), Some("sk-x"));
-        v.delete("p1").unwrap();
-        assert!(v.load("p1").unwrap().is_none());
-        drop(v);
-        drop(dir);
+        std::fs::write(dir.path().join(".env"), content).unwrap();
+        dir
     }
 
-    #[cfg(windows)]
     #[test]
-    fn dpapi_roundtrip_is_encrypted() {
-        let plain = b"a fake test credential";
-        let encrypted = dpapi_protect(plain).unwrap();
-        assert_ne!(encrypted, plain);
-        assert_eq!(dpapi_unprotect(&encrypted).unwrap(), plain);
+    fn env_is_the_sole_source_for_named_providers() {
+        let _g = env_guard();
+        let dir = fixture_env("OPENROUTER_API_KEY=sk-fixture-or\nDEEPSEEK_API_KEY=sk-fixture-ds\n");
+        std::env::set_var("AICOUNCIL_DATA_DIR", dir.path());
+        assert_eq!(
+            named_env_value("openrouter").as_deref(),
+            Some("sk-fixture-or")
+        );
+        assert_eq!(
+            named_env_value("deepseek").as_deref(),
+            Some("sk-fixture-ds")
+        );
+        assert_eq!(status("openrouter"), CredentialStatus::EnvFile);
+        // 白名单外 provider 不从 .env 读取
+        assert_eq!(named_env_value("custom-provider"), None);
+        assert_eq!(status("custom-provider"), CredentialStatus::NotConfigured);
+        std::env::remove_var("AICOUNCIL_DATA_DIR");
+    }
+
+    #[test]
+    fn reload_rereads_env_without_restart() {
+        let _g = env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AICOUNCIL_DATA_DIR", dir.path());
+        assert_eq!(named_env_value("openrouter"), None);
+        // 外部写入 .env 后,无需重启即可读到(重新加载语义)
+        std::fs::write(
+            dir.path().join(".env"),
+            "OPENROUTER_API_KEY=sk-fixture-new\n",
+        )
+        .unwrap();
+        assert_eq!(
+            named_env_value("openrouter").as_deref(),
+            Some("sk-fixture-new")
+        );
+        // 外部清空后同样即时反映
+        std::fs::write(dir.path().join(".env"), "# rotated out\n").unwrap();
+        assert_eq!(named_env_value("openrouter"), None);
+        assert_eq!(status("openrouter"), CredentialStatus::NotConfigured);
+        std::env::remove_var("AICOUNCIL_DATA_DIR");
+    }
+
+    #[test]
+    fn empty_key_in_authoritative_file_does_not_fall_through() {
+        let _g = env_guard();
+        // 权威文件(数据目录)存在但键为空:不得回退到 exe 同级等其他候选
+        let dir = fixture_env("OPENROUTER_API_KEY=\n");
+        std::env::set_var("AICOUNCIL_DATA_DIR", dir.path());
+        std::env::set_var("AICOUNCIL_ENV_PATH", "/nonexistent/.env");
+        assert_eq!(
+            authoritative_env_file().as_deref(),
+            Some(dir.path().join(".env").as_path())
+        );
+        assert_eq!(named_env_value("openrouter"), None);
+        assert_eq!(status("openrouter"), CredentialStatus::NotConfigured);
+        std::env::remove_var("AICOUNCIL_ENV_PATH");
+        std::env::remove_var("AICOUNCIL_DATA_DIR");
+    }
+
+    #[test]
+    fn data_dir_override_is_strictly_isolated() {
+        let _g = env_guard();
+        // AICOUNCIL_DATA_DIR 设置时:候选只有 [AICOUNCIL_ENV_PATH?, 数据目录/.env],
+        // 绝不包含 exe 同级/CWD —— 测试永不触达真实私有文件。
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("AICOUNCIL_DATA_DIR", dir.path());
+        let candidates = crate::storage::repo::env_file_candidates().unwrap();
+        assert_eq!(candidates, vec![dir.path().join(".env")]);
+        // 显式 AICOUNCIL_ENV_PATH 排在最前
+        let explicit = dir.path().join("explicit.env");
+        std::env::set_var("AICOUNCIL_ENV_PATH", &explicit);
+        let candidates = crate::storage::repo::env_file_candidates().unwrap();
+        assert_eq!(candidates, vec![explicit.clone(), dir.path().join(".env")]);
+        std::env::remove_var("AICOUNCIL_ENV_PATH");
+        std::env::remove_var("AICOUNCIL_DATA_DIR");
+    }
+
+    #[test]
+    fn env_var_mapping_is_allowlisted() {
+        assert_eq!(
+            env_var_for_provider("openrouter"),
+            Some("OPENROUTER_API_KEY")
+        );
+        assert_eq!(env_var_for_provider("deepseek"), Some("DEEPSEEK_API_KEY"));
+        assert_eq!(env_var_for_provider("other"), None);
     }
 }

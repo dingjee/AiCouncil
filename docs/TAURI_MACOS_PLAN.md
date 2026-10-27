@@ -4,6 +4,20 @@ Date: 2026-10-28 (Asia/Bangkok). Branch: `codex/tauri-macos`.
 
 ## Outcome and constraints
 
+LATEST USER OVERRIDE (2026-10-28): private root `.env` already contains BOTH
+OpenRouter and DeepSeek API keys. Read both services' credentials directly from
+that file. Do not require Keychain migration or key re-entry. Privately copy the
+existing .env into the final stable macOS runtime data directory, chmod 0600,
+and read only explicitly named supported variables. Determine variable names
+without ever displaying values. `.env` is the source of truth, not DPAPI or a
+browser/localStorage cache. Preserve the original .env and original encrypted
+PC backup. Settings may report configured status and offer reload; do not create
+a conflicting second credential store. External oc agents MUST NOT access the
+real private .env or any credential files. They write runtime parsing code and
+test with fake temporary fixtures only. Parent Codex alone transfers the real
+file locally without displaying values. This overrides all Keychain/re-entry
+implementation tasks and acceptance expectations later in this plan.
+
 Deliver AiCouncil 0.2.0 as a locally usable Tauri 2 macOS Apple Silicon app in
 `dist/`, with the existing PC conversations/settings available on first launch.
 Preserve the Soft Sage visual identity and existing product behavior. macOS is
@@ -161,6 +175,15 @@ do not label a check passed based only on code inspection.
    gaps; avoid re-running already proven full suites without a source change.
 
 ## Final cleanup, version record, shutdown
+
+User clarification: remove all abandoned Windows and iced implementation,
+language/platform remnants and redundant files on this branch. Preserve useful
+core Rust services and source history. The DPAPI caveat concerns OpenRouter;
+DeepSeek title credentials may already exist in the private root .env. Preserve
+that file and adapt named-variable lookup without displaying its contents.
+Do not shutdown other active Codex work: user authorizes
+`/Users/jee/Documents/Projects/WatchDog/arm.sh` to wait until other chats finish.
+Prefer arming that reviewed watcher only after this task has completed all work.
 
 Create a concise durable acceptance report listing actual commands/results,
 counts, artifact hashes, data location, credentials caveat and any unverified

@@ -397,7 +397,8 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                     immutable,
                     (bi, ri) == plan.primary,
                     permit,
-                );
+                )
+                .await;
             }
         }
         Ok(SubmitReceipt {
@@ -410,7 +411,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch(
+    async fn dispatch(
         &self,
         conversation_id: ConversationId,
         batch_id: BatchId,
@@ -431,12 +432,15 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
         let guard = self.guard.clone();
         let anthropic = is_anthropic(&immutable.model);
 
-        tokio::spawn(async move {
-            // 取消令牌先注册:submit 后立即 Stop 也能找到 token(B15)
-            let cancel = CancellationToken::new();
-            cancels.lock().await.insert(request_id, cancel.clone());
+        // 取消令牌在派发前**同步注册**(本函数被 submit 串行 await):
+        // submit 返回回执后用户立即 Stop,此时令牌必须已经存在——
+        // 若在派发任务内部才注册,取消会落在注册窗口内被丢弃,
+        // 请求照常发出并计费(实测:立即取消无效)。
+        let cancel = CancellationToken::new();
+        self.cancels.lock().await.insert(request_id, cancel.clone());
 
-            // 排队可取消:等许可期间也能取消
+        tokio::spawn(async move {
+            // 排队可取消:等许可期间也能取消(不派发、不计费)
             let slot = tokio::select! {
                 p = sem.acquire() => p.map_err(|_| ()),
                 _ = cancel.cancelled() => Err(()),
@@ -1074,7 +1078,8 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
             immutable,
             true,
             permit,
-        );
+        )
+        .await;
         Ok(SubmitReceipt {
             conversation_id,
             batch_id: batch,

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use aicouncil::app::drafts::{ComposerMode, DraftStore};
+use aicouncil::composer::{ComposerMode, DraftStore};
 use aicouncil::domain::{
     Attachment, BatchId, Conversation, ConversationId, DispatchPhase, Generation, GenerationId,
     GenerationStatus, Message, MessageId, ProviderId, Role, UsageRecord,
@@ -329,6 +329,49 @@ fn late_receipt_keeps_input_typed_after_the_send() {
 
     let row = db.conversation_of(conversation).unwrap().unwrap();
     assert_eq!(row.draft, "第二段", "迟到回执不得抹掉提交后的新输入");
+}
+
+/// IPC 语义回归:发送按**前端冻结的版本**做 CAS。
+///
+/// 场景:前端快照发送内容时冻结 `draft_revision` → 快照之后用户又输入了新
+/// 内容(草稿版本前进)→ 落库事务按冻结版本消费 → CAS 不命中 → 新输入保留。
+/// 若后端改用“最新版本”消费(旧实现),新输入会被误删 —— 本用例同时用
+/// 对照组证明两种版本的行为不同。
+#[test]
+fn frozen_send_revision_does_not_consume_a_newer_draft() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aicouncil.db");
+    let db = db_at(&path);
+    let conversation = new_conversation(&db);
+    let mut store = store_for(&db);
+
+    store
+        .save_normal(conversation, "第一段", &[], true)
+        .unwrap();
+    // 前端快照:冻结此时的版本。
+    let frozen = store.revision(conversation);
+    // 快照之后用户又输入(草稿版本前进)。
+    store
+        .save_normal(conversation, "第二段", &[], true)
+        .unwrap();
+    assert!(store.revision(conversation) > frozen, "新输入必须推进版本");
+
+    // 冻结版本的发送:不得消费更新的草稿。
+    let consumption = store
+        .consumption_at(conversation, ComposerMode::Normal, frozen)
+        .expect("消费指令");
+    save_send_batch(&db, conversation, Some(consumption));
+    let row = db.conversation_of(conversation).unwrap().unwrap();
+    assert_eq!(row.draft, "第二段", "冻结版本的发送不得消费更新的草稿");
+
+    // 对照组:按当前版本消费才会清空(证明版本区分有意义)。
+    let current = store.revision(conversation);
+    let consumption = store
+        .consumption_at(conversation, ComposerMode::Normal, current)
+        .expect("消费指令");
+    save_send_batch(&db, conversation, Some(consumption));
+    let row = db.conversation_of(conversation).unwrap().unwrap();
+    assert_eq!(row.draft, "", "当前版本的发送应消费草稿");
 }
 
 #[test]

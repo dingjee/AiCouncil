@@ -1,0 +1,72 @@
+/*
+ * Soft Sage design tokens.
+ *
+ * Values mirror `src/ui_style.rs` (palette + spacing scale) so the webview
+ * keeps the identity of the native app:
+ *
+ *   CANVAS #F4F3EE   SURFACE #FAF9F5   SIDEBAR #ECEDE7
+ *   COMPOSER #F8F8F2 USER_SURFACE #EAEFE7
+ *   TEXT #2E342F    TEXT_MUTED #626B62  ICON #536451
+ *   ACCENT #496B55  HOVER #E3E9DF      SELECTED #DCE7DB
+ *   SELECTION #C8DCCB LINE_SUBTLE #D6DBD2 LINE_INTERACTIVE #768B74
+ *   FOCUS #56795F   LINK #37687B        CODE_SURFACE #ECEFE8
+ *   ERROR #9B4D45  WARNING #89662D     SUCCESS #486747
+ */
+
+:root {
+  --canvas: #f4f3ee;
+  --surface: #faf9f5;
+  --sidebar: #ecede7;
+  --composer: #f8f8f2;
+  --user-surface: #eaefe7;
+  --text: #2e342f;
+  --text-muted: #626b62;
+  --icon: #536451;
+  --accent: #496b55;
+  --on-accent: #faf9f5;
+  --hover: #e3e9df;
+  --selected: #dce7db;
+  --selection: #c8dccb;
+  --line-subtle: #d6dbd2;
+  --line-interactive: #768b74;
+  --focus: #56795f;
+  --link: #37687b;
+  --code-surface: #ecefe8;
+  --code-comment: #606c5e;
+  --error: #9b4d45;
+  --warning: #89662d;
+  --success: #486747;
+
+  --radius-control: 4px;
+  --radius-card: 6px;
+
+  --space-xs: 4px;
+  --space-s: 8px;
+  --space-m: 12px;
+  --space-l: 16px;
+  --space-xl: 24px;
+
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  --body-size: 15px;
+  --line-height: 1.55;
+  --heading-line-height: 1.22;
+
+  /*
+   * Space reserved at the top left of the sidebar header.
+   *
+   * The macOS window uses a **standard** title bar (the webview starts below
+   * it), so no traffic-light space has to be reserved: the value is the
+   * normal gutter. Switch it to ~78px only if the shell ever switches to an
+   * overlay title bar.
+   */
+  --titlebar-inset: var(--space-l);
+  --sidebar-width: 280px;
+  --sidebar-min-width: 220px;
+  --sidebar-max-width: 460px;
+}
+
+/* The inset is identical in the native shell and in the browser preview. */

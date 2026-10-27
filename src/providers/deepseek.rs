@@ -1,6 +1,6 @@
 //! DeepSeek 标题辅助客户端(PLAN 7.3)。
 //!
-//! - 凭据:显式进程 `DEEPSEEK_API_KEY` 优先;其次受控读取显式 `.env`
+//! - 凭据:`.env` 为唯一权威凭据源(读取具名变量;不探测进程环境)
 //!   路径中的同名变量(开发=项目根,发布=exe 同级);**不导入全部
 //!   dotenv 环境**,密钥不进 Debug/tracing/config/SQL/UI。
 //! - `POST {base}/chat/completions`,`model=deepseek-flash`(可 env 覆盖),
@@ -43,58 +43,10 @@ impl TitleErrorKind {
     }
 }
 
-/// 从显式路径读取 `.env` 中**仅** DEEPSEEK_API_KEY(不污染进程环境)。
-fn read_env_key_from(path: &std::path::Path) -> Option<String> {
-    let iter = dotenvy::from_path_iter(path).ok()?;
-    for item in iter.flatten() {
-        let (key, value) = item;
-        if key == "DEEPSEEK_API_KEY" {
-            let v = value.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-/// 定位 `.env`:显式 env 指定路径 > 开发项目根 > exe 同级。
-/// 不随进程 CWD 漂移,不向父目录递归。
-pub fn locate_env_file() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("AICOUNCIL_ENV_PATH") {
-        let p = std::path::PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if cfg!(debug_assertions) {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
-        if root.is_file() {
-            return Some(root);
-        }
-    }
-    let exe = std::env::current_exe().ok()?;
-    let sibling = exe.parent()?.join(".env");
-    sibling.is_file().then_some(sibling)
-}
-
-/// 解析标题 API Key:显式进程环境优先,其次 `.env` 同名变量。
+/// 解析标题 API Key:`.env` 为唯一权威凭据源(统一走共享
+/// credentials loader;只读取具名变量,不打印值)。
 pub fn load_api_key() -> Option<String> {
-    if let Ok(v) = std::env::var("DEEPSEEK_API_KEY") {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    let path = locate_env_file()?;
-    let key = read_env_key_from(&path);
-    if key.is_some() {
-        tracing::info!(
-            "标题服务:已从 .env 读取 DEEPSEEK_API_KEY({})",
-            path.display()
-        );
-    }
-    key
+    crate::storage::credentials::named_env_value("deepseek")
 }
 
 /// 可注入 endpoint 的标题客户端(测试/离线 mock:`new` 传 base)。

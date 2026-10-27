@@ -1,7 +1,12 @@
-//! 入口:启动、日志、平台数据目录(实际初始化在 `app::main`)。
+//! 入口:日志初始化,交予 Tauri 桌面装配。
 
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "aicouncil=info".into()),
+        )
+        .init();
 
-fn main() -> iced::Result {
-    aicouncil::app::main()
+    aicouncil::desktop::run();
 }

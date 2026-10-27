@@ -8,6 +8,9 @@ English UI, local SQLite persistence, no telemetry.
 - Automatic OpenRouter model catalog with a unified model picker: single pick,
   or same-question multi-model parallel answers from one entry. Family-grouped
   list with search; a star marks the primary model.
+- Parallel answers are one group: a tab strip over a fixed-height pane, so
+  every answer stays visible however long it is, switching tabs never moves
+  the page, and "Split" shows two answers side by side for comparison.
 - Multi-branch follow-ups: branch from any completed answer, each branch keeps
   its own history; "continue from here" switches the main branch.
 - Markdown + LaTeX rendering with in-message selection and copy; formulas copy

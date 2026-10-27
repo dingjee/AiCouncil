@@ -394,3 +394,144 @@ credentials) was not read, written or copied.
 - The editor clip fix is verified by headless pixel comparison
   (retained frame versus full frame). A live-window scroll of the composer
   was not re-captured this round.
+
+## 0.1.8: Parallel Answer Group, Streaming Stability, Header/Sidebar Polish
+
+### What changed
+
+- Parallel answers are rendered as one group: a tab strip (status dot, model
+  name, attempt badge) over a fixed-height pane. The pane height does not
+  depend on the answer length, so switching tabs does not change the geometry
+  of the message flow and the outer scrollbar does not jump. Each answer
+  remembers its own offset inside the pane.
+- `Split` toggles between one pane and two side by side; a per-tab compare
+  toggle picks the pair. The selection is one set of one or two answers, so
+  "solo" is the same mechanism with a set of size one.
+- A terminal event no longer overwrites the in-memory tree with the older
+  database snapshot: still-streaming messages keep their live body
+  (`answers::merge_live_content`), and reloads are debounced to one per tick.
+  This is what made the cards blink during a four-way run.
+- The answer order is deterministic (created time, then message id) instead of
+  `HashMap` iteration order, and retried attempts are folded with the attempt
+  count visible.
+- The export annotates the attempt number on the branch heading and on the
+  answer header, so the export and the tab strip can be matched up.
+- Header: export is icon-only next to the rename pencil; right side is
+  usage → `+ New chat` → sidebar toggle. Model picker pop-up is narrower with
+  a small solid triangle. Sidebar: search on top, icon + text `New chat`,
+  full-width chat rows with rename/delete on hover, `+ New group` button that
+  reveals the name input, and the bottom "Delete chat" button removed.
+
+### 0.1.8 acceptance matrix
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| Answer order does not depend on hash iteration order | ✅ Passed | `app::answers::tests::order_is_deterministic_even_with_equal_timestamps` |
+| Retried attempts folded, attempt number kept | ✅ Passed | `app::answers::tests::retry_attempts_are_folded_and_counted` |
+| Solo / split selection rules (one set, size one or two) | ✅ Passed | `app::answers::tests::solo_and_split_selection_rules`, `selecting_a_tab_in_split_mode_replaces_second_pane` |
+| A finished branch does not roll back a still-streaming sibling | ✅ Passed | `app::answers::tests::merge_keeps_live_content_of_streaming_messages` |
+| Switching tabs does not change the answer group height | ✅ Passed | `app::tests::answer_group_height_is_stable_across_tabs` (offscreen layout) |
+| Every answer of a round gets a tab (none disappears) | ✅ Passed | `app::tests::answer_group_renders_every_answer_as_a_tab` |
+| Export marks the attempt of a retried answer | ✅ Passed (service layer) | `services::export` renders `尝试 N` on the branch heading and the answer header |
+| Full suite, clippy, fmt | ✅ Passed | `cargo test` 0 failed; `cargo clippy --all-targets -- -D warnings` zero warnings |
+
+### 0.1.8 Remaining manual coverage
+
+- The group was verified through the offscreen layout harness and unit tests.
+  The interactive walkthrough (four answers streaming while switching tabs,
+  entering and leaving split view, hovering sidebar rows) still needs a pass
+  in a real window.
+- The restored pane offset is applied by a widget operation, so it can land
+  one frame after the tab switch.
+
+### 0.1.8 Delivery
+
+```sh
+cargo fmt --all -- --check                  # ✅ Passed
+cargo clippy --all-targets -- -D warnings   # ✅ Zero warnings
+cargo test                                  # ✅ 0 failed (173 lib + integration suites)
+cargo build --release                       # ✅ Passed
+Copy-Item target\release\aicouncil.exe dist\aicouncil.exe -Force
+Get-FileHash dist\aicouncil.exe -Algorithm SHA256
+# A5FD250EA695A8576293D4BB51BEE2ECC6780F6511D81390296E1CF333CAF2A9
+```
+
+Delivered `dist/aicouncil.exe` (0.1.8, follow-up build); SHA256:
+`A5FD250EA695A8576293D4BB51BEE2ECC6780F6511D81390296E1CF333CAF2A9`.
+It supersedes the first 0.1.8 build (SHA256
+`D531B5AB1DDA75F8A7CFB1F5E988FDCBDCBF46D1F13A51989BE4E76FBB898216`) and
+0.1.7 (SHA256
+`506CE50E250272EA9E21B8924DBF4049C213A1F5B05FF378B89EDD38A39BB590`).
+No `aicouncil.exe` process was running at delivery time, so the file was
+replaced in place. `dist/data/` (the user's live database and credentials)
+was not read, written or copied.
+
+### 0.1.8 Follow-up Matrix
+
+| Scenario | Result | Evidence |
+| --- | --- | --- |
+| Parallel answers are rendered as Markdown after a restart (no raw source) | ✅ Passed | `app::tests::parallel_answers_always_get_a_render_cache_entry` (cache cleared, then refilled for every answer) |
+| Visible message set covers the main path and every answer group | ✅ Passed | same test (`visible_message_ids` contains all answers) |
+| Split view swaps panes when the first pane's tab is clicked | ✅ Passed | `app::answers::tests::selecting_a_tab_in_split_mode_replaces_second_pane` |
+| Tab strip has no per-tab compare control; `Split` stays top-right | ✅ Passed (visual) | offscreen window capture: four plain tabs + one `Split` button |
+| Usage label grouped with the leading icons | ✅ Passed (visual) | offscreen window capture: `[title][✎][⬇][No cost] … [+ New chat][⇥]` |
+| Full suite, clippy, fmt | ✅ Passed | `cargo test` 0 failed; clippy zero warnings; fmt clean |
+
+## 0.1.9 acceptance
+
+| Scenario | Result / evidence |
+| --- | --- |
+| Four tabs remain clickable over a collapsed long question | `answer_tabs_always_report_pointer_cursor`; removing the clipping hit boundary reproduces exactly tabs 0–2 = Pointer, tab 3 = Text |
+| Hidden question text cannot hit outside its drawn clip | `collapsed_body_does_not_hit_outside_its_clip` |
+| Drag released outside the clip ends selection | `clipped_selection_receives_release_outside`; hidden text also cannot start a selection |
+| Picker open → close retains main and answer-pane scroll | `picker_toggle_keeps_main_scroll_offset`, nonzero offsets 80 / 120 preserved; old conditional root loses main offset to 0 |
+| Ask / reply action order, icon-only Attach | Real-widget screenshots inspected: delete/edit/copy; check/make-main/regenerate/delete/copy on an alternate answer |
+| Selector caret tracks popup visibility | Real-widget open/closed screenshots inspected: up / down |
+| Screenshot acceptance method | Offline tiny-skia rendering of actual app widgets at 1.5× DPI; isolated fixtures; no computer-use input or live provider requests |
+
+The UI fixtures now render the user message through the actual selectable
+Markdown path and enable a real picker. These details matter: a plain fallback
+text label or an empty catalog would let the old defects pass unnoticed.
+Temporary captures are never committed and are deleted after inspection.
+
+### 0.1.9 validation details
+
+- `cargo test --locked -j 2`: 261 passed (178 library tests and 83 integration
+  tests), zero failures.
+- `cargo clippy --all-targets --locked -j 2 -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- Four text-raster checks pass: coverage endpoints/monotonicity, six CJK
+  size/DPI combinations with identical bold masks, a real Windows color emoji,
+  and the production renderer's corrected ink coverage.
+- Closed → open → closed screenshots preserve both nonzero scroll offsets;
+  before/after closed screenshots are byte-identical.
+- The existing dispatch-expiry test now waits for both generation and accounting
+  finalization, which the service writes in separate asynchronous tasks, before
+  checking the original accounting and zero-dispatch assertions.
+- Linux CI installs Noto CJK/emoji fonts for the new raster fixtures. A color
+  glyph is required on Windows; other systems skip the color-only comparison
+  when their fallback selects monochrome. Linux execution was not run locally.
+
+## 0.1.10 acceptance
+
+| Scenario | Result / evidence |
+| --- | --- |
+| Fenced code / quote / indented code stay distinct blocks | `render::md::tests::fenced_quote_and_indented_code_are_distinct_blocks` |
+| Code-block Chinese uses the body's sans-serif face, not the monospace fallback | `render_regressions::code_block_cjk_uses_sans_serif`; before: NSimSun (宋体) + MS Gothic, after: Microsoft YaHei UI |
+| Merged CJK drawing keeps the per-glyph positions | `render_regressions::cjk_merged_group_matches_individual_advances` |
+| A steady frame never re-rasterizes whitespace | `render_regressions::steady_frame_does_not_rasterize_whitespace_again`; per-frame cache misses 85 → 0 |
+| Composer has no dead band under the toolbar | The toast row is no longer inserted when there is no toast (an empty 11px text still occupied a line) |
+| Header spacing title ‖ rename ‖ export ‖ usage | Title↔rename 12px, rename↔export 8px, export↔usage 4px (Gestalt proximity: export+usage form one cluster) |
+
+### 0.1.10 validation details
+
+- `cargo test --locked -j 2`: 261 passed (179 library tests and 82 integration
+  tests), zero failures.
+- `cargo clippy --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check`: passed.
+- Measured on a 20,000-character Chinese document (860×900 viewport): glyph
+  rasterization 25 ms → 8 ms per frame; text draw items 1343 → 136; damage
+  diff 1.59 ms → 0.08 ms.
+- Rendering is unchanged by the CJK draw batching: the before/after captures
+  differ only in sub-pixel antialiasing (125 of 684,000 pixels, no glyph
+  displacement).

@@ -256,6 +256,11 @@ impl MessageTree {
         self.messages.get(&id)
     }
 
+    /// 可变访问(流式正文回填 / 测试构造)。
+    pub fn get_mut(&mut self, id: MessageId) -> Option<&mut Message> {
+        self.messages.get_mut(&id)
+    }
+
     /// 从无序消息集合构建(父先于子插入;同批时间戳并列时可靠)。
     /// 忽略父缺失的孤儿消息并报告其数量。
     pub fn from_messages(msgs: Vec<Message>) -> (Self, usize) {

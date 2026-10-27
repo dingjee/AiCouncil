@@ -74,6 +74,13 @@ static TABLE: &[(&str, &str)] = &[
     ("message.interrupted", "Interrupted"),
     ("message.expand", "Expand question"),
     ("message.collapse", "Collapse question"),
+    // 并行回答组
+    ("answers.split", "Split"),
+    ("answers.split_tooltip", "Compare two answers side by side"),
+    ("answers.attempt", "Attempt {n}"),
+    ("answers.superseded", "Superseded"),
+    ("answers.live", "Generating"),
+    ("answers.failed", "Failed"),
     // 选择(局部选择)
     ("selection.copy", "Copy"),
     ("selection.copy_tooltip", "Copy selected text (plain text; formulas as source)"),

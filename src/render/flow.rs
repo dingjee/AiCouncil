@@ -413,21 +413,57 @@ struct PlacedAtom {
     descent_hint: f32,
 }
 
+/// 行内一段连续选区(合并同样式文本原子后的矩形)。
+struct RunRect {
+    x0: f32,
+    x1: f32,
+    y: f32,
+    h: f32,
+    style: TextAtomStyle,
+}
+
+impl RunRect {
+    fn rect(&self, line_top: f32) -> Rectangle {
+        Rectangle::new(
+            Point::new(self.x0, line_top + self.y),
+            Size::new((self.x1 - self.x0).max(2.0), self.h),
+        )
+    }
+}
+
 struct LineBox {
     atoms: Vec<PlacedAtom>,
     height: f32,
     top: f32,
+    /// 合并绘制组:行内连续同样式 CJK 原子 → 一个段落。
+    merged: Vec<MergedGroup>,
+}
+
+/// 行内一段连续同样式 CJK 原子的合并绘制组。
+struct MergedGroup {
+    /// 组首原子在本行的下标。
+    start: usize,
+    /// 组尾原子在本行的下标(不含)。
+    end: usize,
+    style: TextAtomStyle,
+    /// 合并后的文本(同时用作段落缓存的键)。
+    text: String,
 }
 
 /// 按字体样式分组的文本测量缓存。键含内容,跨 content 版本安全复用;
 /// 字号/主题变化经 style_revision 清空。
 type PerFontMeasures = HashMap<String, TextMeasure>;
 
+/// 合并绘制缓存:样式 + 合并文本 → 段落。
+type MergedParagraphs = HashMap<(TextAtomStyle, String), Para>;
+
 pub struct FlowState {
     version: u64,
     width: f32,
     style_revision: u64,
     measures: HashMap<TextAtomStyle, PerFontMeasures>,
+    /// 合并绘制的段落缓存(按需创建:只有真正画到的行才会建段落)。
+    merged: std::cell::RefCell<MergedParagraphs>,
     lines: Vec<LineBox>,
     /// 选择 UX:上次上抛的 hover 位置(去重)。
     last_hover: Option<SelPos>,
@@ -589,6 +625,7 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
         let style_changed = state.style_revision != self.style.revision;
         if style_changed {
             state.measures.clear();
+            state.merged.borrow_mut().clear();
             state.style_revision = self.style.revision;
         }
         if !style_changed
@@ -627,6 +664,7 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
                 atoms: std::mem::take(cur),
                 height,
                 top: *y_base,
+                merged: Vec::new(),
             });
             *y_base += height;
         }
@@ -687,6 +725,7 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
                 atoms: Vec::new(),
                 height: min_line_h,
                 top: 0.0,
+                merged: Vec::new(),
             });
         }
         for line in &mut lines {
@@ -701,7 +740,96 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
                 atom.x += offset;
             }
         }
+        // 合并绘制分组:CJK 逐字原子 → 每行一个段落。
+        for line in &mut lines {
+            line.merged = self.merge_cjk_groups(line);
+        }
         state.lines = lines;
+    }
+
+    /// 行内连续同样式的**单个 CJK 字符**原子可合并为一个段落。
+    ///
+    /// CJK 在 cosmic-text 里逐字测量、逐字绘制:一段中文会产生 O(字数)
+    /// 个段落与绘制调用,进而在 tiny-skia 的 damage 追踪里形成 O(字数)
+    /// 个矩形,滚动时整帧都要重算/重绘。CJK 字符等宽(1em)且相邻字符
+    /// 之间没有字距调整,因此把同一行的连续 CJK 合成一个段落后,
+    /// 字形位置与逐字排布完全一致(见 tests/render_regressions.rs)。
+    ///
+    /// 这里只记录分组;段落本身在绘制时才按需创建(见
+    /// [`MathFlow::merged_paragraph`]),避免长文档首帧为整篇正文
+    /// 建立合并段落。
+    fn merge_cjk_groups(&self, line: &LineBox) -> Vec<MergedGroup> {
+        let mut groups: Vec<MergedGroup> = Vec::new();
+        let mut i = 0;
+        while i < line.atoms.len() {
+            let Some((text, style)) = self.mergeable_cjk(line.atoms[i].atom_idx) else {
+                i += 1;
+                continue;
+            };
+            let mut end = i + 1;
+            let mut merged = text.clone();
+            while end < line.atoms.len() {
+                let Some((next, next_style)) = self.mergeable_cjk(line.atoms[end].atom_idx) else {
+                    break;
+                };
+                if next_style != style {
+                    break;
+                }
+                merged.push_str(&next);
+                end += 1;
+            }
+            if end - i > 1 {
+                groups.push(MergedGroup {
+                    start: i,
+                    end,
+                    style,
+                    text: merged,
+                });
+            }
+            i = end;
+        }
+        groups
+    }
+
+    /// 合并段落(按需创建并缓存)。
+    fn merged_paragraph(&self, state: &FlowState, group: &MergedGroup) -> Para {
+        let mut cache = state.merged.borrow_mut();
+        let key = (group.style, group.text.clone());
+        if let Some(paragraph) = cache.get(&key) {
+            return paragraph.clone();
+        }
+        let paragraph = self.make_paragraph(&group.text, group.style);
+        cache.insert(key, paragraph.clone());
+        paragraph
+    }
+
+    /// 可合并的原子:恰好一个 CJK 字符的文本原子。
+    fn mergeable_cjk(&self, atom_idx: usize) -> Option<(String, TextAtomStyle)> {
+        match self.content.atoms.get(atom_idx) {
+            Some(Atom::Text { text, style }) => {
+                let mut chars = text.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) if is_cjk(c) => Some((text.clone(), *style)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// 合并后的段落(不换行:合并组必然落在同一行内)。
+    fn make_paragraph(&self, content: &str, style: TextAtomStyle) -> Para {
+        Para::with_text(text::Text {
+            content,
+            bounds: Size::new(65_536.0, 1_024.0),
+            size: Pixels(self.content.text_size),
+            line_height: LineHeight::Absolute(Pixels(self.content.line_height)),
+            font: Self::font_of(style),
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: Shaping::Advanced,
+            wrapping: Wrapping::None,
+        })
     }
 
     /// 命中:内容局部坐标点 → 块内 SelPos。
@@ -751,6 +879,9 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
     }
 
     /// 选区高亮矩形(内容局部坐标)。
+    ///
+    /// 连续同样式的文本原子合并成一个矩形:逐字矩形会让中文长选区产生
+    /// O(字数) 个矩形,进而在 damage 追踪里放大整帧重绘成本。
     fn selection_rects(&self, state: &FlowState) -> Vec<Rectangle> {
         let Some((a, b)) = self.selection else {
             return Vec::new();
@@ -762,12 +893,16 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
         let b_ch = b.1; // WHOLE 视为很大
         let mut rects = Vec::new();
         for line in &state.lines {
+            let mut run: Option<RunRect> = None;
             for p in &line.atoms {
                 if p.atom_idx < a_atom || p.atom_idx > b_atom {
                     continue;
                 }
                 let Atom::Text { text, style } = &self.content.atoms[p.atom_idx] else {
                     // 公式/不可分割原子:整体高亮
+                    if let Some(r) = run.take() {
+                        rects.push(r.rect(line.top));
+                    }
                     rects.push(Rectangle::new(
                         Point::new(p.x, line.top + p.y),
                         Size::new(p.w, p.h),
@@ -790,11 +925,29 @@ impl<'a, Message: Clone + 'a> MathFlow<'a, Message> {
                 } else {
                     Self::grapheme_x(state, *style, text, e)
                 };
-                let width = (x1 - x0).max(2.0);
-                rects.push(Rectangle::new(
-                    Point::new(p.x + x0, line.top + p.y),
-                    Size::new(width, p.h),
-                ));
+                let (lx0, lx1) = (p.x + x0, p.x + x1);
+                let extend = run.as_ref().is_some_and(|r| {
+                    r.style == *style && (r.y - p.y).abs() < 0.01 && (r.h - p.h).abs() < 0.01
+                });
+                if extend {
+                    if let Some(r) = run.as_mut() {
+                        r.x1 = r.x1.max(lx1);
+                    }
+                } else {
+                    if let Some(r) = run.take() {
+                        rects.push(r.rect(line.top));
+                    }
+                    run = Some(RunRect {
+                        x0: lx0,
+                        x1: lx1,
+                        y: p.y,
+                        h: p.h,
+                        style: *style,
+                    });
+                }
+            }
+            if let Some(r) = run.take() {
+                rects.push(r.rect(line.top));
             }
         }
         rects
@@ -818,6 +971,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
             width: 0.0,
             style_revision: 0,
             measures: HashMap::new(),
+            merged: std::cell::RefCell::new(HashMap::new()),
             lines: Vec::new(),
             last_hover: None,
             last_click: None,
@@ -892,8 +1046,81 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
                 break;
             };
             let _ = li;
-            for (ai, atom_layout) in line_layout.children().enumerate() {
+            let children: Vec<Layout<'_>> = line_layout.children().collect();
+            let mut ai = 0;
+            let mut group_idx = 0;
+            while ai < line.atoms.len() {
+                // 合并组:连续 CJK 原子一次绘制(见 merge_cjk_groups)。
+                if group_idx < line.merged.len() && line.merged[group_idx].start == ai {
+                    let group = &line.merged[group_idx];
+                    let (Some(first), Some(last)) = (
+                        children.get(group.start),
+                        children.get(group.end.saturating_sub(1)),
+                    ) else {
+                        break;
+                    };
+                    let first_bounds = first.bounds();
+                    let last_bounds = last.bounds();
+                    let placed = &line.atoms[group.start];
+                    let style = group.style;
+                    let decor = self.content.decor.get(placed.atom_idx);
+                    let color = if decor.and_then(|d| d.link.as_deref()).is_some() {
+                        self.style.link
+                    } else {
+                        base
+                    };
+                    let group_width =
+                        (last_bounds.position().x + last_bounds.width) - first_bounds.position().x;
+                    if style.mono {
+                        renderer.fill_quad(
+                            iced::advanced::renderer::Quad {
+                                bounds: Rectangle::new(
+                                    first_bounds.position() - Vector::new(2.0, 1.0),
+                                    Size::new(group_width + 4.0, first_bounds.height + 2.0),
+                                ),
+                                ..Default::default()
+                            },
+                            Background::Color(self.style.code_bg),
+                        );
+                    }
+                    let paragraph = self.merged_paragraph(state, group);
+                    renderer.fill_paragraph(&paragraph, first_bounds.position(), color, *viewport);
+                    if let Some(d) = decor {
+                        if d.link.is_some() {
+                            let y = first_bounds.position().y + first_bounds.height - 1.5;
+                            renderer.fill_quad(
+                                iced::advanced::renderer::Quad {
+                                    bounds: Rectangle::new(
+                                        Point::new(first_bounds.position().x, y),
+                                        Size::new(group_width, 1.0),
+                                    ),
+                                    ..Default::default()
+                                },
+                                Background::Color(self.style.link),
+                            );
+                        }
+                        if d.strikethrough {
+                            let y = first_bounds.position().y + first_bounds.height * 0.55;
+                            renderer.fill_quad(
+                                iced::advanced::renderer::Quad {
+                                    bounds: Rectangle::new(
+                                        Point::new(first_bounds.position().x, y),
+                                        Size::new(group_width, 1.0),
+                                    ),
+                                    ..Default::default()
+                                },
+                                Background::Color(color),
+                            );
+                        }
+                    }
+                    ai = group.end;
+                    group_idx += 1;
+                    continue;
+                }
                 let Some(p) = line.atoms.get(ai) else {
+                    break;
+                };
+                let Some(atom_layout) = children.get(ai) else {
                     break;
                 };
                 let bounds = atom_layout.bounds();
@@ -986,6 +1213,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
                     }
                     Atom::Break => {}
                 }
+                ai += 1;
             }
         }
     }
@@ -1084,7 +1312,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
         tree: &iced::advanced::widget::Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let Some(pos) = cursor.position() else {
@@ -1092,6 +1320,13 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
         };
         let bounds = layout.bounds();
         if !bounds.contains(pos) {
+            return mouse::Interaction::None;
+        }
+        // 视口检查:滚动容器把内容画在视口之外(例如内层面板被滚动后,
+        // 上方的标签条区域仍属于同一棵子树)。若不检查视口,这些不可见
+        // 的正文会抢走光标形态(`Interaction::Text` 的序数高于
+        // `Pointer`),使同一行的标签按钮显示成文本插入光标。
+        if !viewport.contains(pos) {
             return mouse::Interaction::None;
         }
         let state = tree.state.downcast_ref::<FlowState>();

@@ -39,6 +39,8 @@ pub struct ExportResult {
 pub struct MessageMeta {
     pub model: Option<String>,
     pub status: Option<GenerationStatus>,
+    /// 第几次尝试(同一重试 lineage;>1 时导出与界面都会标注)。
+    pub attempt: Option<usize>,
 }
 
 /// 导出输入的一致快照。
@@ -58,10 +60,28 @@ impl<'a> ExportInput<'a> {
             .iter()
             .filter(|g| g.assistant_message_id == id)
             .max_by_key(|g| g.started_at.unwrap_or_else(crate::storage::now_dt));
+        let attempt = g.map(|g| self.attempt_of(g));
         MessageMeta {
             model: g.map(|g| g.model_id.clone()),
             status: g.map(|g| g.status),
+            attempt,
         }
+    }
+
+    /// 同一重试 lineage 内的尝试序号(1 = 首次)。
+    fn attempt_of(&self, g: &Generation) -> usize {
+        let root = g.retry_root_id.unwrap_or(g.request_id);
+        self.generations
+            .iter()
+            .filter(|other| other.retry_root_id == Some(root))
+            .filter(|other| match (other.started_at, g.started_at) {
+                (Some(a), Some(b)) => a <= b,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => false,
+            })
+            .count()
+            .max(1)
     }
 }
 
@@ -100,7 +120,14 @@ pub fn render_markdown(input: &ExportInput<'_>, scope: ExportScope) -> Result<St
             .path_from_root(*leaf)
             .map_err(|_| ExportError::Empty)?;
         if leaves.len() > 1 {
-            out.push_str(&format!("## 分支 {}\n\n", i + 1));
+            // 重试尝试在分支标题上标注(与界面标签一致)
+            let attempt = input
+                .meta_of(*leaf)
+                .attempt
+                .filter(|a| *a > 1)
+                .map(|a| format!("(尝试 {a})"))
+                .unwrap_or_default();
+            out.push_str(&format!("## 分支 {}{attempt}\n\n", i + 1));
         }
         for id in path {
             let Some(m) = input.tree.get(id) else {
@@ -133,6 +160,10 @@ fn push_message(out: &mut String, m: &Message, meta: MessageMeta, _id: MessageId
             let mut header = String::from("**回答**");
             if let Some(model) = &meta.model {
                 header.push_str(&format!(" · {model}"));
+            }
+            // 重试尝试标注(与界面标签的“尝试 N”一致,便于两边对照)
+            if let Some(attempt) = meta.attempt.filter(|a| *a > 1) {
+                header.push_str(&format!(" · 尝试 {attempt}"));
             }
             header.push_str(&format!(" · {}", fmt_time(m.created_at)));
             match meta.status {

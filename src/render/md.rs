@@ -1413,6 +1413,45 @@ mod tests {
         assert!(matches!(doc.blocks[1], Block::Quote(_)));
     }
 
+    /// 围栏代码块 / 引用 / 引用内的缩进代码块:三者必须各归各位
+    /// (CommonMark 语义:缩进 4 格的行是**缩进代码块**,不是引用段落)。
+    #[test]
+    fn fenced_quote_and_indented_code_are_distinct_blocks() {
+        let src = "```text\n围栏内容\n```\n\n> 引用一\n> 引用二\n\n> 引用内的缩进代码\n\n正文";
+        let doc = parse_s(src);
+        assert!(
+            matches!(doc.blocks[0], Block::CodeBlock { .. }),
+            "{:?}",
+            doc.blocks[0]
+        );
+        // 空行分隔的两个引用是两个块。
+        assert!(
+            matches!(doc.blocks[1], Block::Quote(_)),
+            "{:?}",
+            doc.blocks[1]
+        );
+        assert!(
+            matches!(doc.blocks[2], Block::Quote(_)),
+            "{:?}",
+            doc.blocks[2]
+        );
+        assert!(
+            matches!(doc.blocks[3], Block::Paragraph(_)),
+            "{:?}",
+            doc.blocks[3]
+        );
+
+        // 引用内缩进 4 格的段落 → 嵌套的代码块(CommonMark)。
+        let nested = parse_s("> 引用\n>\n>     缩进代码\n");
+        let Block::Quote(inner) = &nested.blocks[0] else {
+            panic!("{:?}", nested.blocks)
+        };
+        assert!(
+            inner.iter().any(|b| matches!(b, Block::CodeBlock { .. })),
+            "引用内的缩进代码块必须被识别为代码块: {inner:?}"
+        );
+    }
+
     #[test]
     fn hard_break_is_newline_soft_break_is_space() {
         let doc = parse_s("行一  \n行二\n行三");

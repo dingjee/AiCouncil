@@ -487,7 +487,10 @@ was distilled into:
 4. The vertical-stacking logic for parallel cards in a narrow main area is a
    placeholder (the window size is known but the layout branch never takes
    effect — still side by side; need to switch to column at the card row
-   based on available width).
+   based on available width). **Resolved in 0.1.8**: parallel answers are now
+   a tab strip plus a fixed-height pane (one or two answers side by side), so
+   the answers are no longer squeezed into the message column and no
+   width-based stacking branch is needed.
 
 ---
 
@@ -664,3 +667,117 @@ task close.
   window, closing the app, reopening) was not performed in this round.
 - CJK glyphs inside a code block still fall back to the system monospace font;
   the horizontal scrollbar regression itself is fixed and covered.
+
+## 0.1.8 Parallel Answer Group, Streaming Stability, and Header/Sidebar Polish (2026-10-21)
+
+### Completed Items
+
+- **Parallel answers became one group instead of a row of squeezed cards.**
+  `src/app/answers.rs` owns the answer set: the assistant children of a
+  question, ordered deterministically (created time, then message id — the old
+  order came from `HashMap` iteration and changed between runs), with retried
+  attempts of the same lineage folded into the latest one and the attempt
+  count kept visible.
+- **Tab strip + fixed-height pane.** A group renders as a tab strip (status
+  dot, model name, attempt badge) above a pane whose height is independent of
+  the answer length, so switching tabs never changes the geometry of the
+  message flow and the outer scrollbar never jumps. Each answer remembers its
+  own scroll offset inside the pane (`answer_pane_metrics`) and the offset is
+  restored on switch; while an answer is still streaming the pane sticks to
+  the bottom if the reader was already at the bottom.
+- **Side-by-side comparison.** The `Split` button toggles between one pane and
+  two; a per-tab compare toggle adds an answer to the pair. The selection is a
+  single set of one or two answers, so “solo” is just the set of size one and
+  there is no separate mode to remember. Double answers are labelled in the
+  pane header so the left/right models stay distinguishable.
+- **Streaming no longer blinks.** A terminal event no longer replaces the whole
+  in-memory tree with the database snapshot: `answers::merge_live_content`
+  keeps the live body of messages that are still streaming, because the
+  service only flushes partial content every 300ms/4KiB and the snapshot is
+  therefore older than the stream. Reloads are debounced (one per tick instead
+  of one per finished branch).
+- **Export and UI agree on the answer set.** The export annotates the attempt
+  number on the branch heading and on the answer header
+  (`**回答** · model · 尝试 2 · time`), so a retried model is countable on both
+  sides instead of silently differing.
+- **Header.** The export button is now icon-only and sits next to the rename
+  pencil; the right-hand side is usage → `+ New chat` → sidebar toggle.
+- **Model picker.** The pop-up is narrower (`clamp(220, 320)`) and the trigger
+  uses a small solid triangle instead of the up/down arrows.
+- **Sidebar (Chats).** Search box on top, then an icon + text `New chat`
+  button. A chat row fills the whole width and reveals rename/delete icons on
+  hover (or when selected); the bottom “Delete chat” button is gone. The group
+  section has a `+ New group` button in the same style that reveals the
+  name input and `Create`.
+
+### Verification
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --all-targets -- -D warnings` — passed (zero warnings).
+- `cargo test` — passed, 0 failed (172 lib tests + integration suites).
+- New tests: `app::answers` (deterministic order, attempt folding, solo/split
+  selection rules, live-content merge) and `app::tests`
+  (`answer_group_height_is_stable_across_tabs`,
+  `answer_group_renders_every_answer_as_a_tab`).
+
+### Known Gaps
+
+- The answer group was verified through the offscreen layout harness and unit
+  tests; the interactive walkthrough (switching tabs while four answers
+  stream, dragging the sidebar) still needs a pass in a real window.
+- The pane scroll offset is restored by a widget operation, so the restored
+  position can land one frame after the tab switch.
+
+### 0.1.8 Follow-up Fixes
+
+- **Answer cards render Markdown again (main bug).** The render cache was
+  only filled for the main path, but a parallel answer is *not* on the main
+  path (the path holds a single leaf). After a restart — or after the tree
+  was reloaded — the parallel answers had no cache entry, so the card fell
+  back to `text(content)` and displayed the raw Markdown source.
+  `App::visible_message_ids` now lists the main path plus every answer of
+  every question on it, `rerender_visible` re-renders that set, and
+  `ensure_renders_current` fills the gaps every tick.
+- **The per-tab compare button is gone.** The tab strip is now just
+  status dot + model name + attempt badge; `Split` in the top-right corner is
+  the only control. In split view a tab click replaces the second pane, and
+  clicking the first pane's tab swaps the two panes, so any pair can be
+  reached without extra buttons.
+- **The usage label sits with the leading icons.** The header is
+  `[title][rename][export][usage] … [New chat][sidebar]`; the cost label
+  follows the export icon instead of drifting next to the right-hand icons
+  (Gestalt proximity — same group, not the neighbouring one).
+
+### Verification (follow-up)
+
+- `cargo test --lib` — 173 passed, 0 failed (run five times in a row: the
+  layout tests serialise their data directory through a mutex, because the
+  directory is passed by a process-global environment variable).
+- `cargo test` — 0 failed. `egress_guard::a08_dispatch_level_recheck_rejects_after_queue_expiry`
+  is timing sensitive (a 4s mock delay against a 3s permit TTL) and flaked
+  once under full-suite load; it is unrelated to this change and passes on
+  re-run.
+- `cargo clippy --all-targets -- -D warnings` — zero warnings.
+
+## 0.1.9 UI follow-up
+
+- Main view retains its widget tree when the model picker opens or closes;
+  both the conversation and inner answer pane retain their reading positions.
+- Hidden text in a collapsed question cannot claim the cursor or begin a
+  selection behind the answer tabs. Releasing a selection outside the clip
+  still ends it.
+- Ask actions: delete → edit (when eligible) → copy.
+- Reply actions: select for follow-up → make main (eligible alternate answers
+  only) → regenerate/retry (stop during streaming) → delete → copy.
+- Attach is an icon with its tooltip. The selector's filled caret points up
+  while the popup is visible and down after dismissal.
+
+The UI work was implemented through OpenCode / MiniMax M3.1 Flash, then reviewed
+and corrected locally. Regression fixtures use isolated data; screenshots use
+headless rendering of the real app widgets, with no computer-use interaction.
+
+Normal text now uses a cached grayscale coverage adjustment below weight 600;
+explicit semibold/bold and color glyphs retain their raster appearance. The
+Windows probe identifies Microsoft YaHei UI for the Chinese sample. This is a
+lighter rendering preference, not a claim of matching Typedown's internal
+renderer. See `docs/RENDERING.md` for measured results and reproduction commands.

@@ -25,6 +25,11 @@ pub use layer::Layer;
 pub use primitive::Primitive;
 pub use settings::Settings;
 
+// Text rasterization: grayscale coverage correction (see `text::coverage_to_alpha`).
+pub use text::{
+    coverage_to_alpha, GLYPH_CACHE_MISSES, TEXT_COVERAGE_BOLD_THRESHOLD, TEXT_COVERAGE_GAMMA,
+};
+
 #[cfg(feature = "geometry")]
 pub use geometry::Geometry;
 

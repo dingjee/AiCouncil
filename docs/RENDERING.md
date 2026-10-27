@@ -144,3 +144,115 @@ The P0 exit criteria are met: ordinary Markdown and common formulas are readable
   regions agree by construction. `tests/editor_render.rs` covers it: retained
   frame equals full frame (0 differing pixels) across nine editor heights and
   five scroll steps, and no glyph ink appears below the text viewport.
+
+## 0.1.9: popup state and text hit testing
+
+Opening the model picker changed the main widget root from `Column` to `Stack`.
+Iced reconciles a different widget tag by rebuilding its subtree, including the
+main scrollable and answer-pane offsets. The root now stays a `Stack`, with the
+conversation always in child zero. The selector caret follows popup visibility:
+up while open, down while closed (also when no enabled models remain).
+
+The Grok cursor issue came from the preceding collapsed question. Iced's
+`container(...).clip(true)` clips drawing but forwards the original viewport to
+hit testing and events. Hidden selectable Chinese text extended behind the last
+tab, and `Text` won over `Pointer` when interactions were combined. `ClipHit`
+now applies the visible body rectangle to events and hit testing. Releases are
+still forwarded with an unavailable cursor outside the clip, so a drag released
+outside finishes correctly. The selectable prose and code widgets also respect
+their scroll viewport.
+
+The actual four-tab regression reproduces the reported asymmetry when the clip
+boundary is removed: tabs 0–2 report `Pointer`, tab 3 reports `Text`. Restoring
+the boundary makes all four report `Pointer`. The popup regression sets nonzero
+main and answer-pane offsets using widget operations, then checks the real
+widget state through closed → open → closed. Restoring the old conditional root
+makes the main offset change from 80 to 0; the fixed root preserves both offsets.
+
+Offline screenshots of the real widget tree can be reproduced in PowerShell:
+
+```powershell
+$env:AICOUNCIL_UI_SCREENSHOTS = Join-Path $PWD 'screenshots'
+cargo test --lib app::tests::
+Remove-Item Env:\AICOUNCIL_UI_SCREENSHOTS
+```
+
+This writes the message actions, four tabs, selector open/closed, and retained
+scroll scenes through the same tiny-skia renderer at 1.5× DPI. It performs no
+computer-use input and sends no provider requests. Screenshots are ignored and
+must be deleted after inspection.
+
+## 0.1.9: lighter normal text coverage
+
+The Windows probe resolves the Chinese sample to Microsoft YaHei UI at normal
+weight (400); normal Markdown was not accidentally marked bold. AiCouncil uses
+Cosmic Text / Swash / tiny-skia software rendering. Upstream turns grayscale
+area coverage directly into premultiplied alpha. A font's rasterized edge pixels,
+small reading size, and this compositing path affect perceived stroke thickness.
+Typedown's internal font and raster settings were not inspected, so the visual
+difference cannot be attributed to a universally correct native gamma value.
+
+The local renderer now applies a cached coverage tone curve (exponent 1.6) to
+normal/light runs below weight 600. This reduces the antialiased fringe without
+changing the font, glyph placement, text color, transparent pixels, or fully
+covered ink. Semibold/bold runs and color glyphs retain their previous pixels.
+This is an empirical appearance adjustment for the requested lighter reading
+style, not a claim of pixel equality with Typedown or DirectWrite.
+
+The offline probe renders 情/馈/懂/赢 and Latin samples at 15/18/22px and
+1.0/1.5× DPI. At 15px / 1.5×, the Chinese normal mask's summed coverage changes
+from 236158 to 210143 (−11.0%); bold coverage remains identical. The integration
+test also measures the actual Iced/tiny-skia output against the corrected mask,
+checks aligned masks pixel by pixel, and exercises a real color emoji.
+
+```powershell
+cargo run --release --example text_raster_probe
+cargo test --test text_raster
+```
+
+The probe writes before/after comparisons under `screenshots/text_raster/`
+(left: original coverage; right: adjusted coverage), enlarged 6× with nearest
+neighbor sampling so the real raster pixels can be inspected. Delete the
+captures after inspection.
+
+## 0.1.10: CJK 字面与滚动帧成本
+
+### 代码块内的中文(issue:字体渲染怪异)
+
+Cosmic Text 的等宽回退链只收录**等宽**的 CJK 字面。Windows 上是
+`NSimSun`(宋体)与 `MS Gothic`(日文):代码块里的中文因此被排成宋体/日文
+字形,细横画几乎消失,同一行里还会出现两种字面混排 —— 与正文使用的
+`Microsoft YaHei UI` 完全是两种字体。
+
+`render::code_flow::script_spans` 把代码块里的 CJK 片段单独切出来交给
+sans-serif 族,拉丁文仍保持等宽。选中/高亮的列宽也不再假设等宽:改用已排版
+段落的 grapheme 位置(`hit_test` / `grapheme_position`),中文的两倍宽不再
+让选区整体错位。
+
+### 滚动帧成本(issue:长文本滚动卡顿)
+
+两个独立原因,都已测量:
+
+1. **空白字形每帧重跑标量器**(主因)。`GlyphCache::allocate` 对没有墨迹的
+   字形(空格为主)提前返回,**却没有写入缓存条目** —— 缓存因此永远不认识
+   这些字形,每一帧都会为屏幕上的每个空格重新光栅化。20,000 字的中文文档
+   每帧未命中 85 次,占掉约 25ms 帧预算里的 20ms。
+   修补见 `vendor/iced_tiny_skia/PATCH.md`;现在空白结果会被缓存,
+   同一份文档的栅格化耗时从 ~25ms 降到 ~8ms。
+
+2. **逐字绘制**。`render::flow` 把每个 CJK 字符当作独立原子,于是每行产生
+   O(字数) 个段落与绘制调用,并在 tiny-skia 的 damage 追踪里形成同样数量
+   的矩形。现在同一行内连续同样式的 CJK 原子会**合并成一个段落**绘制
+   (字形位置与逐字排布完全一致,见 `tests/render_regressions.rs`);
+   文本绘制项从 1343 降到 136,damage 差分从 1.59ms 降到 0.08ms。
+   合并段落按需创建(只有真正画到的行才建),长文档首帧不会为整篇正文
+   建立合并段落。选区高亮同样按同样式合并,避免 O(字数) 个矩形。
+
+### 引用 / 代码块的语法归属
+
+CommonMark 下三者互不相同,解析层保持这一区分
+(`render::md::tests::fenced_quote_and_indented_code_are_distinct_blocks`):
+
+- 围栏代码块(```` ``` ````)→ `Block::CodeBlock`(带边框 + 横向滚动条);
+- `>` 引用 → `Block::Quote`(左侧竖线,不换行截断);
+- 引用内缩进 4 格的行 → 引用内部的**缩进代码块**(仍是一个代码块)。

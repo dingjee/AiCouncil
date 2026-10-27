@@ -14,7 +14,7 @@ use std::hash::{Hash, Hasher};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::document::PathSeg;
-use super::flow::{word_range, SelPos, SelectionHooks};
+use super::flow::{grapheme_index_at_byte, is_cjk, word_range, SelPos, SelectionHooks};
 use super::RenderStyle;
 
 /// renderer 的段落类型。
@@ -45,6 +45,69 @@ pub struct CodeFlow<'a, Message> {
     /// (起始行, 起始列)-(结束行, 结束列)。
     selection: Option<((usize, usize), (usize, usize))>,
     hooks: Option<SelectionHooks<'a, Message>>,
+}
+
+/// 代码块内的 CJK 片段改用 sans-serif 族(与正文同一张字面)。
+///
+/// cosmic-text 的等宽回退链只收录**等宽**的 CJK 字面:Windows 上是
+/// NSimSun(宋体)与 MS Gothic(日文),中文因此被排成细横画的宋体/日文
+/// 字形,与正文使用的 Microsoft YaHei UI 完全是两种字体,行内甚至会
+/// 出现两种字面混排。这里把 CJK 片段单独切出来交给 sans-serif 族,
+/// 拉丁文仍保持等宽。
+pub fn script_spans(
+    spans: Vec<iced::advanced::text::Span<'static, ()>>,
+) -> Vec<iced::advanced::text::Span<'static, ()>> {
+    let mut out: Vec<iced::advanced::text::Span<'static, ()>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let text = span.text.clone().into_owned();
+        if !text.chars().any(is_cjk) {
+            out.push(span);
+            continue;
+        }
+        let mut buf = String::new();
+        let mut buf_cjk: Option<bool> = None;
+        for ch in text.chars() {
+            let cjk = is_cjk(ch);
+            if buf_cjk != Some(cjk) {
+                if !buf.is_empty() {
+                    out.push(span_with_text(
+                        &span,
+                        std::mem::take(&mut buf),
+                        buf_cjk == Some(true),
+                    ));
+                }
+                buf_cjk = Some(cjk);
+            }
+            buf.push(ch);
+        }
+        if !buf.is_empty() {
+            out.push(span_with_text(&span, buf, buf_cjk == Some(true)));
+        }
+    }
+    out
+}
+
+/// 复制原 span 的装饰,只替换文本与字体族。
+fn span_with_text(
+    src: &iced::advanced::text::Span<'static, ()>,
+    text: String,
+    cjk: bool,
+) -> iced::advanced::text::Span<'static, ()> {
+    let mut span = iced::advanced::text::Span::new(text);
+    span.color = src.color;
+    span.underline = src.underline;
+    span.strikethrough = src.strikethrough;
+    span.link = src.link;
+    span.font = if cjk {
+        let base = src.font.unwrap_or(Font::MONOSPACE);
+        Some(Font {
+            family: iced::font::Family::SansSerif,
+            ..base
+        })
+    } else {
+        src.font
+    };
+    span
 }
 
 impl<'a, Message: Clone + 'a> CodeFlow<'a, Message> {
@@ -82,6 +145,20 @@ impl<'a, Message: Clone + 'a> CodeFlow<'a, Message> {
         self.style.body * 0.9
     }
 
+    /// 行内 grapheme 序号 → 像素 x(按实际字形排布,不假设等宽)。
+    ///
+    /// 代码块里的 CJK 走 sans-serif,宽度是拉丁等宽字符的两倍;用
+    /// `char_w` 线性换算会让选区整体错位,因此改为查询已排版段落的
+    /// grapheme 位置。
+    fn grapheme_x(&self, state: &CodeFlowState, line: usize, grapheme: usize) -> f32 {
+        state
+            .paragraphs
+            .get(line)
+            .and_then(|p| p.grapheme_position(0, grapheme))
+            .map(|p| p.x)
+            .unwrap_or(grapheme as f32 * state.char_w)
+    }
+
     fn hit(&self, state: &CodeFlowState, x: f32, y: f32) -> SelPos {
         let line = if self.lines.is_empty() {
             0
@@ -90,11 +167,20 @@ impl<'a, Message: Clone + 'a> CodeFlow<'a, Message> {
                 .clamp(0, self.lines.len() as i64 - 1)
                 .max(0) as usize
         };
-        let col = (x / state.char_w.max(1.0)).round() as usize;
         let count = self
             .lines
             .get(line)
             .map(|l| l.graphemes(true).count())
+            .unwrap_or(0);
+        // 命中测试交给已排版段落(逐字形),CJK 与拉丁宽度不同也能定位。
+        let col = state
+            .paragraphs
+            .get(line)
+            .and_then(|p| p.hit_test(Point::new(x, state.line_h * 0.5)))
+            .map(|hit| {
+                let text = self.lines.get(line).map(String::as_str).unwrap_or("");
+                grapheme_index_at_byte(text, hit.cursor())
+            })
             .unwrap_or(0);
         (line, col.min(count))
     }
@@ -119,8 +205,9 @@ impl<'a, Message: Clone + 'a> CodeFlow<'a, Message> {
             if s >= e {
                 continue;
             }
-            let x0 = s as f32 * state.char_w;
-            let w = ((e - s) as f32 * state.char_w).max(state.char_w);
+            let x0 = self.grapheme_x(state, li, s);
+            let x1 = self.grapheme_x(state, li, e);
+            let w = (x1 - x0).max(state.char_w);
             rects.push(Rectangle::new(
                 Point::new(x0, li as f32 * state.line_h),
                 Size::new(w, state.line_h),
@@ -196,7 +283,7 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
             });
             state.char_w = (probe.min_bounds().width / 10.0).max(1.0);
             for (li, spans) in self.spans.iter().enumerate() {
-                let owned: Vec<_> = spans.clone();
+                let owned: Vec<_> = script_spans(spans.clone());
                 let p = if owned.is_empty() {
                     Para::with_text(text::Text {
                         content: self.lines.get(li).map(String::as_str).unwrap_or(" "),
@@ -359,12 +446,15 @@ impl<'a, Message: Clone + 'a> Widget<Message, iced::Theme, iced::Renderer>
         _tree: &iced::advanced::widget::Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         cursor
             .position()
             .filter(|p| layout.bounds().contains(*p))
+            // 视口检查:滚动出可见区域的代码块不应抢走光标形态
+            // (见 render::flow::MathFlow::mouse_interaction 的说明)。
+            .filter(|p| viewport.contains(*p))
             .map(|_| mouse::Interaction::Text)
             .unwrap_or(mouse::Interaction::None)
     }

@@ -16,6 +16,8 @@
 //! 事件桥接:ChatService broadcast + TitleService broadcast 经
 //! Subscription 进入 update;按 (conversation_id, request_id) 更新。
 
+pub mod answers;
+mod clip;
 mod design;
 pub mod drafts;
 pub mod i18n;
@@ -200,6 +202,17 @@ pub enum Message {
     DeleteGroup(GroupId),
     MoveToGroup(ConversationId, Option<GroupId>),
     ConvSearchChanged(String),
+    /// 侧栏会话项悬停(显示 rename/delete 图标)。
+    HoverConversation(Option<ConversationId>),
+    /// 展开/收起“新建分组”输入(点按才显示输入框)。
+    ToggleNewGroupForm,
+    // 并行回答组(标签 / 对比)
+    /// 选择回答(单栏独占;双栏替换第二栏)。
+    SelectAnswer(MessageId),
+    /// 切换单栏 / 双栏对比。
+    ToggleSplitView,
+    /// 面板滚动(offset, 内容高, 视口高)。
+    AnswerScrolled(MessageId, f32, f32, f32),
     // 面板与侧栏
     Panel(Panels),
     ToggleSidebar,
@@ -255,6 +268,35 @@ struct StreamState {
     model: String,
     status: GenerationStatus,
     error: Option<String>,
+}
+
+/// 消息卡片的头部形态。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardHeader {
+    /// 完整头部:模型名 + 原始 ID + 状态 + 尝试数。
+    Full,
+    /// 精简头部:模型名 + 尝试数(双栏对比时区分左右)。
+    Compact,
+    /// 无头部(单栏面板:模型名与状态已在标签条上)。
+    None,
+}
+
+/// 回答面板的滚动状态(按回答记忆;用于切回恢复与流式吸底)。
+#[derive(Clone, Copy, Default)]
+struct PaneMetrics {
+    /// 当前滚动偏移(绝对像素)。
+    offset: f32,
+    /// 内容高度。
+    content_h: f32,
+    /// 视口高度。
+    view_h: f32,
+}
+
+impl PaneMetrics {
+    /// 距离底部的高度(≤24px 视为在底部)。
+    fn distance_to_bottom(&self) -> f32 {
+        (self.content_h - self.view_h - self.offset).max(0.0)
+    }
 }
 
 /// 门禁弹窗动作。
@@ -569,6 +611,12 @@ pub struct App {
     streaming: HashMap<MessageId, StreamState>,
     /// 流式脏消息集合:一次 tick 全部刷新(替代旧单 ID 覆盖,PLAN 5.2)。
     dirty_stream: HashSet<MessageId>,
+    /// 待重载的会话(终态事件去抖:一个 tick 合并一次读库)。
+    dirty_conversations: HashSet<ConversationId>,
+    /// 并行回答组视图状态(按问题)。
+    answer_views: HashMap<MessageId, answers::AnswerView>,
+    /// 回答面板的滚动状态(按回答;记忆切回位置 + 流式吸底判定)。
+    answer_pane_metrics: HashMap<MessageId, PaneMetrics>,
 
     // 配置(PLAN 3.1/3.2/8:general settings + window)
     config: storage::repo::AppConfig,
@@ -579,6 +627,10 @@ pub struct App {
     conv_search: String,
     renaming_conv: Option<(ConversationId, String)>,
     new_group_name: String,
+    /// “新建分组”表单是否展开(点按按钮才显示输入框)。
+    new_group_form_open: bool,
+    /// 侧栏会话项悬停(显示 rename/delete 图标)。
+    hovered_conv: Option<ConversationId>,
     renaming_group: Option<(GroupId, String)>,
 
     catalog: Vec<CatalogEntry>,
@@ -790,6 +842,9 @@ impl App {
             style: RenderStyle::soft_sage(body_size),
             streaming: HashMap::new(),
             dirty_stream: HashSet::new(),
+            dirty_conversations: HashSet::new(),
+            answer_views: HashMap::new(),
+            answer_pane_metrics: HashMap::new(),
             config,
             window_size: (1150.0, 680.0),
             sidebar_dragging: false,
@@ -803,6 +858,8 @@ impl App {
             conv_search: String::new(),
             renaming_conv: None,
             new_group_name: String::new(),
+            new_group_form_open: false,
+            hovered_conv: None,
             renaming_group: None,
             catalog,
             prefs,
@@ -897,7 +954,7 @@ impl App {
         if let Some(conv) = app.current {
             app.refresh_costs(conv);
         }
-        app.rerender_current();
+        app.rerender_visible();
         app.scroll
             .set_current_conversation(app.current.unwrap_or_default());
 
@@ -1000,34 +1057,6 @@ impl App {
             .unwrap_or(1)
     }
 
-    /// 该卡是否被同 lineage 更新的尝试取代(默认只显示最新;B17)。
-    fn superseded_by_later_attempt(&self, conv: ConversationId, assistant: MessageId) -> bool {
-        let Some(tree) = self.trees.get(&conv) else {
-            return false;
-        };
-        let Some(g) = self.generation_for(conv, assistant) else {
-            return false;
-        };
-        let root = g.retry_root_id.unwrap_or(g.request_id);
-        let Some(mine) = tree.get(assistant) else {
-            return false;
-        };
-        self.generations
-            .get(&conv)
-            .map(|gs| {
-                gs.iter()
-                    .filter(|g| {
-                        g.retry_root_id == Some(root) && g.assistant_message_id != assistant
-                    })
-                    .any(|g| {
-                        tree.get(g.assistant_message_id)
-                            .map(|other| other.created_at > mine.created_at)
-                            .unwrap_or(false)
-                    })
-            })
-            .unwrap_or(false)
-    }
-
     fn generation_for(
         &self,
         conversation: ConversationId,
@@ -1085,10 +1114,48 @@ impl App {
         resolve_selection(&self.enabled_models(), &ranked, &self.model_sel)
     }
 
-    fn rerender_current(&mut self) {
+    /// 当前会话里“会被显示”的消息(主路径 + 各问题的回答组)。
+    ///
+    /// 并行回答不在主路径上(主路径只含一个叶子),只按主路径渲染会让
+    /// 回答卡片没有缓存,退化成纯文本(Markdown 源码直接显示)。
+    fn visible_message_ids(&self) -> Vec<MessageId> {
+        let Some(tree) = self.current_tree() else {
+            return Vec::new();
+        };
+        let mut ids: Vec<MessageId> = self.main_path();
+        let questions: Vec<MessageId> = ids
+            .iter()
+            .copied()
+            .filter(|id| tree.get(*id).is_some_and(|m| m.role == Role::User))
+            .collect();
+        for question in questions {
+            for child in tree.children_of(Some(question)) {
+                ids.push(child);
+            }
+        }
+        ids
+    }
+
+    /// 重渲染当前会话里所有可见的消息(主路径 + 回答组)。
+    fn rerender_visible(&mut self) {
+        let ids = self.visible_message_ids();
         let style = self.style;
-        let ids: Vec<MessageId> = self.main_path();
         for id in ids {
+            self.rerender_message(id, &style);
+        }
+    }
+
+    /// 补齐缺失的渲染缓存(可见但还没渲染过的消息)。
+    ///
+    /// 冷启动或整树重载之后,并行回答可能没有缓存;没有缓存的卡片会
+    /// 显示 Markdown 源码而不是渲染结果。
+    fn ensure_renders_current(&mut self) {
+        let ids = self.visible_message_ids();
+        let style = self.style;
+        for id in ids {
+            if self.renders.contains_key(&id) {
+                continue;
+            }
             self.rerender_message(id, &style);
         }
     }
@@ -1118,6 +1185,10 @@ impl App {
         if orphans > 0 {
             tracing::warn!(%orphans, "重载存在孤儿消息");
         }
+        // 保留正在流式消息的实时正文(数据库快照按 300ms/4KB 节流,会落后;
+        // 直接覆盖会让兄弟分支的正文回退,肉眼即“卡片忽显忽隐”)。
+        let live: HashSet<MessageId> = self.streaming.keys().copied().collect();
+        let tree = answers::merge_live_content(tree, self.trees.get(&conv), &live);
         self.trees.insert(conv, tree);
         self.generations
             .insert(conv, self.db.generations_of(conv).unwrap_or_default());
@@ -1132,6 +1203,14 @@ impl App {
         }
         // 草稿镜像只同步受影响会话(流式增量不重复克隆全部草稿)。
         self.sync_draft_state(conv);
+    }
+
+    /// 终态事件去抖:标记待重载,由下一次 tick 合并成一次读库。
+    ///
+    /// 并行多路回答会在相近时刻陆续结束;逐个事件整树重载既慢又会让
+    /// 兄弟分支的渲染缓存与正文错位。
+    fn mark_conversation_dirty(&mut self, conv: ConversationId) {
+        self.dirty_conversations.insert(conv);
     }
 
     /// 按权威行同步某会话的草稿镜像(发送事务消费草稿后调用)。
@@ -1167,7 +1246,7 @@ impl App {
             // 恢复 composer:按权威行(不读陈旧 Conversation clone)。
             self.restore_composer(id);
             self.refresh_costs(id);
-            self.rerender_current();
+            self.rerender_visible();
             let chat_for_usage_repair = self.chat.clone();
             tasks.push(Task::perform(
                 async move { chat_for_usage_repair.repair_pending_usage().await },
@@ -1738,6 +1817,32 @@ impl App {
                 }
                 Task::none()
             }
+            // ----- 并行回答组(标签 / 对比) -----
+            Message::SelectAnswer(msg_id) => self.select_answer(msg_id),
+            Message::ToggleSplitView => self.toggle_split_view(),
+            // ----- 侧栏会话项 -----
+            Message::HoverConversation(msg_id) => {
+                self.hovered_conv = msg_id;
+                Task::none()
+            }
+            Message::ToggleNewGroupForm => {
+                self.new_group_form_open = !self.new_group_form_open;
+                if !self.new_group_form_open {
+                    self.new_group_name.clear();
+                }
+                Task::none()
+            }
+            Message::AnswerScrolled(msg_id, offset, content_h, view_h) => {
+                self.answer_pane_metrics.insert(
+                    msg_id,
+                    PaneMetrics {
+                        offset,
+                        content_h,
+                        view_h,
+                    },
+                );
+                Task::none()
+            }
             Message::Copy(msg_id) => {
                 // 整条消息原始 Markdown(tooltip 与局部复制明确区分)
                 let content = self
@@ -2008,6 +2113,8 @@ impl App {
                     let _ = self.db.upsert_group(&g);
                     self.groups.push(g);
                     self.new_group_name.clear();
+                    // 建组后收起表单
+                    self.new_group_form_open = false;
                 }
                 Task::none()
             }
@@ -2356,7 +2463,7 @@ impl App {
                 if let Some(c) = self.conversations.iter_mut().find(|c| c.id == conv) {
                     c.main_leaf_id = Some(id);
                 }
-                self.rerender_current();
+                self.rerender_visible();
                 if let Some(op) = self.scroll.notify_sent() {
                     return self.run_scroll_op(op);
                 }
@@ -2415,7 +2522,7 @@ impl App {
                 self.config.general.body_text_size = Some(size);
                 self.style = RenderStyle::soft_sage(size);
                 // 全量重渲染(缓存键含字号)
-                self.rerender_current();
+                self.rerender_visible();
                 save_config(self.config.clone())
             }
             Message::WindowResized(size) => {
@@ -2473,6 +2580,14 @@ impl App {
     fn on_tick(&mut self) -> Task<Message> {
         self.tick_count = self.tick_count.wrapping_add(1);
         let mut tasks = Vec::new();
+        // 终态事件去抖:本 tick 内的多次结构重载合并成一次
+        // (并行多路陆续结束时不再逐个整树重载)。
+        if !self.dirty_conversations.is_empty() {
+            let convs: Vec<ConversationId> = self.dirty_conversations.drain().collect();
+            for conv in convs {
+                self.refresh_from_db(conv);
+            }
+        }
         // 一次 tick 刷新所有脏流式消息,再计算一次阅读位置(PLAN 5.2)
         if !self.dirty_stream.is_empty() {
             let ids: Vec<MessageId> = self.dirty_stream.drain().collect();
@@ -2484,6 +2599,10 @@ impl App {
                 tasks.push(self.run_scroll_op(op));
             }
         }
+        // 补齐缺失的渲染缓存(并行回答不在主路径上;缺缓存会退化成纯文本)
+        self.ensure_renders_current();
+        // 回答面板:正在生成的回答在面板内吸底(与外层滚动同一语义)。
+        tasks.push(self.follow_streaming_panes());
         if self.tick_count.is_multiple_of(60) && self.toast.is_some() {
             self.toast = None;
         }
@@ -2491,6 +2610,46 @@ impl App {
             self.toast_error = None;
         }
         tasks.push(self.check_composer_focus());
+        Task::batch(tasks)
+    }
+
+    /// 正在生成的回答:面板在底部时保持吸底(否则保持用户位置)。
+    fn follow_streaming_panes(&self) -> Task<Message> {
+        let Some(question_id) = self.current_question_with_answers() else {
+            return Task::none();
+        };
+        let all = self.answer_visible_ids(question_id);
+        let view = self
+            .answer_views
+            .get(&question_id)
+            .cloned()
+            .unwrap_or_default();
+        let displayed = view.visible_answers(&all);
+        let mut tasks = Vec::new();
+        for (pos, id) in displayed.iter().enumerate() {
+            let Some(metrics) = self.answer_pane_metrics.get(id) else {
+                continue;
+            };
+            if metrics.distance_to_bottom() > scroll::BOTTOM_TOLERANCE {
+                continue;
+            }
+            let streaming = self
+                .status_of(*id)
+                .map(|s| {
+                    matches!(
+                        s.status,
+                        GenerationStatus::Queued
+                            | GenerationStatus::Connecting
+                            | GenerationStatus::Streaming
+                    )
+                })
+                .unwrap_or(false);
+            if !streaming {
+                continue;
+            }
+            let bottom = (metrics.content_h - metrics.view_h).max(0.0);
+            tasks.push(self.scroll_pane_to(pos, bottom));
+        }
         Task::batch(tasks)
     }
 
@@ -2535,8 +2694,10 @@ impl App {
             GenEvent::RemoteGenerationId { .. } => {}
             GenEvent::Finished { .. } => {
                 // main_leaf 由服务层 CAS 移动;此处只对账
+                // 正文以数据库为准(服务端发终态前已落库);结构刷新去抖,
+                // 避免并行多路结束时反复整树重载。
                 self.streaming.remove(&msg);
-                self.refresh_from_db(conv);
+                self.mark_conversation_dirty(conv);
                 self.refresh_usage_rank();
                 if is_current {
                     let style = self.style;
@@ -2546,7 +2707,7 @@ impl App {
             GenEvent::Failed { error } => {
                 // 失败也刷新 generations:历史/重启失败同样显示(B02)
                 self.streaming.remove(&msg);
-                self.refresh_from_db(conv);
+                self.mark_conversation_dirty(conv);
                 if is_current {
                     let style = self.style;
                     self.rerender_message(msg, &style);
@@ -2555,7 +2716,7 @@ impl App {
             }
             GenEvent::Cancelled => {
                 self.streaming.remove(&msg);
-                self.refresh_from_db(conv);
+                self.mark_conversation_dirty(conv);
                 if is_current {
                     let style = self.style;
                     self.rerender_message(msg, &style);
@@ -2564,7 +2725,7 @@ impl App {
             GenEvent::Rejected { detail } => {
                 // dispatch 门禁晚到拒绝:卡片显示持久化原因
                 self.streaming.remove(&msg);
-                self.refresh_from_db(conv);
+                self.mark_conversation_dirty(conv);
                 if is_current {
                     let style = self.style;
                     self.rerender_message(msg, &style);
@@ -3024,7 +3185,7 @@ impl App {
                 },
             );
         }
-        self.rerender_current();
+        self.rerender_visible();
         if let Some(op) = self.scroll.notify_sent() {
             return self.run_scroll_op(op);
         }
@@ -3132,7 +3293,7 @@ impl App {
                 self.toast_error = Some(i18n::f("toast.retry_rejected", &[("reason", &e)]));
                 if self.current == Some(conv) {
                     self.refresh_from_db(conv);
-                    self.rerender_current();
+                    self.rerender_visible();
                 }
                 Task::none()
             }
@@ -3152,7 +3313,7 @@ impl App {
             self.streaming
                 .retain(|_, s| !terminal.contains(&s.request_id));
         }
-        self.rerender_current();
+        self.rerender_visible();
     }
 }
 
@@ -3232,31 +3393,39 @@ impl App {
             input,
         ]
         .into();
-        if let Some(picker) = picker {
-            let dismiss: Element<'_, Message> = mouse_area(
-                container(Space::new().width(Length::Fill).height(Length::Fill))
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .on_press(Message::TogglePicker)
-            .into();
-            let panel = iced::widget::opaque(picker);
-            let placed: Element<'_, Message> = container(panel)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::Alignment::Start)
-                .align_y(iced::Alignment::End)
-                .padding(Padding {
-                    top: 0.0,
-                    bottom: 92.0,
-                    left: 16.0,
-                    right: 0.0,
-                })
+        // 弹层结构恒定:即使弹窗关闭也保留 Stack(第 0 层仍是 base 列)。
+        // 原因:iced 的 `Tree::diff` 在标签不同(Column ↔ Stack)时会整棵子树
+        // 重建,滚动条的 offset 存在 `tree.state` 里,随子树一起被丢弃 →
+        // 打开/关闭模型选择弹窗时主会话跳回顶部。固定为 Stack 后,
+        // base 永远是第 0 个子节点,diff 只增删弹层,主滚动状态保持不变。
+        let overlay: Element<'_, Message> = match picker {
+            Some(picker) => {
+                let dismiss: Element<'_, Message> = mouse_area(
+                    container(Space::new().width(Length::Fill).height(Length::Fill))
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                )
+                .on_press(Message::TogglePicker)
                 .into();
-            iced::widget::stack![base, dismiss, placed].into()
-        } else {
-            base
-        }
+                let panel = iced::widget::opaque(picker);
+                let placed: Element<'_, Message> = container(panel)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(iced::Alignment::Start)
+                    .align_y(iced::Alignment::End)
+                    .padding(Padding {
+                        top: 0.0,
+                        bottom: 92.0,
+                        left: 16.0,
+                        right: 0.0,
+                    })
+                    .into();
+                iced::widget::stack![dismiss, placed].into()
+            }
+            // 关闭态:透明占位层(不拦截事件、不改变几何)。
+            None => Space::new().width(Length::Fill).height(Length::Fill).into(),
+        };
+        iced::widget::stack![base, overlay].into()
     }
 
     fn view_header(&self) -> Element<'_, Message> {
@@ -3271,34 +3440,40 @@ impl App {
         );
 
         // 可编辑标题(主区;Enter 保存 / Esc 取消;与侧栏同一组件形态)
-        let title_el: Element<'_, Message> = if let Some((id, buf)) = &self.renaming_conv {
-            if Some(*id) == self.current {
-                text_input(i18n::t("title.placeholder"), buf)
-                    .on_input(Message::RenameInput)
-                    .on_submit(Message::RenameApply)
-                    .size(15)
-                    .width(Length::Fixed(360.0))
-                    .style(design::text_input_style)
-                    .into()
+        // 标题文字与重命名按钮拆成两个元素:两者之间的间距要独立控制
+        // (见下方 left_group 的间距编排)。
+        let (title_el, rename_el): (Element<'_, Message>, Option<Element<'_, Message>>) =
+            if let Some((id, buf)) = &self.renaming_conv {
+                if Some(*id) == self.current {
+                    (
+                        text_input(i18n::t("title.placeholder"), buf)
+                            .on_input(Message::RenameInput)
+                            .on_submit(Message::RenameApply)
+                            .size(15)
+                            .width(Length::Fixed(360.0))
+                            .style(design::text_input_style)
+                            .into(),
+                        None,
+                    )
+                } else {
+                    (text(self.title_text()).size(16).into(), None)
+                }
             } else {
-                text(self.title_text()).size(16).into()
-            }
-        } else {
-            match self.current_conv() {
-                Some(conv) => row![
-                    text(self.title_text()).size(16),
-                    tooltip(
-                        button(icons::icon("edit")).on_press(Message::RenameStart(conv.id)),
-                        text(i18n::t("title.edit_tooltip")).size(12),
-                        iced::widget::tooltip::Position::Bottom,
+                match self.current_conv() {
+                    Some(conv) => (
+                        text(self.title_text()).size(16).into(),
+                        Some(
+                            tooltip(
+                                button(icons::icon("edit")).on_press(Message::RenameStart(conv.id)),
+                                text(i18n::t("title.edit_tooltip")).size(12),
+                                iced::widget::tooltip::Position::Bottom,
+                            )
+                            .into(),
+                        ),
                     ),
-                ]
-                .spacing(design::SPACING_XS)
-                .align_y(iced::Alignment::Center)
-                .into(),
-                None => text(self.title_text()).size(16).into(),
-            }
-        };
+                    None => (text(self.title_text()).size(16).into(), None),
+                }
+            };
 
         let export_menu: Element<'_, Message> = if self.export_menu_open {
             row![
@@ -3312,17 +3487,43 @@ impl App {
         } else {
             row![].into()
         };
+        // 左侧组:标题 → 重命名 → 导出(仅图标)→ 用量标签。
+        //
+        // 间距按格式塔接近律编排(逐级收紧,读作三组):
+        // - 标题文字 ↔ 重命名按钮:最大(SPACING_M)。重命名是独立控件,
+        //   贴住标题文字时会被读成标题的一部分。
+        // - 重命名 ↔ 导出:次之(SPACING_S)。
+        // - 导出 ↔ 用量:最小(SPACING_XS)。用量跟随导出图标,归为同一组。
+        let mut left_group = row![].spacing(0).align_y(iced::Alignment::Center);
+        left_group = left_group.push(title_el);
+        if let Some(rename) = rename_el {
+            left_group = left_group
+                .push(Space::new().width(Length::Fixed(design::SPACING_M)))
+                .push(rename)
+                .push(Space::new().width(Length::Fixed(design::SPACING_S)));
+        } else {
+            left_group = left_group.push(Space::new().width(Length::Fixed(design::SPACING_S)));
+        }
+        let left_group = left_group
+            .push(tooltip(
+                button(icons::icon("export")).on_press(Message::ToggleExportMenu),
+                text(i18n::t("panel.export_tooltip")).size(12),
+                iced::widget::tooltip::Position::Bottom,
+            ))
+            .push(Space::new().width(Length::Fixed(design::SPACING_XS)))
+            .push(usage);
+        // 右侧:新建会话 → 侧栏开关
         let export_row = row![
             tooltip(
                 button(
                     row![
-                        icons::icon("export"),
-                        text(i18n::t("panel.export")).size(13)
+                        icons::icon("plus"),
+                        text(i18n::t("conversation.new_button")).size(13)
                     ]
                     .spacing(design::SPACING_XS)
                 )
-                .on_press(Message::ToggleExportMenu),
-                text(i18n::t("panel.export_tooltip")).size(12),
+                .on_press(Message::NewConversation),
+                text(i18n::t("conversation.new_button")).size(12),
                 iced::widget::tooltip::Position::Bottom,
             ),
             tooltip(
@@ -3336,14 +3537,9 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         container(
-            row![
-                title_el,
-                Space::new().width(Length::Fill),
-                usage,
-                export_row
-            ]
-            .spacing(design::SPACING_S)
-            .align_y(iced::Alignment::Center),
+            row![left_group, Space::new().width(Length::Fill), export_row]
+                .spacing(design::SPACING_S)
+                .align_y(iced::Alignment::Center),
         )
         .width(Length::Fill)
         .height(Length::Fixed(52.0))
@@ -3465,29 +3661,20 @@ impl App {
                 continue;
             };
             if m.role == Role::User {
-                let children = tree.children_of(Some(*id));
-                if children.len() > 1 {
-                    cards.push(self.view_message_card(*id));
-                    // 重试尝试聚合:默认只显示未被更新的尝试(B17);
-                    // 展开后显示全部(账目按每次 request 独立计费)
+                // 并行回答组:同一问题的多个回答(标签条 + 面板)。
+                let generations = self
+                    .generations
+                    .get(&m.conversation_id)
+                    .map(|g| g.as_slice())
+                    .unwrap_or(&[]);
+                let items = answers::answer_set(&tree, generations, *id);
+                if items.len() > 1 {
+                    cards.push(self.view_message_card(*id, CardHeader::Full));
+                    cards.push(self.view_answer_group(*id, &items));
+                    // 被取代的旧尝试默认折叠;展开后全部可见(B17;
+                    // 账目按每次 request 独立计费)
+                    let hidden = answers::hidden_attempts(&items);
                     let expand = self.show_attempts.contains(&m.conversation_id);
-                    let visible: Vec<MessageId> = children
-                        .iter()
-                        .copied()
-                        .filter(|c| {
-                            expand
-                                || tree.get(*c).is_some_and(|cm| cm.role == Role::User)
-                                || !self.superseded_by_later_attempt(m.conversation_id, *c)
-                        })
-                        .collect();
-                    let hidden = children.len() - visible.len();
-                    let parallel: Vec<Element<Message>> =
-                        visible.iter().map(|c| self.view_message_card(*c)).collect();
-                    cards.push(
-                        container(row(parallel).spacing(design::SPACING_XS))
-                            .width(Length::Fill)
-                            .into(),
-                    );
                     if hidden > 0 {
                         let label = i18n::f("message.show_attempts", &[("n", &hidden.to_string())]);
                         cards.push(
@@ -3510,7 +3697,7 @@ impl App {
                     continue;
                 }
             }
-            cards.push(self.view_message_card(*id));
+            cards.push(self.view_message_card(*id, CardHeader::Full));
         }
         // A deleted parallel user can leave visible answers whose generation
         // still points at that user. Keep those answers visible as a group.
@@ -3532,7 +3719,10 @@ impl App {
                         orphan_groups
                             .entry(generation.user_message_id)
                             .or_default()
-                            .push(self.view_message_card(generation.assistant_message_id));
+                            .push(self.view_message_card(
+                                generation.assistant_message_id,
+                                CardHeader::Full,
+                            ));
                     }
                 }
             }
@@ -3611,7 +3801,7 @@ impl App {
         iced::widget::stack![scroll, latest].into()
     }
 
-    fn view_message_card(&self, id: MessageId) -> Element<'_, Message> {
+    fn view_message_card(&self, id: MessageId, header_mode: CardHeader) -> Element<'_, Message> {
         let Some(tree) = self.current_tree() else {
             return row![].into();
         };
@@ -3708,148 +3898,65 @@ impl App {
             .spacing(design::SPACING_XS)
             .align_y(iced::Alignment::Center);
         // raw ID tooltip(消除正文里的 anthropic/… 噪音;审计可见)
-        if let Some(mid) = &raw_model_id {
-            if let Some(name) = &model_name {
-                if name != mid {
-                    header = header.push(tooltip(
-                        text(i18n::t("models.id_tooltip").replace("{id}", mid))
-                            .size(10)
-                            .color(crate::ui_style::palette::TEXT_MUTED),
-                        text(mid.clone()).size(10),
-                        iced::widget::tooltip::Position::Bottom,
-                    ));
+        if header_mode == CardHeader::Full {
+            if let Some(mid) = &raw_model_id {
+                if let Some(name) = &model_name {
+                    if name != mid {
+                        header = header.push(tooltip(
+                            text(i18n::t("models.id_tooltip").replace("{id}", mid))
+                                .size(10)
+                                .color(crate::ui_style::palette::TEXT_MUTED),
+                            text(mid.clone()).size(10),
+                            iced::widget::tooltip::Position::Bottom,
+                        ));
+                    }
                 }
             }
         }
-        if let Some(s) = status_label {
-            header = header.push(text(s).size(11).color(crate::ui_style::palette::WARNING));
-        }
-        if let Some(p) = partial_label {
-            header = header.push(text(p).size(11).color(crate::ui_style::palette::WARNING));
+        if header_mode == CardHeader::Full {
+            if let Some(s) = status_label {
+                header = header.push(text(s).size(11).color(crate::ui_style::palette::WARNING));
+            }
+            if let Some(p) = partial_label {
+                header = header.push(text(p).size(11).color(crate::ui_style::palette::WARNING));
+            }
         }
         if let Some(reason) = short_reason {
-            let err_el: Element<Message> = if let Some(full) = &full_error {
-                tooltip(
-                    text(reason).size(11).color(crate::ui_style::palette::ERROR),
-                    text(full.clone()).size(11),
-                    iced::widget::tooltip::Position::Bottom,
-                )
-                .into()
-            } else {
-                text(reason)
-                    .size(11)
-                    .color(crate::ui_style::palette::ERROR)
+            if header_mode == CardHeader::Full {
+                let err_el: Element<Message> = if let Some(full) = &full_error {
+                    tooltip(
+                        text(reason).size(11).color(crate::ui_style::palette::ERROR),
+                        text(full.clone()).size(11),
+                        iced::widget::tooltip::Position::Bottom,
+                    )
                     .into()
-            };
-            header = header.push(err_el);
+                } else {
+                    text(reason)
+                        .size(11)
+                        .color(crate::ui_style::palette::ERROR)
+                        .into()
+                };
+                header = header.push(err_el);
+            }
         }
-        actions = actions.push(tooltip(
-            button(icons::icon("copy")).on_press(Message::Copy(id)),
-            text(i18n::t("message.copy_tooltip")).size(12),
-            iced::widget::tooltip::Position::Top,
-        ));
+        // 底部操作条顺序(固定契约):
+        // - 助手/回答:勾选 → 设为主答案 → 重新生成(或停止)→ 删除 → 复制
+        // - 用户/提问:删除 → 编辑 → 复制
         let can_remove = !streaming_now
             && self.pending_send.is_none()
             && self.egress_modal.is_none()
             && !self.message_has_active_generation(conv_id, id);
-        actions = actions.push(tooltip(
-            button(icons::icon("trash"))
-                .on_press_maybe(can_remove.then_some(Message::RemoveMessage(id))),
-            text("Remove message from conversation").size(12),
-            iced::widget::tooltip::Position::Top,
-        ));
-        if is_user
+        let can_edit = is_user
             && latest_user == Some(id)
             && !self.message_has_active_generation(conv_id, id)
             && self.pending_send.is_none()
-            && self.egress_modal.is_none()
-        {
-            actions = actions.push(tooltip(
-                button(icons::icon("edit")).on_press(Message::EditLatest(id)),
-                text("Edit latest question").size(12),
-                iced::widget::tooltip::Position::Top,
-            ));
-        }
-        if streaming_now {
-            let req = stream.as_ref().unwrap().request_id;
-            actions = actions.push(tooltip(
-                button(icons::icon("stop")).on_press(Message::Stop(req)),
-                text(i18n::t("message.stop")).size(12),
-                iced::widget::tooltip::Position::Top,
-            ));
-        } else if !is_user {
-            // 重试按钮:资格门禁(冷却倒计时/补救;服务层兜底)
-            let decision = gen.as_ref().map(|g| {
-                let root = g.retry_root_id.unwrap_or(g.request_id);
-                let lineage_active = self
-                    .generations
-                    .get(&conv_id)
-                    .map(|gs| {
-                        gs.iter()
-                            .any(|x| x.retry_root_id == Some(root) && !x.status.is_terminal())
-                    })
-                    .unwrap_or(false);
-                let latest_failure: Option<FailureInfo> =
-                    self.generations.get(&conv_id).and_then(|gs| {
-                        gs.iter()
-                            .filter(|x| x.retry_root_id == Some(root) && x.failure.is_some())
-                            .max_by_key(|x| x.finished_at.unwrap_or_else(crate::storage::now_dt))
-                            .and_then(|x| x.failure.clone())
-                    });
-                retry_decision(
-                    g.status,
-                    latest_failure.as_ref(),
-                    crate::domain::recovery::now_ms(),
-                    lineage_active,
-                )
-            });
+            && self.egress_modal.is_none();
+        if !is_user {
             let completed = gen
                 .as_ref()
                 .map(|g| g.status == GenerationStatus::Completed)
                 .unwrap_or(false);
-            let retry_tip = match &decision {
-                Some(RetryDecision::Allowed) => {
-                    if completed {
-                        i18n::t("message.regenerate").to_string()
-                    } else {
-                        i18n::t("message.retry").to_string()
-                    }
-                }
-                Some(RetryDecision::InFlight) => i18n::t("retry.in_flight").to_string(),
-                Some(RetryDecision::Cooldown(until)) => {
-                    let secs = ((until - crate::domain::recovery::now_ms()) / 1000).max(0);
-                    i18n::f("retry.cooldown", &[("s", &secs.to_string())])
-                }
-                Some(RetryDecision::NeedsAction(remedy)) => {
-                    let key = match remedy {
-                        crate::domain::Remedy::SwitchIp => "retry.needs.switch_ip",
-                        crate::domain::Remedy::Credentials => "retry.needs.credentials",
-                        crate::domain::Remedy::Balance => "retry.needs.balance",
-                        crate::domain::Remedy::EditInput => "retry.needs.edit_input",
-                        crate::domain::Remedy::PickModel => "retry.needs.pick_model",
-                        crate::domain::Remedy::None => "retry.needs.none",
-                    };
-                    i18n::t(key).to_string()
-                }
-                None => i18n::t("message.retry").to_string(),
-            };
-            let allowed = matches!(decision, Some(RetryDecision::Allowed) | None);
-            let mut retry_btn = button(icons::icon("retry")).style(design::quiet_button);
-            if allowed {
-                retry_btn = retry_btn.on_press(Message::Retry(id));
-            }
-            actions = actions.push(tooltip(
-                retry_btn,
-                text(retry_tip).size(12),
-                iced::widget::tooltip::Position::Top,
-            ));
-            if completed && self.current_conv().and_then(|c| c.main_leaf_id) != Some(id) {
-                actions = actions.push(tooltip(
-                    button(icons::icon("continue")).on_press(Message::ContinueFrom(id)),
-                    text(i18n::t("message.continue_tooltip")).size(12),
-                    iced::widget::tooltip::Position::Top,
-                ));
-            }
+            // 1) 勾选:把该回答加入多路追问集合
             if completed {
                 let checked = self.branch_selection.contains(&id);
                 actions = actions.push(tooltip(
@@ -3860,9 +3967,94 @@ impl App {
                     iced::widget::tooltip::Position::Top,
                 ));
             }
+            // 2) 设为主答案:同一问题存在多个回答时才有意义
+            //    (单回答会话里“主分支”没有歧义,按钮冗余)。
+            if completed
+                && self.current_conv().and_then(|c| c.main_leaf_id) != Some(id)
+                && self.sibling_answer_count(tree, conv_id, id) > 1
+            {
+                actions = actions.push(tooltip(
+                    button(icons::icon("continue")).on_press(Message::ContinueFrom(id)),
+                    text(i18n::t("message.continue_tooltip")).size(12),
+                    iced::widget::tooltip::Position::Top,
+                ));
+            }
+            // 3) 重新生成 / 停止
+            if streaming_now {
+                let req = stream.as_ref().unwrap().request_id;
+                actions = actions.push(tooltip(
+                    button(icons::icon("stop")).on_press(Message::Stop(req)),
+                    text(i18n::t("message.stop")).size(12),
+                    iced::widget::tooltip::Position::Top,
+                ));
+            } else {
+                // 重试按钮:资格门禁(冷却倒计时/补救;服务层兜底)
+                let decision = gen.as_ref().map(|g| {
+                    let root = g.retry_root_id.unwrap_or(g.request_id);
+                    let lineage_active = self
+                        .generations
+                        .get(&conv_id)
+                        .map(|gs| {
+                            gs.iter()
+                                .any(|x| x.retry_root_id == Some(root) && !x.status.is_terminal())
+                        })
+                        .unwrap_or(false);
+                    let latest_failure: Option<FailureInfo> =
+                        self.generations.get(&conv_id).and_then(|gs| {
+                            gs.iter()
+                                .filter(|x| x.retry_root_id == Some(root) && x.failure.is_some())
+                                .max_by_key(|x| {
+                                    x.finished_at.unwrap_or_else(crate::storage::now_dt)
+                                })
+                                .and_then(|x| x.failure.clone())
+                        });
+                    retry_decision(
+                        g.status,
+                        latest_failure.as_ref(),
+                        crate::domain::recovery::now_ms(),
+                        lineage_active,
+                    )
+                });
+                let retry_tip = match &decision {
+                    Some(RetryDecision::Allowed) => {
+                        if completed {
+                            i18n::t("message.regenerate").to_string()
+                        } else {
+                            i18n::t("message.retry").to_string()
+                        }
+                    }
+                    Some(RetryDecision::InFlight) => i18n::t("retry.in_flight").to_string(),
+                    Some(RetryDecision::Cooldown(until)) => {
+                        let secs = ((until - crate::domain::recovery::now_ms()) / 1000).max(0);
+                        i18n::f("retry.cooldown", &[("s", &secs.to_string())])
+                    }
+                    Some(RetryDecision::NeedsAction(remedy)) => {
+                        let key = match remedy {
+                            crate::domain::Remedy::SwitchIp => "retry.needs.switch_ip",
+                            crate::domain::Remedy::Credentials => "retry.needs.credentials",
+                            crate::domain::Remedy::Balance => "retry.needs.balance",
+                            crate::domain::Remedy::EditInput => "retry.needs.edit_input",
+                            crate::domain::Remedy::PickModel => "retry.needs.pick_model",
+                            crate::domain::Remedy::None => "retry.needs.none",
+                        };
+                        i18n::t(key).to_string()
+                    }
+                    None => i18n::t("message.retry").to_string(),
+                };
+                let allowed = matches!(decision, Some(RetryDecision::Allowed) | None);
+                let mut retry_btn = button(icons::icon("retry")).style(design::quiet_button);
+                if allowed {
+                    retry_btn = retry_btn.on_press(Message::Retry(id));
+                }
+                actions = actions.push(tooltip(
+                    retry_btn,
+                    text(retry_tip).size(12),
+                    iced::widget::tooltip::Position::Top,
+                ));
+            }
             // 尝试数(lineage 聚合;默认显示最新,旧尝试可展开)
             let attempts = self.lineage_count_of(conv_id, id);
-            if attempts > 1 {
+            if attempts > 1 && header_mode != CardHeader::None {
                 header = header.push(
                     text(i18n::f("message.attempts", &[("n", &attempts.to_string())]))
                         .size(10)
@@ -3870,6 +4062,27 @@ impl App {
                 );
             }
         }
+        // 4) 删除(助手行在重新生成之后,用户行在最前)
+        actions = actions.push(tooltip(
+            button(icons::icon("trash"))
+                .on_press_maybe(can_remove.then_some(Message::RemoveMessage(id))),
+            text("Remove message from conversation").size(12),
+            iced::widget::tooltip::Position::Top,
+        ));
+        // 5) 编辑(仅最新提问)
+        if can_edit {
+            actions = actions.push(tooltip(
+                button(icons::icon("edit")).on_press(Message::EditLatest(id)),
+                text("Edit latest question").size(12),
+                iced::widget::tooltip::Position::Top,
+            ));
+        }
+        // 6) 复制(永远在最后)
+        actions = actions.push(tooltip(
+            button(icons::icon("copy")).on_press(Message::Copy(id)),
+            text(i18n::t("message.copy_tooltip")).size(12),
+            iced::widget::tooltip::Position::Top,
+        ));
 
         let body: Element<Message> = if m.content.is_empty() && streaming_now {
             text("…").size(self.style.body).into()
@@ -3905,11 +4118,16 @@ impl App {
             let clipped: Element<Message> = if expanded {
                 body
             } else {
-                container(body)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(COLLAPSED_HEIGHT))
-                    .clip(true)
-                    .into()
+                // 折叠态:裁剪后的正文不得越界参与命中
+                // (否则隐藏的正文会伸到回答标签条上方,抢走光标形态
+                //  并吃掉落在标签上的点击)。
+                clip::ClipHit::new(
+                    container(body)
+                        .width(Length::Fill)
+                        .height(Length::Fixed(COLLAPSED_HEIGHT))
+                        .clip(true),
+                )
+                .into()
             };
             expand_action = Some(
                 tooltip(
@@ -3924,9 +4142,11 @@ impl App {
             body
         };
 
-        let mut card = column![container(header.wrap()).width(Length::Fill), body_elem]
-            .spacing(design::SPACING_XS)
-            .width(Length::Fill);
+        let mut card = column![].spacing(design::SPACING_XS).width(Length::Fill);
+        if header_mode != CardHeader::None {
+            card = card.push(container(header.wrap()).width(Length::Fill));
+        }
+        card = card.push(body_elem);
         if is_user && !m.attachments.is_empty() {
             let mut chips = row![].spacing(design::SPACING_XS);
             for a in &m.attachments {
@@ -3980,6 +4200,299 @@ impl App {
         }
     }
 
+    /// 回答面板高度(固定)。
+    ///
+    /// 面板高度与回答长短无关:切换标签不会改变整条消息流的几何,
+    /// 外层滚动条因此不会跳动(回答内部的滚动位置单独记忆)。
+    fn answer_pane_height(&self) -> f32 {
+        (self.window_size.1 - 260.0).clamp(240.0, 640.0)
+    }
+
+    /// 回答面板的滚动条 Id(按面板位置)。
+    ///
+    /// 按位置而非按回答固定:切换标签时面板控件留在同一树节点,滚动
+    /// 偏移随状态继承,再由 `scroll_pane_to` 覆盖为该回答的记忆位置。
+    fn answer_pane_id(position: usize) -> iced::widget::Id {
+        match position {
+            0 => iced::widget::Id::new("answer-pane-0"),
+            _ => iced::widget::Id::new("answer-pane-1"),
+        }
+    }
+
+    /// 下发“滚动到指定偏移”(切回标签后恢复阅读位置)。
+    fn scroll_pane_to(&self, position: usize, offset: f32) -> Task<Message> {
+        let op = iced::advanced::widget::operation::scrollable::scroll_to(
+            Self::answer_pane_id(position),
+            iced::advanced::widget::operation::scrollable::AbsoluteOffset { x: 0.0, y: offset }
+                .into(),
+        );
+        iced_runtime::task::widget(op)
+    }
+
+    /// 回答的展示名(与卡片头部同一归一化规则)。
+    fn answer_display_name(&self, item: &answers::AnswerItem) -> String {
+        if item.model_id.is_empty() {
+            return i18n::t("message.role.assistant").to_string();
+        }
+        let cat_name = self
+            .catalog
+            .iter()
+            .find(|e| e.model_id == item.model_id)
+            .map(|e| e.name.clone())
+            .unwrap_or_default();
+        presentation(&item.model_id, &cat_name).full_label
+    }
+
+    /// 并行回答组:标签条 + 面板(单栏 / 双栏对比)。
+    fn view_answer_group(
+        &self,
+        question_id: MessageId,
+        items: &[answers::AnswerItem],
+    ) -> Element<'_, Message> {
+        let expand = self
+            .current
+            .is_some_and(|c| self.show_attempts.contains(&c));
+        let shown_items: Vec<&answers::AnswerItem> = if expand {
+            items.iter().collect()
+        } else {
+            answers::visible_items(items)
+        };
+        let all_ids: Vec<MessageId> = shown_items.iter().map(|i| i.message_id).collect();
+        let state = self
+            .answer_views
+            .get(&question_id)
+            .cloned()
+            .unwrap_or_default();
+        let displayed = state.visible_answers(&all_ids);
+
+        // 标签条:状态点 + 模型名(+ 尝试角标)+ 对比开关
+        let mut strip = row![]
+            .spacing(design::SPACING_XS)
+            .align_y(iced::Alignment::Center);
+        for item in &shown_items {
+            let id = item.message_id;
+            let is_displayed = displayed.contains(&id);
+            let name = self.answer_display_name(item);
+            let mut tab_content = row![].spacing(4).align_y(iced::Alignment::Center);
+            tab_content = tab_content.push(icons::icon_with_color(
+                answer_status_icon(item),
+                answer_status_color(item),
+            ));
+            tab_content = tab_content.push(text(ellipsize(&name, 18)).size(12));
+            if item.attempt > 1 {
+                tab_content = tab_content.push(
+                    text(i18n::f(
+                        "answers.attempt",
+                        &[("n", &item.attempt.to_string())],
+                    ))
+                    .size(9)
+                    .color(crate::ui_style::palette::TEXT_MUTED),
+                );
+            }
+            if item.superseded {
+                tab_content = tab_content.push(
+                    text(i18n::t("answers.superseded"))
+                        .size(9)
+                        .color(crate::ui_style::palette::TEXT_MUTED),
+                );
+            }
+            let tab = button(tab_content)
+                .on_press(Message::SelectAnswer(id))
+                .style(if is_displayed {
+                    design::active_button
+                } else {
+                    design::quiet_button
+                });
+            strip = strip.push(tab);
+        }
+
+        let split_button = tooltip(
+            button(
+                row![
+                    icons::icon("compare"),
+                    text(i18n::t("answers.split")).size(11)
+                ]
+                .spacing(4),
+            )
+            .on_press(Message::ToggleSplitView)
+            .style(if state.mode == answers::LayoutMode::Split {
+                design::active_button
+            } else {
+                design::quiet_button
+            }),
+            text(i18n::t("answers.split_tooltip")).size(12),
+            iced::widget::tooltip::Position::Top,
+        );
+        let header = row![
+            scrollable(strip)
+                .direction(iced::widget::scrollable::Direction::Horizontal(
+                    iced::widget::scrollable::Scrollbar::default(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Shrink),
+            split_button,
+        ]
+        .spacing(design::SPACING_XS)
+        .align_y(iced::Alignment::Center);
+
+        // 面板:固定高度 + 独立滚动(单栏/双栏)
+        let pane_height = self.answer_pane_height();
+        let split = state.mode == answers::LayoutMode::Split && displayed.len() > 1;
+        let mut panes = row![]
+            .spacing(design::SPACING_S)
+            .align_y(iced::Alignment::Start);
+        for (pos, id) in displayed.iter().enumerate() {
+            let scroll_id = *id;
+            let pane = scrollable(self.view_answer_pane(*id, split))
+                .id(Self::answer_pane_id(pos))
+                .width(Length::Fill)
+                .height(Length::Fixed(pane_height))
+                .on_scroll(move |vp: scrollable::Viewport| {
+                    Message::AnswerScrolled(
+                        scroll_id,
+                        vp.absolute_offset().y,
+                        vp.content_bounds().height,
+                        vp.bounds().height,
+                    )
+                });
+            panes = panes.push(pane);
+        }
+
+        container(column![header, panes].spacing(design::SPACING_S))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// 面板内的回答卡片(单栏隐藏头部;双栏保留精简头部以区分左右)。
+    fn view_answer_pane(&self, id: MessageId, split: bool) -> Element<'_, Message> {
+        self.view_message_card(
+            id,
+            if split {
+                CardHeader::Compact
+            } else {
+                CardHeader::None
+            },
+        )
+    }
+
+    /// 某回答所属的问题(assistant 消息的父节点)。
+    fn question_of(&self, msg_id: MessageId) -> Option<MessageId> {
+        self.current_tree()
+            .and_then(|t| t.get(msg_id))
+            .and_then(|m| m.parent_id)
+    }
+
+    /// 同一问题下的回答数量(含被取代的旧尝试)。
+    ///
+    /// 用于“设为主答案”按钮的可见性:只有存在多个回答时,选择主分支
+    /// 才有意义。
+    fn sibling_answer_count(
+        &self,
+        tree: &MessageTree,
+        conv_id: ConversationId,
+        msg_id: MessageId,
+    ) -> usize {
+        let Some(question_id) = tree.get(msg_id).and_then(|m| m.parent_id) else {
+            return 0;
+        };
+        let generations = self
+            .generations
+            .get(&conv_id)
+            .map(|g| g.as_slice())
+            .unwrap_or(&[]);
+        answers::answer_set(tree, generations, question_id).len()
+    }
+
+    /// 某问题的回答集合(含被取代的尝试)。
+    fn answer_items(&self, question_id: MessageId) -> Vec<answers::AnswerItem> {
+        let Some(tree) = self.current_tree() else {
+            return Vec::new();
+        };
+        let generations = self
+            .current
+            .and_then(|c| self.generations.get(&c))
+            .map(|g| g.as_slice())
+            .unwrap_or(&[]);
+        answers::answer_set(tree, generations, question_id)
+    }
+
+    /// 某问题当前可见的回答(折叠被取代的尝试,与视图一致)。
+    fn answer_visible_ids(&self, question_id: MessageId) -> Vec<MessageId> {
+        let items = self.answer_items(question_id);
+        let expand = self
+            .current
+            .is_some_and(|c| self.show_attempts.contains(&c));
+        items
+            .iter()
+            .filter(|i| expand || !i.superseded)
+            .map(|i| i.message_id)
+            .collect()
+    }
+
+    /// 选中一个回答(标签点击)。
+    fn select_answer(&mut self, msg_id: MessageId) -> Task<Message> {
+        let Some(question_id) = self.question_of(msg_id) else {
+            return Task::none();
+        };
+        let all = self.answer_visible_ids(question_id);
+        let mut view = self
+            .answer_views
+            .get(&question_id)
+            .cloned()
+            .unwrap_or_default();
+        view.select(msg_id);
+        let displayed = view.visible_answers(&all);
+        self.answer_views.insert(question_id, view);
+        self.restore_pane_offsets(&displayed)
+    }
+
+    /// 单栏 / 双栏对比切换。
+    fn toggle_split_view(&mut self) -> Task<Message> {
+        let Some(question_id) = self.current_question_with_answers() else {
+            return Task::none();
+        };
+        let all = self.answer_visible_ids(question_id);
+        let mut view = self
+            .answer_views
+            .get(&question_id)
+            .cloned()
+            .unwrap_or_default();
+        view.toggle_split(&all);
+        let displayed = view.visible_answers(&all);
+        self.answer_views.insert(question_id, view);
+        self.restore_pane_offsets(&displayed)
+    }
+
+    /// 当前会话里最近一个有并行回答的问题(对比开关的作用对象)。
+    fn current_question_with_answers(&self) -> Option<MessageId> {
+        let path = self.main_path();
+        let tree = self.current_tree()?;
+        for id in path.iter().rev() {
+            let Some(m) = tree.get(*id) else { continue };
+            if m.role != Role::User {
+                continue;
+            }
+            if self.answer_visible_ids(*id).len() > 1 {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    /// 恢复各面板的阅读位置(按回答记忆的偏移)。
+    ///
+    /// 面板 Id 按“位置”而非“回答”固定:切换标签时面板控件留在同一
+    /// 树节点,滚动偏移随状态继承,再由本操作覆盖为该回答的记忆位置。
+    fn restore_pane_offsets(&self, displayed: &[MessageId]) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for (pos, id) in displayed.iter().enumerate() {
+            if let Some(m) = self.answer_pane_metrics.get(id) {
+                tasks.push(self.scroll_pane_to(pos, m.offset));
+            }
+        }
+        Task::batch(tasks)
+    }
+
     fn view_input(&self) -> (Element<'_, Message>, Option<Element<'_, Message>>) {
         // 门禁弹窗打开时:主区底部显示弹窗卡片(替代输入区;Esc/取消关闭)
         if self.egress_modal.is_some() {
@@ -4029,16 +4542,20 @@ impl App {
             ))
             .size(12)
         };
+        // 三角方向由弹层状态驱动:展开朝上、收起朝下。所有关闭路径
+        // (按钮、外部点击、Esc、选中模型、退出并行)都只改
+        // `model_sel.picker_open`,因此方向永远与实际可见状态一致。
+        let caret_icon = if self.model_sel.picker_open && !enabled.is_empty() {
+            "caret_up"
+        } else {
+            "caret"
+        };
         let selector_button = tooltip(
             button(
                 row![
                     icons::icon("models"),
                     text(label).size(13),
-                    icons::icon(if self.model_sel.picker_open {
-                        "up"
-                    } else {
-                        "down"
-                    }),
+                    icons::icon(caret_icon),
                 ]
                 .spacing(design::SPACING_XS)
                 .align_y(iced::Alignment::Center),
@@ -4168,7 +4685,7 @@ impl App {
             };
             // 自适应高度:桌面约 150–300,按窗口高度缩放(6.2;D04/D07)
             let picker_height = ((self.window_size.1 - 170.0) * 0.35).clamp(80.0, 300.0);
-            let picker_width = (self.window_size.0 - 300.0).clamp(240.0, 430.0);
+            let picker_width = (self.window_size.0 - 300.0).clamp(220.0, 320.0);
             container(
                 column![
                     row![
@@ -4303,15 +4820,10 @@ impl App {
             tooltip(btn, tip, iced::widget::tooltip::Position::Top).into()
         };
 
+        // 附件按钮:只留图标(文字标签会让输入区工具条变宽);
+        // 提示与无障碍文案仍由 tooltip 提供。
         let attach_button = tooltip(
-            button(
-                row![
-                    icons::icon("attach"),
-                    text(i18n::t("composer.attach")).size(12)
-                ]
-                .spacing(5),
-            )
-            .on_press(Message::PickAttachments),
+            button(icons::icon("attach")).on_press(Message::PickAttachments),
             text(i18n::t("composer.attach_tooltip")).size(12),
             iced::widget::tooltip::Position::Top,
         );
@@ -4357,30 +4869,38 @@ impl App {
         .height(Length::Shrink);
 
         let toast = self.toast.clone().unwrap_or_default();
-        let toast_el: Element<Message> = if !toast.is_empty() {
-            text(toast)
-                .size(11)
-                .color(crate::ui_style::palette::SUCCESS)
-                .into()
-        } else if let Some(err) = self.toast_error.clone() {
-            text(err)
-                .size(11)
-                .color(crate::ui_style::palette::ERROR)
-                .into()
+        let toast_text: Option<Element<Message>> = if !toast.is_empty() {
+            Some(
+                text(toast)
+                    .size(11)
+                    .color(crate::ui_style::palette::SUCCESS)
+                    .into(),
+            )
         } else {
-            text("").size(11).into()
+            self.toast_error.clone().map(|err| {
+                text(err)
+                    .size(11)
+                    .color(crate::ui_style::palette::ERROR)
+                    .into()
+            })
         };
-        let input = column![editor, chips, toolbar, toast_el,]
+        // 无提示时**不插入**提示行:空文本仍占一行(11px 行高),会在
+        // 输入区底部留下一条多余空白带(issue:主界面底部空余高度)。
+        let mut input = column![editor, chips, toolbar]
             .spacing(design::SPACING_XS)
             .padding(Padding::new(10.0))
             .height(Length::Shrink);
+        if let Some(toast_el) = toast_text {
+            input = input.push(toast_el);
+        }
+        let input = input;
         let base: Element<'_, Message> = container(input)
             .width(Length::Fill)
             .height(Length::Shrink)
             .style(design::composer_style)
             .into();
         if self.model_sel.picker_open && !enabled.is_empty() {
-            let picker_width = (self.window_size.0 - 300.0).clamp(240.0, 430.0);
+            let picker_width = (self.window_size.0 - 300.0).clamp(220.0, 320.0);
             let panel: Element<'_, Message> = container(picker)
                 .padding(8)
                 .width(Length::Fixed(picker_width + 16.0))
@@ -4519,14 +5039,7 @@ impl App {
     fn view_history(&self) -> Element<'_, Message> {
         let mut col = column![].spacing(design::SPACING_XS).padding(6);
 
-        col = col.push(
-            row![
-                button(text(i18n::t("conversation.new_button")).size(12))
-                    .on_press(Message::NewConversation),
-                Space::new().width(Length::Fill),
-            ]
-            .spacing(design::SPACING_XS),
-        );
+        // 搜索框置顶
         col = col.push(
             text_input(
                 i18n::t("conversation.search_placeholder"),
@@ -4535,6 +5048,19 @@ impl App {
             .on_input(Message::ConvSearchChanged)
             .size(13)
             .style(design::text_input_style),
+        );
+        // 新建会话(icon + 文本;整行可点)
+        col = col.push(
+            button(
+                row![
+                    icons::icon("plus"),
+                    text(i18n::t("conversation.new_button")).size(12)
+                ]
+                .spacing(design::SPACING_XS),
+            )
+            .on_press(Message::NewConversation)
+            .width(Length::Fill)
+            .style(design::quiet_button),
         );
 
         #[allow(clippy::redundant_closure)]
@@ -4587,45 +5113,68 @@ impl App {
                     c.title.clone()
                 };
                 let label = text(title).size(13);
+                // 悬停或选中时显示 rename / delete(图标在行尾)
+                let show_actions = self.hovered_conv == Some(c.id) || is_current;
+                let mut actions = row![].spacing(2).align_y(iced::Alignment::Center);
+                if show_actions {
+                    actions = actions.push(tooltip(
+                        button(icons::icon("edit")).on_press(Message::RenameStart(c.id)),
+                        text(i18n::t("conversation.rename")).size(12),
+                        iced::widget::tooltip::Position::Left,
+                    ));
+                    actions = actions.push(tooltip(
+                        button(icons::icon("trash"))
+                            .on_press(Message::DeleteConversation(c.id))
+                            .style(design::danger_button),
+                        text(i18n::t("conversation.delete")).size(12),
+                        iced::widget::tooltip::Position::Left,
+                    ));
+                }
                 let item = row![
                     button(row![icons::icon("folder"), label].spacing(6))
                         .on_press(Message::SelectConversation(c.id))
+                        .width(Length::Fill)
                         .style(if is_current {
                             design::active_button
                         } else {
                             design::quiet_button
                         }),
-                    Space::new().width(Length::Fill),
-                    tooltip(
-                        button(icons::icon("edit")).on_press(Message::RenameStart(c.id)),
-                        text(i18n::t("title.edit_tooltip")).size(12),
-                        iced::widget::tooltip::Position::Left,
-                    ),
+                    actions,
                 ]
                 .spacing(2)
                 .padding(1);
+                // 悬停检测:进入/离开时更新状态
+                let item = mouse_area(item)
+                    .on_enter(Message::HoverConversation(Some(c.id)))
+                    .on_exit(Message::HoverConversation(None));
                 col = col.push(item);
             }
         }
 
-        // 分组管理
+        // 分组管理:点按按钮才展开输入框
         col = col.push(Space::new().width(Length::Fill));
         col = col.push(
-            text(i18n::t("group.new"))
-                .size(12)
-                .color(crate::ui_style::palette::TEXT_MUTED),
+            button(
+                row![icons::icon("plus"), text(i18n::t("group.new")).size(12)]
+                    .spacing(design::SPACING_XS),
+            )
+            .on_press(Message::ToggleNewGroupForm)
+            .width(Length::Fill)
+            .style(design::quiet_button),
         );
-        col = col.push(
-            row![
-                text_input(i18n::t("group.new_placeholder"), &self.new_group_name)
-                    .on_input(Message::NewGroupInput)
-                    .on_submit(Message::NewGroupApply)
-                    .size(13)
-                    .style(design::text_input_style),
-                button(text(i18n::t("group.create")).size(12)).on_press(Message::NewGroupApply),
-            ]
-            .spacing(design::SPACING_XS),
-        );
+        if self.new_group_form_open {
+            col = col.push(
+                row![
+                    text_input(i18n::t("group.new_placeholder"), &self.new_group_name)
+                        .on_input(Message::NewGroupInput)
+                        .on_submit(Message::NewGroupApply)
+                        .size(13)
+                        .style(design::text_input_style),
+                    button(text(i18n::t("group.create")).size(12)).on_press(Message::NewGroupApply),
+                ]
+                .spacing(design::SPACING_XS),
+            );
+        }
 
         if let Some((group_id, buf)) = &self.renaming_group {
             let group_id = *group_id;
@@ -4673,11 +5222,6 @@ impl App {
                 );
             }
             col = col.push(move_row);
-            col = col.push(
-                button(text(i18n::t("conversation.delete")).size(11))
-                    .on_press(Message::DeleteConversation(current))
-                    .style(design::danger_button),
-            );
         }
 
         scrollable(col)
@@ -5029,6 +5573,30 @@ fn ellipsize(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// 标签条上的状态图标(生成中/失败/完成)。
+fn answer_status_icon(item: &answers::AnswerItem) -> &'static str {
+    match item.status {
+        Some(GenerationStatus::Failed)
+        | Some(GenerationStatus::Cancelled)
+        | Some(GenerationStatus::Interrupted) => "x",
+        _ => "dot",
+    }
+}
+
+/// 标签条上的状态颜色。
+fn answer_status_color(item: &answers::AnswerItem) -> iced::Color {
+    use crate::ui_style::palette;
+    match item.status {
+        Some(
+            GenerationStatus::Queued | GenerationStatus::Connecting | GenerationStatus::Streaming,
+        ) => palette::WARNING,
+        Some(GenerationStatus::Failed)
+        | Some(GenerationStatus::Cancelled)
+        | Some(GenerationStatus::Interrupted) => palette::ERROR,
+        _ => palette::TEXT_MUTED,
+    }
+}
+
 /// 附件大小标签(字节 → B/KB)。
 fn size_label(bytes: usize) -> String {
     if bytes < 1024 {
@@ -5115,6 +5683,7 @@ async fn pick_attachments() -> PickedAttachments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::{mouse, Event, Point, Rectangle};
 
     fn set(models: &[&str]) -> Vec<String> {
         models.iter().map(|m| m.to_string()).collect()
@@ -5205,6 +5774,643 @@ mod tests {
         assert!(ellipsize("abcdef", 3).ends_with('…'));
         assert_eq!(size_label(512), "512 B");
         assert_eq!(size_label(2048), "2.0 KB");
+    }
+
+    /// 串行化“启动应用态”的测试:数据目录经环境变量传入(进程内全局),
+    /// 并行跑会互相覆盖目录并导致偶发失败。
+    static BOOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 构造“1 问 + N 答”的内存态(不触碰真实数据目录)。
+    fn parallel_app(tag: &str, bodies: &[String]) -> (App, MessageId, Vec<MessageId>) {
+        parallel_app_with_question(tag, "问题", bodies)
+    }
+
+    /// 同 [`parallel_app`],但可指定提问正文(用于折叠态回归)。
+    fn parallel_app_with_question(
+        tag: &str,
+        question: &str,
+        bodies: &[String],
+    ) -> (App, MessageId, Vec<MessageId>) {
+        // 数据目录是进程级环境变量:串行化,避免并行测试互相覆盖
+        let _guard = BOOT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("aicouncil-answer-group-{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("临时数据目录");
+        std::env::set_var("AICOUNCIL_DATA_DIR", &dir);
+
+        let (mut app, _task) = App::boot();
+        let conv_id = ConversationId::new();
+        let provider_id = crate::domain::ProviderId::from_uuid_str(OPENROUTER_ID);
+        let now = chrono::Utc::now();
+        let mut conv = Conversation::new(conv_id, now);
+        conv.title = "test".to_string();
+
+        let user_id = MessageId::new();
+        let mut messages = vec![crate::domain::Message {
+            id: user_id,
+            conversation_id: conv_id,
+            parent_id: None,
+            role: Role::User,
+            content: question.to_string(),
+            attachments: Vec::new(),
+            created_at: now,
+        }];
+        let mut generations = Vec::new();
+        let mut assistants = Vec::new();
+        for (i, body) in bodies.iter().enumerate() {
+            let asst = MessageId::new();
+            assistants.push(asst);
+            messages.push(crate::domain::Message {
+                id: asst,
+                conversation_id: conv_id,
+                parent_id: Some(user_id),
+                role: Role::Assistant,
+                content: body.clone(),
+                attachments: Vec::new(),
+                created_at: now + chrono::Duration::milliseconds(i as i64 + 1),
+            });
+            generations.push(Generation {
+                request_id: GenerationId::new(),
+                batch_id: crate::domain::BatchId::new(),
+                user_message_id: user_id,
+                assistant_message_id: asst,
+                provider_id,
+                model_id: format!("vendor/model-{i}"),
+                status: GenerationStatus::Completed,
+                params: None,
+                system_prompt: None,
+                context_snapshot: Vec::new(),
+                price_snapshot: None,
+                remote_generation_id: None,
+                error: None,
+                retry_of: None,
+                retry_root_id: None,
+                failure: None,
+                request_snapshot: None,
+                retry_not_before_ms: None,
+                dispatch_phase: crate::domain::DispatchPhase::NotDispatched,
+                started_at: Some(now),
+                finished_at: Some(now),
+            });
+        }
+        conv.main_leaf_id = Some(assistants[0]);
+        let (tree, orphans) = MessageTree::from_messages(messages);
+        assert_eq!(orphans, 0);
+        app.conversations = vec![conv];
+        app.trees.insert(conv_id, tree);
+        app.generations.insert(conv_id, generations);
+        app.current = Some(conv_id);
+        let style = app.style;
+        app.rerender_message(user_id, &style);
+        for id in &assistants {
+            app.rerender_message(*id, &style);
+        }
+        (app, user_id, assistants)
+    }
+
+    /// 布局消息区并返回“并行回答组”的边界(标签条 + 面板)。
+    fn layout_answer_group(app: &App, width: f32) -> (f32, f32) {
+        use iced::advanced::{layout, widget::Tree, Layout};
+        use iced::{Font, Pixels, Size};
+
+        let mut element = app.view_messages();
+        let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 4000.0)),
+        );
+        let root = Layout::new(&node);
+        // 结构:scrollable > 消息列 > [问题卡, 回答组]
+        let column = root
+            .children()
+            .next()
+            .and_then(|c| c.children().next())
+            .and_then(|c| c.children().next())
+            .expect("消息列");
+        let group = column.children().nth(1).expect("回答组");
+        let b = group.bounds();
+        (b.height, b.width)
+    }
+
+    #[test]
+    fn answer_group_height_is_stable_across_tabs() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let short = "短回答。".to_string();
+            let long = "长回答。".repeat(400);
+            let (mut app, _user, assistants) = parallel_app(
+                "stable",
+                &[short.clone(), long.clone(), short.clone(), long.clone()],
+            );
+
+            let (h1, _) = layout_answer_group(&app, 1200.0);
+            // 切到另一个标签:面板高度固定 → 整组高度不变
+            app.answer_views.insert(
+                assistants[0],
+                answers::AnswerView {
+                    mode: answers::LayoutMode::Solo,
+                    active: vec![assistants[0]],
+                },
+            );
+            let (h2, _) = layout_answer_group(&app, 1200.0);
+            app.answer_views.insert(
+                assistants[0],
+                answers::AnswerView {
+                    mode: answers::LayoutMode::Solo,
+                    active: vec![assistants[1]],
+                },
+            );
+            let (h3, _) = layout_answer_group(&app, 1200.0);
+            assert!(
+                (h1 - h2).abs() < 0.5 && (h2 - h3).abs() < 0.5,
+                "切换标签不应改变回答组高度:{h1} / {h2} / {h3}"
+            );
+            assert!(h1 > 100.0, "回答组应有可见高度:{h1}");
+        });
+    }
+
+    #[test]
+    fn answer_group_renders_every_answer_as_a_tab() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let body = "回答正文。".to_string();
+            let (app, user, _assistants) = parallel_app(
+                "tabs",
+                &[body.clone(), body.clone(), body.clone(), body.clone()],
+            );
+            // 四个回答 → 四个标签(都在回答集合里,不会因为“没内容”而消失)
+            let items = app.answer_items(user);
+            let ids = app.answer_visible_ids(user);
+            assert_eq!(items.len(), 4);
+            assert_eq!(ids.len(), 4);
+            // 单栏默认显示第一个;切到对比模式显示两个
+            let view = answers::AnswerView::default();
+            assert_eq!(view.visible_answers(&ids), vec![ids[0]]);
+            let mut split = answers::AnswerView::default();
+            split.toggle_split(&ids);
+            assert_eq!(split.visible_answers(&ids).len(), 2);
+        });
+    }
+
+    /// 标签条的边界(四个标签按钮)。
+    fn answer_tab_bounds(app: &App, width: f32) -> Vec<Rectangle> {
+        use iced::advanced::{layout, widget::Tree, Layout};
+        use iced::{Font, Pixels, Size};
+
+        let mut element = app.view_messages();
+        let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 4000.0)),
+        );
+        let root = Layout::new(&node);
+        // 结构:scrollable > 消息列 > [问题卡, 回答组]
+        let column = root
+            .children()
+            .next()
+            .and_then(|c| c.children().next())
+            .and_then(|c| c.children().next())
+            .expect("消息列");
+        let group = column.children().nth(1).expect("回答组");
+        // 回答组:容器 > [标签条行, 面板行]
+        let header = group.child(0).child(0);
+        // 标签条行: [横向滚动条, 对比开关]
+        let strip = header.child(0).child(0);
+        strip.children().map(|c| c.bounds()).collect()
+    }
+
+    /// 回归:四个回答标签的光标形态必须一致(手型)。
+    ///
+    /// 之前折叠的问题卡片会把正文溢出到回答组上方,溢出的正文
+    /// (`Interaction::Text`,序数高于 `Pointer`)抢走了光标形态,
+    /// 于是被覆盖的标签(如 Grok)显示文本插入光标,其它标签正常。
+    /// 命中必须与绘制一致:被裁剪掉的正文不参与命中。
+    #[test]
+    fn answer_tabs_always_report_pointer_cursor() {
+        use iced::advanced::{layout, widget::Tree, Layout};
+        use iced::{Font, Pixels, Size};
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            // 足够长 → 折叠态正文远高于 140px 的裁剪窗口。
+            let question = "继续全情投入,很容易变成用阅读和分镜代替设计。".repeat(200);
+            let (mut app, _user, _assistants) = parallel_app_with_question(
+                "cursor",
+                &question,
+                &[
+                    "回答正文。".repeat(40),
+                    "短回答。".to_string(),
+                    "回答正文。".repeat(40),
+                    "短回答。".to_string(),
+                ],
+            );
+            fixture_models(&mut app);
+            let tabs = answer_tab_bounds(&app, 1200.0);
+            assert_eq!(tabs.len(), 4, "四个回答 → 四个标签");
+
+            let mut element = app.view_messages();
+            let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1200.0, 4000.0)),
+            );
+            let root = Layout::new(&node);
+            let viewport = Rectangle::new(Point::new(0.0, 0.0), Size::new(1200.0, 4000.0));
+            for (i, tab) in tabs.iter().enumerate() {
+                let center = tab.center();
+                let interaction = element.as_widget().mouse_interaction(
+                    &tree,
+                    root,
+                    mouse::Cursor::Available(center),
+                    &viewport,
+                    &renderer,
+                );
+                assert_eq!(
+                    interaction,
+                    mouse::Interaction::Pointer,
+                    "标签 {i} 的光标形态应为手型,实际 {interaction:?}(位置 {center:?})"
+                );
+            }
+        });
+    }
+
+    /// 回归:折叠态问题卡片被裁掉的正文不得越界参与命中。
+    ///
+    /// 裁剪只作用于绘制(`container(...).clip(true)`),命中判定若不
+    /// 受同一矩形约束,隐藏正文会伸到卡片之外(回答标签条上方),
+    /// 抢走光标形态并吃掉点击。
+    #[test]
+    fn collapsed_body_does_not_hit_outside_its_clip() {
+        use iced::advanced::{layout, widget::Tree, Layout};
+        use iced::{Font, Pixels, Size};
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let question = "继续全情投入,很容易变成用阅读和分镜代替设计。".repeat(200);
+            let (app, user, _assistants) =
+                parallel_app_with_question("clip", &question, &["回答正文。".to_string()]);
+            let mut card = app.view_message_card(user, CardHeader::Full);
+            let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+            let mut tree = Tree::new(&card);
+            let node = card.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(1200.0, 4000.0)),
+            );
+            let root = Layout::new(&node);
+            let viewport = Rectangle::new(Point::new(0.0, 0.0), Size::new(1200.0, 4000.0));
+            let bounds = root.bounds();
+            // 卡片底部之下(隐藏正文所在的区域)不应有任何命中。
+            for dy in [
+                bounds.height + 10.0,
+                bounds.height + 120.0,
+                bounds.height + 400.0,
+            ] {
+                let p = Point::new(600.0, dy);
+                let interaction = card.as_widget().mouse_interaction(
+                    &tree,
+                    root,
+                    mouse::Cursor::Available(p),
+                    &viewport,
+                    &renderer,
+                );
+                assert_eq!(
+                    interaction,
+                    mouse::Interaction::None,
+                    "折叠正文不得在裁剪区外命中({p:?} → {interaction:?})"
+                );
+            }
+        });
+    }
+
+    /// 回归:打开/关闭模型选择弹窗不得让主会话滚动位置跳回顶部。
+    ///
+    /// 根因:iced 的 `Tree::diff` 在标签不同(Column ↔ Stack)时整棵子树
+    /// 重建,滚动条的 offset 存在 `tree.state` 里,随子树一起丢失。
+    /// 修法:主区根节点恒为 Stack(第 0 层永远是 base 列)。
+    fn fixture_models(app: &mut App) {
+        app.catalog.clear();
+        app.prefs.clear();
+        for (i, name) in [
+            "GPT 6 Astra",
+            "Gemini 4 Argon",
+            "Claude Opus 5.5",
+            "Grok 4.7",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let model_id = format!("vendor/model-{i}");
+            app.catalog.push(CatalogEntry {
+                model_id: model_id.clone(),
+                name: (*name).into(),
+                context_window: None,
+                max_output: None,
+                pricing: Default::default(),
+                capabilities: vec![],
+                server_defaults: None,
+                available: true,
+            });
+            let preference = app.prefs.entry(model_id).or_default();
+            preference.enabled = true;
+            preference.sort_order = i as i64;
+        }
+        app.model_sel.primary = Some("vendor/model-0".into());
+    }
+
+    fn screenshot_fixture(app: &App, tree: &mut iced::advanced::widget::Tree, name: &str) {
+        use iced::advanced::{
+            layout,
+            renderer::{Headless, Renderer as _},
+            Layout,
+        };
+        use iced::{Font, Pixels, Size};
+        let Some(directory) = std::env::var_os("AICOUNCIL_UI_SCREENSHOTS") else {
+            return;
+        };
+        let size = Size::new(app.window_size.0, app.window_size.1);
+        let mut renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+        let mut element = app.view_main();
+        tree.diff(&element);
+        let node =
+            element
+                .as_widget_mut()
+                .layout(tree, &renderer, &layout::Limits::new(Size::ZERO, size));
+        let viewport = Rectangle::with_size(size);
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            tree,
+            &mut renderer,
+            &design::theme(),
+            &iced::advanced::renderer::Style {
+                text_color: crate::ui_style::palette::TEXT,
+            },
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let physical = Size::new((size.width * 1.5) as u32, (size.height * 1.5) as u32);
+        let pixels = renderer.screenshot(physical, 1.5, crate::ui_style::palette::SURFACE);
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = std::fs::File::create(directory.join(format!("{name}.png"))).unwrap();
+        let mut encoder = png::Encoder::new(file, physical.width, physical.height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&pixels)
+            .unwrap();
+    }
+
+    #[test]
+    fn picker_toggle_keeps_main_scroll_offset() {
+        use iced::advanced::{
+            layout,
+            widget::{
+                operation::scrollable::{self, Scrollable},
+                Operation, Tree,
+            },
+            Layout,
+        };
+        use iced::{Font, Pixels, Size, Vector};
+        #[derive(Default)]
+        struct Offsets(HashMap<iced::widget::Id, f32>);
+        impl Operation for Offsets {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&iced::widget::Id>,
+                _: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn Scrollable,
+            ) {
+                if let Some(id) = id {
+                    self.0.insert(id.clone(), translation.y);
+                }
+            }
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (mut app, _, _) = parallel_app_with_question(
+                "scroll",
+                &"继续全情投入，游戏先是决策与反馈。".repeat(100),
+                &["回答正文。\n\n".repeat(100), "另一个回答。\n\n".repeat(100)],
+            );
+            fixture_models(&mut app);
+            app.window_size = (1200.0, 500.0);
+            app.model_sel.picker_open = false;
+            let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+            let limits = layout::Limits::new(Size::ZERO, Size::new(1200.0, 500.0));
+            let targets = [
+                (iced::widget::Id::new(MESSAGES_ID), 80.0),
+                (App::answer_pane_id(0), 120.0),
+            ];
+            let mut element = app.view_main();
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            for (id, y) in &targets {
+                let mut operation = scrollable::scroll_to::<()>(
+                    id.clone(),
+                    scrollable::AbsoluteOffset {
+                        x: Some(0.0),
+                        y: Some(*y),
+                    },
+                );
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut operation,
+                );
+            }
+            let mut before = Offsets::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut before);
+            for (id, expected) in &targets {
+                assert_eq!(
+                    before.0.get(id),
+                    Some(expected),
+                    "fixture must establish a nonzero offset"
+                );
+            }
+            drop(element);
+            screenshot_fixture(&app, &mut tree, "scroll-before");
+            for (open, name) in [(true, "scroll-open"), (false, "scroll-after")] {
+                app.model_sel.picker_open = open;
+                assert_eq!(
+                    app.view_input().1.is_some(),
+                    open,
+                    "fixture must render the real popup"
+                );
+                let mut element = app.view_main();
+                tree.diff(&element);
+                let node = element
+                    .as_widget_mut()
+                    .layout(&mut tree, &renderer, &limits);
+                let mut after = Offsets::default();
+                element.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut after,
+                );
+                for (id, expected) in &targets {
+                    assert_eq!(
+                        after.0.get(id),
+                        Some(expected),
+                        "popup {open}: scroll state changed for {id:?}"
+                    );
+                }
+                drop(element);
+                screenshot_fixture(&app, &mut tree, name);
+            }
+        });
+    }
+
+    #[test]
+    fn clipped_selection_receives_release_outside() {
+        use iced::advanced::{layout, widget::Tree, Layout};
+        use iced::{Font, Pixels, Size};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (app, user, _) = parallel_app_with_question(
+                "selection-release",
+                &"继续全情投入，决策与反馈。".repeat(100),
+                &["回答".into()],
+            );
+            let mut card = app.view_message_card(user, CardHeader::Full);
+            let renderer = iced::Renderer::new(Font::DEFAULT, Pixels(app.style.body));
+            let mut tree = Tree::new(&card);
+            let node = card.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(900.0, 1000.0)),
+            );
+            let viewport = Rectangle::with_size(Size::new(900.0, 1000.0));
+            let outside = Point::new(600.0, node.bounds().height + 120.0);
+            let mut messages = vec![];
+            for (event, position) in [
+                (
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    Point::new(600.0, 70.0),
+                ),
+                (mouse::Event::ButtonReleased(mouse::Button::Left), outside),
+            ] {
+                card.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    mouse::Cursor::Available(position),
+                    &renderer,
+                    &mut iced::advanced::clipboard::Null,
+                    &mut iced::advanced::Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| matches!(message, Message::SelStart(..))),
+                "press must start a real selection"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| matches!(message, Message::SelFinish)),
+                "release outside must end selection"
+            );
+            messages.clear();
+            card.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Layout::new(&node),
+                mouse::Cursor::Available(outside),
+                &renderer,
+                &mut iced::advanced::clipboard::Null,
+                &mut iced::advanced::Shell::new(&mut messages),
+                &viewport,
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::SelStart(..))),
+                "hidden text cannot start selection"
+            );
+        });
+    }
+
+    #[test]
+    fn ui_acceptance_screenshots() {
+        if std::env::var_os("AICOUNCIL_UI_SCREENSHOTS").is_none() {
+            return;
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let body = "继续全情投入，很容易变成用阅读和分镜代替设计。\n\n游戏先是决策与反馈，然后才是寓意。\n\n正常正文：情 馈 懂 赢。\n\n**粗体强调：情 馈 懂 赢。**".to_string();
+            let (mut app, _, assistants) = parallel_app_with_question("ui-acceptance",
+                "比较四个模型的回答，检查中文正文、标签和操作按钮。", &[body.clone(), body.clone(), body.clone(), body]);
+            fixture_models(&mut app);
+            app.window_size = (1200.0, 780.0);
+            app.answer_views.clear();
+            let mut tree = iced::advanced::widget::Tree::empty();
+            screenshot_fixture(&app, &mut tree, "ui-main");
+            let _ = app.select_answer(assistants[3]);
+            screenshot_fixture(&app, &mut tree, "ui-grok");
+            app.model_sel.picker_open = true;
+            screenshot_fixture(&app, &mut tree, "ui-picker-open");
+            app.model_sel.picker_open = false;
+            screenshot_fixture(&app, &mut tree, "ui-picker-closed");
+        });
+    }
+
+    /// 回归:并行回答不在主路径上,没有渲染缓存就会退化成纯文本
+    /// (卡片显示 Markdown 源码而不是渲染结果)。
+    #[test]
+    fn parallel_answers_always_get_a_render_cache_entry() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let body = "**粗体**与 `代码` 的回答。".to_string();
+            let (mut app, user, assistants) = parallel_app(
+                "renders",
+                &[body.clone(), body.clone(), body.clone(), body.clone()],
+            );
+            // 模拟冷启动:渲染缓存为空(只剩主路径)
+            app.renders.clear();
+            app.rerender_visible();
+            app.renders.clear();
+            // 补齐后:每个回答都有渲染产物
+            app.ensure_renders_current();
+            for id in &assistants {
+                let rendered = app
+                    .renders
+                    .get(id)
+                    .unwrap_or_else(|| panic!("回答 {id} 缺少渲染缓存"));
+                assert!(
+                    !rendered.doc.blocks.is_empty(),
+                    "回答 {id} 的渲染产物不应为空"
+                );
+            }
+            // 可见消息集合也包含这些回答
+            let visible = app.visible_message_ids();
+            for id in &assistants {
+                assert!(visible.contains(id), "回答 {id} 应在可见集合里");
+            }
+            let _ = user;
+        });
     }
 
     #[test]

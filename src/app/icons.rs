@@ -44,14 +44,30 @@ pub fn icon_with_color(name: &'static str, color: iced::Color) -> svg::Svg<'stat
         "edit" => "<path d='M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z'/>",
         "trash" => "<path d='M3 6h18M8 6V4h8v2m3 0-1 14H6L5 6m5 4v6m4-6v6'/>",
         "star" => "<path d='m12 2 3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2Z'/>",
+        "plus" => "<path d='M12 5v14M5 12h14'/>",
+        "compare" => "<rect x='3' y='4' width='7' height='16' rx='1'/><rect x='14' y='4' width='7' height='16' rx='1'/>",
+        "caret" => "<path d='M7 10.5 12 15.5 17 10.5Z'/>",
+        // 展开态:三角朝上(与“收起”方向一致)。
+        "caret_up" => "<path d='M7 13.5 12 8.5 17 13.5Z'/>",
+        "dot" => "<circle cx='12' cy='12' r='4'/>",
         "blank" => "",
         _ => "<circle cx='12' cy='12' r='8'/>",
     };
+    // 实心小三角 / 圆点:填充而非描边。
+    let filled = matches!(name, "caret" | "caret_up" | "dot");
+    let (fill, stroke) = if filled {
+        (stroke_color(color), "none".to_string())
+    } else {
+        ("none".to_string(), stroke_color(color))
+    };
     let data = format!(
-        "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='{}' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'>{paths}</svg>",
-        stroke_color(color)
+        "<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='{fill}' stroke='{stroke}' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'>{paths}</svg>"
     );
-    svg::Svg::new(Handle::from_memory(data.into_bytes()))
-        .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0))
+    let svg = svg::Svg::new(Handle::from_memory(data.into_bytes()));
+    match name {
+        // 小三角更紧凑(常见下拉指示尺寸)。
+        "caret" => svg.width(Length::Fixed(11.0)).height(Length::Fixed(11.0)),
+        "dot" => svg.width(Length::Fixed(9.0)).height(Length::Fixed(9.0)),
+        _ => svg.width(Length::Fixed(16.0)).height(Length::Fixed(16.0)),
+    }
 }

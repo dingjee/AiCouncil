@@ -526,12 +526,23 @@ async fn a08_dispatch_level_recheck_rejects_after_queue_expiry() {
     svc.submit(plan2).await.unwrap();
     guard.set(EgressVerdict::Blocked(obs("CN"))).await;
 
-    // 等待两个终态
+    // reject_late writes generation and usage in separate blocking tasks.
+    // Wait for both results before asserting the accounting contract.
     assert!(
         common::wait_for(
             || {
                 let gs = db.generations_of(conv).unwrap();
-                gs.len() == 2 && gs.iter().all(|g| g.status.is_terminal())
+                gs.len() == 2
+                    && gs.iter().all(|g| g.status.is_terminal())
+                    && gs
+                        .iter()
+                        .find(|g| g.model_id == "anthropic/claude-fable-5.1")
+                        .is_some_and(|rejected| {
+                            db.usage_of(conv).unwrap().iter().any(|usage| {
+                                usage.request_id == rejected.request_id
+                                    && usage.status == aicouncil::domain::UsageStatus::Unavailable
+                            })
+                        })
             },
             12000
         )

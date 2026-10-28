@@ -2,8 +2,10 @@ import { useEffect } from "react";
 
 import { t } from "./i18n/strings";
 import { Composer } from "./components/Composer";
+import { EgressModal } from "./components/EgressModal";
 import { Icon } from "./components/Icon";
 import { MessageThread } from "./components/MessageThread";
+import { Modal } from "./components/Modal";
 import { ModelsPanel } from "./components/ModelsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar } from "./components/Sidebar";
@@ -29,8 +31,8 @@ export function App() {
 
   if (state.status === "booting") {
     return (
-      <div className="app" data-sidebar="expanded">
-        <div className="empty" style={{ gridColumn: "1 / -1" }}>
+      <div className="app" data-sidebar="expanded" data-testid="app">
+        <div className="empty">
           <div className="empty__title">AiCouncil</div>
           <p>Loading…</p>
         </div>
@@ -40,8 +42,8 @@ export function App() {
 
   if (state.status === "error") {
     return (
-      <div className="app" data-sidebar="expanded">
-        <div className="empty" style={{ gridColumn: "1 / -1" }}>
+      <div className="app" data-sidebar="expanded" data-testid="app">
+        <div className="empty">
           <div className="empty__title">{t("dialog.db.title")}</div>
           <p>{state.bootError}</p>
           <button type="button" className="btn btn--accent" onClick={() => void actions.bootstrap()}>
@@ -57,7 +59,11 @@ export function App() {
   );
 
   return (
-    <div className="app" data-sidebar={state.sidebarCollapsed ? "collapsed" : "expanded"}>
+    <div
+      className="app"
+      data-sidebar={state.sidebarCollapsed ? "collapsed" : "expanded"}
+      data-testid="app"
+    >
       {state.sidebarCollapsed ? null : (
         <>
           <Sidebar />
@@ -65,7 +71,7 @@ export function App() {
         </>
       )}
 
-      <main className="main">
+      <main className="main" data-testid="main">
         <header className="main__header">
           {state.sidebarCollapsed ? (
             <button
@@ -86,14 +92,13 @@ export function App() {
             <span className="main__subtitle">{t("title.auto_failed_hint")}</span>
           ) : null}
 
-          <div style={{ marginLeft: "auto", display: "flex", gap: "var(--space-xs)" }}>
+          <div className="main__toolbar">
             <button
               type="button"
               className="btn"
-              aria-current={state.panel === "models"}
-              onClick={() =>
-                actions.setPanel(state.panel === "models" ? "history" : "models")
-              }
+              aria-haspopup="dialog"
+              aria-expanded={state.modal === "models"}
+              onClick={() => actions.openModal("models")}
             >
               <Icon name="models" size={14} />
               {t("panel.models")}
@@ -101,10 +106,9 @@ export function App() {
             <button
               type="button"
               className="btn"
-              aria-current={state.panel === "settings"}
-              onClick={() =>
-                actions.setPanel(state.panel === "settings" ? "history" : "settings")
-              }
+              aria-haspopup="dialog"
+              aria-expanded={state.modal === "settings"}
+              onClick={() => actions.openModal("settings")}
             >
               <Icon name="settings" size={14} />
               {t("panel.settings")}
@@ -119,17 +123,27 @@ export function App() {
         <Composer />
       </main>
 
-      {state.panel === "models" ? (
-        <aside className="right-panel" aria-label={t("panel.models")}>
+      {state.modal === "models" ? (
+        <Modal
+          title={t("modal.models_title")}
+          testId="modal-models"
+          onClose={() => actions.closeModal()}
+        >
           <ModelsPanel />
-        </aside>
+        </Modal>
       ) : null}
 
-      {state.panel === "settings" ? (
-        <aside className="right-panel" aria-label={t("panel.settings")}>
+      {state.modal === "settings" ? (
+        <Modal
+          title={t("modal.settings_title")}
+          testId="modal-settings"
+          onClose={() => actions.closeModal()}
+        >
           <SettingsPanel />
-        </aside>
+        </Modal>
       ) : null}
+
+      <EgressModal />
 
       {state.toast ? (
         <div

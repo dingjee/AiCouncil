@@ -75,10 +75,7 @@ export function ModelsPanel() {
 
   return (
     <div className="panel-section">
-      <div style={{ display: "flex", alignItems: "center", gap: "var(--space-s)" }}>
-        <h2 className="panel-section__title" style={{ margin: 0, flex: 1 }}>
-          {t("panel.models")}
-        </h2>
+      <div className="panel-section__row">
         <button
           type="button"
           className="btn"

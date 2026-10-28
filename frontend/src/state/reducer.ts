@@ -19,7 +19,7 @@ import type {
   Settings,
   UsageRecord,
 } from "../ipc/types";
-import { initialState, type AppState, type EgressModalState, type Panel, type ToastKind } from "./types";
+import { initialState, type AppState, type EgressModalState, type ModalKind, type ToastKind } from "./types";
 
 export type Action =
   | { type: "boot/started" }
@@ -95,7 +95,7 @@ export type Action =
   | { type: "edit/text"; text: string }
   | { type: "edit/attachments"; attachments: Message["attachments"] }
   | { type: "edit/cancel" }
-  | { type: "panel/set"; panel: Panel }
+  | { type: "modal/set"; modal: ModalKind | null }
   | { type: "sidebar/toggle"; collapsed?: boolean }
   | { type: "sidebar/width"; width: number }
   | { type: "conversation/search"; query: string }
@@ -388,8 +388,8 @@ export function reducer(state: AppState, action: Action): AppState {
     case "edit/cancel":
       return { ...state, editingLatest: null, editText: "", editAttachments: [] };
 
-    case "panel/set":
-      return { ...state, panel: action.panel };
+    case "modal/set":
+      return { ...state, modal: action.modal };
 
     case "sidebar/toggle":
       return {

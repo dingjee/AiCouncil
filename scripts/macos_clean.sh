@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GLM-F: cleanup of TASK-CREATED temp/cache/test artifacts only.
-# Inventory of record: docs/GLMF_STATUS.md. By default this prints what it
+# Inventory of record: docs/MACOS_ACCEPTANCE.md. By default this prints what it
 # WOULD remove (dry run); pass --apply to delete, --target to also remove
 # target/ (final cleanup step; never during active parallel work).
 #

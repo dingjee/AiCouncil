@@ -67,6 +67,75 @@
   --sidebar-width: 280px;
   --sidebar-min-width: 220px;
   --sidebar-max-width: 460px;
+
+  /*
+   * Follow the system appearance by default. The same token names are
+   * re-declared for dark mode below, so no duplicated persisted theme state
+   * and no remount is needed when the system switches while the app is open.
+   */
+  color-scheme: light dark;
+
+  /* Native form controls (checkbox, radio, selection) follow the palette. */
+  accent-color: var(--accent);
+}
+
+/* -------------------------------------------------------- dark appearance */
+
+/*
+ * Dark counterpart of the Soft Sage palette. Lighter desaturated variants of
+ * the light accent/hover/selection keep the sage identity at readable
+ * contrast on the dark surfaces.
+ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #1d201d;
+    --surface: #252925;
+    --sidebar: #212521;
+    --composer: #222622;
+    --user-surface: #2a312b;
+    --text: #e4e8e2;
+    --text-muted: #9aa699;
+    --icon: #93a092;
+    --accent: #84b493;
+    --on-accent: #17211a;
+    --hover: #2d332d;
+    --selected: #354233;
+    --selection: #3d5244;
+    --line-subtle: #3a4039;
+    --line-interactive: #6e7f6e;
+    --focus: #8db698;
+    --link: #82b4ca;
+    --code-surface: #292e28;
+    --code-comment: #939f93;
+    --error: #e08a80;
+    --warning: #d3a869;
+    --success: #8bb88a;
+  }
+}
+
+::selection {
+  background: var(--selection);
+  color: var(--text);
+}
+
+/* Scrollbars follow the active surface/line tokens in both appearances. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--line-interactive);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 
 /* The inset is identical in the native shell and in the browser preview. */

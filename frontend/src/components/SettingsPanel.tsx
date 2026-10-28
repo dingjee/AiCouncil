@@ -32,8 +32,6 @@ export function SettingsPanel() {
 
   return (
     <div className="panel-section">
-      <h2 className="panel-section__title">{t("settings.title")}</h2>
-
       <section className="card">
         <h3 className="panel-section__title">{t("settings.provider_keys")}</h3>
         <p style={{ margin: "0 0 var(--space-s)" }}>

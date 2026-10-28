@@ -48,24 +48,31 @@ select {
 
 /* ------------------------------------------------------------------ layout */
 
+/*
+ * The shell is one explicit flex row: sidebar + resizer + main.
+ *
+ * There is no implicit grid column and no right-hand panel column: the
+ * main area is the only flexible child and it always fills the remaining
+ * space, no matter whether the sidebar is mounted or not.
+ */
 .app {
   position: relative;
-  display: grid;
-  grid-template-columns: auto 1fr auto;
+  display: flex;
+  align-items: stretch;
   height: 100%;
+  min-height: 0;
   overflow: hidden;
-}
-
-.app[data-sidebar="collapsed"] {
-  grid-template-columns: 0 1fr auto;
 }
 
 .sidebar {
   display: flex;
   flex-direction: column;
+  flex: 0 0 var(--sidebar-width);
   width: var(--sidebar-width);
   min-width: var(--sidebar-min-width);
   max-width: var(--sidebar-max-width);
+  height: 100%;
+  min-height: 0;
   background: var(--sidebar);
   border-right: 1px solid var(--line-subtle);
   overflow: hidden;
@@ -108,12 +115,14 @@ select {
 }
 
 .sidebar__list {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 0 var(--space-s) var(--space-l);
 }
 
 .sidebar__footer {
+  flex: none;
   border-top: 1px solid var(--line-subtle);
   padding: var(--space-s) var(--space-m);
   display: flex;
@@ -121,18 +130,29 @@ select {
   gap: var(--space-xs);
 }
 
+/*
+ * The chat column.
+ *
+ * `min-height: 0` on every level is what keeps the composer on screen: the
+ * thread may grow as much as it wants, the main area never grows past the
+ * window, and only the thread scrolls.
+ */
 .main {
   display: flex;
   flex-direction: column;
+  flex: 1 1 0%;
   min-width: 0;
+  min-height: 0;
   background: var(--canvas);
   position: relative;
+  overflow: hidden;
 }
 
 .main__header {
   display: flex;
   align-items: center;
   gap: var(--space-s);
+  flex: none;
   padding: var(--space-s) var(--space-l);
   border-bottom: 1px solid var(--line-subtle);
   background: var(--canvas);
@@ -142,6 +162,12 @@ select {
 
 .main__header > * {
   -webkit-app-region: no-drag;
+}
+
+.main__toolbar {
+  margin-left: auto;
+  display: flex;
+  gap: var(--space-xs);
 }
 
 .main__title {
@@ -159,40 +185,11 @@ select {
 }
 
 .main__body {
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
-}
-
-.right-panel {
-  width: 340px;
-  background: var(--sidebar);
-  border-left: 1px solid var(--line-subtle);
-  overflow-y: auto;
-  padding: var(--space-l);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-m);
-}
-
-@media (max-width: 1080px) {
-  .right-panel {
-    width: 300px;
-  }
-}
-
-@media (max-width: 860px) {
-  .app {
-    grid-template-columns: auto 1fr;
-  }
-  .right-panel {
-    position: absolute;
-    inset: 0 0 0 auto;
-    z-index: 20;
-    width: min(340px, 90vw);
-    box-shadow: -8px 0 24px rgb(0 0 0 / 12%);
-  }
 }
 
 /* ------------------------------------------------------------------ controls */
@@ -386,9 +383,11 @@ textarea.input {
 /* ------------------------------------------------------------------ messages */
 
 .thread {
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   padding: var(--space-l);
   display: flex;
   flex-direction: column;
@@ -407,23 +406,34 @@ textarea.input {
 .turn__question {
   align-self: flex-end;
   max-width: 80%;
+  display: flex;
+  flex-direction: column;
   background: var(--user-surface);
   border: 1px solid var(--line-subtle);
   border-radius: var(--radius-card);
   padding: var(--space-s) var(--space-m);
+}
+
+/*
+ * Only the **body** of a long question collapses. The footer with the
+ * Expand/Collapse button and the edit/delete controls stays visible, so
+ * the question can always be opened again.
+ */
+.turn__question-body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-.turn__question--collapsed {
+.turn__question-body[data-collapsed="true"] {
   max-height: 4.6em;
   overflow: hidden;
 }
 
-.turn__question-actions {
+.turn__question-footer {
   display: flex;
   gap: var(--space-xs);
   justify-content: flex-end;
+  flex: none;
   margin-top: var(--space-xs);
 }
 
@@ -519,9 +529,21 @@ textarea.input {
 }
 
 .card__actions {
-  margin-left: auto;
   display: flex;
   gap: var(--space-xs);
+}
+
+/*
+ * The answer actions follow the text: they are in the flow at the bottom
+ * of the card, aligned to the right, and never cover the answer.
+ */
+.card__footer {
+  display: flex;
+  justify-content: flex-end;
+  flex: none;
+  margin-top: var(--space-s);
+  padding-top: var(--space-xs);
+  border-top: 1px solid var(--line-subtle);
 }
 
 .card__error {
@@ -704,6 +726,7 @@ textarea.input {
 
 .composer {
   position: relative;
+  flex: none;
   border-top: 1px solid var(--line-subtle);
   background: var(--composer);
   padding: var(--space-m) var(--space-l);
@@ -891,6 +914,13 @@ textarea.input {
   gap: var(--space-s);
 }
 
+.panel-section__row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-s);
+}
+
 .panel-section__title {
   font-size: 0.8em;
   text-transform: uppercase;
@@ -932,6 +962,91 @@ textarea.input {
 }
 .status-dot[data-state="missing"] {
   background: var(--error);
+}
+
+/* ------------------------------------------------------------------ modals */
+
+/*
+ * Popups (Models, Settings).
+ *
+ * The layer is fixed and lives outside the app column, so a dialog can
+ * never shrink the chat. The body scrolls on its own; the dialog keeps
+ * sensible proportions in a 880x520 and in a 1150x680 window.
+ */
+.modal-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-l);
+}
+
+.modal-scrim {
+  position: absolute;
+  inset: 0;
+  background: rgb(46 52 47 / 28%);
+}
+
+.modal {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(560px, calc(100vw - 2 * var(--space-l)));
+  max-height: min(70vh, calc(100vh - 2 * var(--space-l)));
+  min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--line-interactive);
+  border-radius: var(--radius-card);
+  box-shadow: 0 18px 48px rgb(0 0 0 / 22%);
+  overflow: hidden;
+}
+
+.modal--wide {
+  width: min(680px, calc(100vw - 2 * var(--space-l)));
+}
+
+.modal:focus {
+  outline: none;
+}
+
+.modal__header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-s);
+  flex: none;
+  padding: var(--space-s) var(--space-m);
+  border-bottom: 1px solid var(--line-subtle);
+  background: var(--surface);
+}
+
+.modal__title {
+  margin: 0;
+  flex: 1;
+  font-size: 1em;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-m);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-m);
+}
+
+.modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-s);
+  flex-wrap: wrap;
 }
 
 /* ------------------------------------------------------------------ toast */

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # GLM-F: verify the final dist artifacts (.app bundle and raw exe).
-# STRICT: every expected artifact must exist and must claim version 0.2.0 —
+# STRICT: every expected artifact must exist and must claim version 0.2.1 —
 # missing artifacts are a FAIL, never a SKIP. Checks: version, arm64 arch,
 # codesign structure (ad-hoc expected; NOT notarization), obsolete GUI linkage.
 # Usage: scripts/macos_release_check.sh [--app PATH] [--exe PATH]
-#        [--skip-app] [--skip-exe] [--expected-version 0.2.0]
+#        [--skip-app] [--skip-exe] [--expected-version 0.2.1]
+#        [--frontend-manifest PATH]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,7 +13,8 @@ cd "$ROOT"
 
 APP="dist/AiCouncil.app"
 EXE="dist/aicouncil"
-EXPECTED_VERSION="0.2.0"
+EXPECTED_VERSION="0.2.1"
+MANIFEST="dist/frontend-embed.sha256"
 CHECK_APP=1
 CHECK_EXE=1
 while [[ $# -gt 0 ]]; do
@@ -22,6 +24,7 @@ while [[ $# -gt 0 ]]; do
         --skip-app) CHECK_APP=0; shift ;;
         --skip-exe) CHECK_EXE=0; shift ;;
         --expected-version) EXPECTED_VERSION="$2"; shift 2 ;;
+        --frontend-manifest) MANIFEST="$2"; shift 2 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
 done
@@ -85,6 +88,24 @@ if [[ "$CHECK_EXE" -eq 1 ]]; then
             die "release exe contains native smoke harness references ($SMOKE_HITS)"
         fi
         note "native smoke harness absent in release (AICOUNCIL_NATIVE_SMOKE refs: 0)"
+        # Embedded frontend identity: the exe must embed exactly the asset set
+        # recorded at frontend build time (vite content-hashed names; a
+        # mismatch means a stale binary relative to the final frontend).
+        # NB: no `strings | grep -q` pipes here — SIGPIPE under pipefail
+        # misreports matches (see macos_build.sh check_embed).
+        if [[ -f "$MANIFEST" ]]; then
+            EMBEDDED_NAMES="$(strings -a "$EXE")"
+            while IFS= read -r rel; do
+                [[ -z "$rel" || "$rel" == "." ]] && continue
+                grep -qF "$rel" <<<"$EMBEDDED_NAMES" \
+                    || die "exe does not embed frontend asset: $rel (stale binary?)"
+            done < <(cut -d' ' -f3- "$MANIFEST" | sed 's|^[[:space:]]*||; s|^\./||')
+            EMBEDDED_JS="$(grep -oE 'assets/index-[A-Za-z0-9_-]+\.js' <<<"$EMBEDDED_NAMES" | sort -u)"
+            note "embedded frontend manifest: $MANIFEST"
+            note "embedded JS bundle(s): ${EMBEDDED_JS:-<none>}"
+        else
+            die "frontend embed manifest missing: $MANIFEST (build with scripts/macos_build.sh)"
+        fi
     fi
 fi
 

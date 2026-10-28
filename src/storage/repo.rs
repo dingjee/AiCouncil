@@ -3,11 +3,13 @@
 //! 数据源边界(PLAN 3.1):配置文件保存提供方非敏感连接配置与通用设置;
 //! 数据库保存会话/偏好/目录缓存;系统凭据保存 Key。同一字段不双写。
 //!
-//! macOS 数据位置契约(0.2.0 起):
+//! macOS 数据位置契约(0.2.1 起):
 //! - `AICOUNCIL_DATA_DIR` 设置时:使用该目录(测试/验收隔离;不做旧数据导入)。
 //! - .app 包内运行(…/Foo.app/Contents/MacOS/exe):稳定目录
 //!   `~/Library/Application Support/AiCouncil`(与包位置无关,升级/搬家不变)。
 //!   首次启动从包同级 `data/`(如 `dist/data`)WAL 安全导入旧库与 config,
+//!   并在稳定目录尚无 `.env` 时原子、非覆盖地导入包同级 `data/.env`
+//!   (0600 权限)——捆绑交付的凭据因此与工作目录无关、路径确定。
 //!   不覆盖已有目标文件,幂等;绝不导入/解密 Windows DPAPI 凭据文件。
 //! - 非包内运行(cargo dev/test):exe 同级 `data/`(隔离于真实用户数据)。
 
@@ -157,7 +159,8 @@ pub fn env_file_candidates() -> std::io::Result<Vec<PathBuf>> {
 
 /// 首次启动旧数据导入(仅包内 macOS;隔离目录/AICOUNCIL_DATA_DIR 下不执行)。
 /// 来源:包同级 `data/`(PC 0.1.10 便携目录,如 `dist/data`)。
-/// 非覆盖、幂等;只导入 aicouncil.db 与 config.json;绝不触碰 credentials.dpapi。
+/// 非覆盖、幂等;只导入 aicouncil.db、config.json 与 `.env`(首次,0600);
+/// 绝不触碰 credentials.dpapi。
 #[doc(hidden)]
 pub fn import_legacy_data(exe: &Path, dest_dir: &Path) -> std::io::Result<()> {
     // 隔离由 `data_dir()` 调用点保证(AICOUNCIL_DATA_DIR 命中时根本不会走到
@@ -178,6 +181,9 @@ pub fn import_legacy_data(exe: &Path, dest_dir: &Path) -> std::io::Result<()> {
         import_database_snapshot(&src_db, &dest_db)?;
     }
     copy_if_absent(&src_dir.join("config.json"), &dest_dir.join("config.json"))?;
+    // 凭据交付修复(0.2.1):包同级 `data/.env` 在稳定目录无 `.env` 时
+    // 首次导入(原子、非覆盖、0600)。路径由包根推导,与 CWD 无关。
+    import_env_file(&src_dir.join(".env"), &dest_dir.join(".env"))?;
     Ok(())
 }
 
@@ -192,6 +198,44 @@ fn copy_if_absent(src: &Path, dest: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::rename(&tmp, dest)
+}
+
+/// `.env` 首次导入:目标不存在且源存在时,经临时文件+原子改名落位,
+/// 并显式设为 0600(仅属主可读写;不依赖源文件/umask 的权限)。
+/// 非覆盖、幂等;源文件字节不变。永不触碰 credentials.dpapi。
+fn import_env_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.exists() || !src.is_file() {
+        return Ok(());
+    }
+    let tmp = dest.with_file_name(".env.importing");
+    let result = (|| {
+        std::fs::copy(src, &tmp)?;
+        // 竞态兜底:复制期间目标已出现 → 非覆盖,丢弃本次副本
+        if dest.exists() {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
+        set_owner_only_permissions(&tmp)?;
+        std::fs::rename(&tmp, dest)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// 凭据文件落位权限:0600(仅属主可读写)。
+fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// WAL 安全的旧库导入:先旁路复制源(含 -wal/-shm/-journal),副本上做恢复与
@@ -462,6 +506,86 @@ mod tests {
             std::fs::read_to_string(dest.join("config.json")).unwrap(),
             "{\"version\":1}"
         );
+    }
+
+    #[test]
+    fn env_import_first_launch_is_atomic_owner_only_and_preserves_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("AiCouncil.app/Contents/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let exe = bundle.join("aicouncil");
+        let legacy = dir.path().join("data");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // 假 fixture 绝不是真实凭据;源文件故意 0644,导入后必须 0600
+        let src_env = legacy.join(".env");
+        std::fs::write(&src_env, "OPENROUTER_API_KEY=sk-fixture-or\n").unwrap();
+        std::fs::set_permissions(&src_env, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dest = dir.path().join("support/AiCouncil");
+        std::fs::create_dir_all(&dest).unwrap();
+        let dest_env = dest.join(".env");
+
+        import_legacy_data(&exe, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(&dest_env).unwrap(),
+            b"OPENROUTER_API_KEY=sk-fixture-or\n"
+        );
+        let mode = std::fs::metadata(&dest_env).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "导入的 .env 必须是 0600");
+        // 源文件字节与权限不变;无 staging 残留
+        assert_eq!(
+            std::fs::read(&src_env).unwrap(),
+            b"OPENROUTER_API_KEY=sk-fixture-or\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&src_env).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert!(!dest.join(".env.importing").exists());
+        // 幂等:再次导入不改动已落位文件
+        import_legacy_data(&exe, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(&dest_env).unwrap(),
+            b"OPENROUTER_API_KEY=sk-fixture-or\n"
+        );
+    }
+
+    #[test]
+    fn env_import_never_overwrites_existing_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("AiCouncil.app/Contents/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let exe = bundle.join("aicouncil");
+        let legacy = dir.path().join("data");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join(".env"), "OPENROUTER_API_KEY=sk-fixture-new\n").unwrap();
+        let dest = dir.path().join("support/AiCouncil");
+        std::fs::create_dir_all(&dest).unwrap();
+        // 已有(用户/父进程放置的).env:非覆盖
+        std::fs::write(dest.join(".env"), "OPENROUTER_API_KEY=sk-fixture-user\n").unwrap();
+        import_legacy_data(&exe, &dest).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join(".env")).unwrap(),
+            "OPENROUTER_API_KEY=sk-fixture-user\n"
+        );
+        assert!(!dest.join(".env.importing").exists());
+    }
+
+    #[test]
+    fn env_import_skipped_when_bundle_has_no_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("AiCouncil.app/Contents/MacOS");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let exe = bundle.join("aicouncil");
+        let legacy = dir.path().join("data");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("config.json"), "{}").unwrap();
+        let dest = dir.path().join("support/AiCouncil");
+        std::fs::create_dir_all(&dest).unwrap();
+        // 包同级无 .env:安静跳过,不报错、不创建
+        import_legacy_data(&exe, &dest).unwrap();
+        assert!(!dest.join(".env").exists());
+        assert!(!dest.join(".env.importing").exists());
     }
 
     #[test]

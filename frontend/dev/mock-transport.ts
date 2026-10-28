@@ -32,6 +32,7 @@ import type {
   UsageRecord,
 } from "../src/ipc/types";
 import type { Transport } from "../src/ipc/transport";
+import { longFixture, type FixtureName } from "./fixtures";
 
 const now = Date.now();
 
@@ -241,7 +242,25 @@ export class MockBackend {
   private listeners = new Map<string, Set<(payload: unknown) => void>>();
   private cancelled = new Set<Id>();
 
-  constructor() {
+  constructor(fixture: FixtureName = "default") {
+    if (fixture === "long") {
+      const data = longFixture();
+      this.conversations = data.conversations;
+      this.messages = data.messages;
+      this.generations = data.generations;
+      this.usage = data.usage;
+      for (const conversation of this.conversations) {
+        this.drafts.set(conversation.id, {
+          text: "",
+          attachments: [],
+          edit_text: "",
+          edit_attachments: [],
+          edit_target_id: null,
+          revision: 0,
+        });
+      }
+      return;
+    }
     const first = this.conversations[0];
     this.messages.set(first.id, [
       {
@@ -331,7 +350,7 @@ export class MockBackend {
 
   private bootstrapState(): BootstrapState {
     return {
-      app_version: "0.2.0",
+      app_version: "0.2.1",
       settings: this.settings,
       conversations: this.conversations,
       groups: this.groups,
@@ -822,8 +841,8 @@ export class MockBackend {
   }
 }
 
-export function createMockTransport(): Transport {
-  const backend = new MockBackend();
+export function createMockTransport(fixture: FixtureName = "default"): Transport {
+  const backend = new MockBackend(fixture);
   return {
     invoke: (command, args) => backend.invoke(command, args ?? {}),
     listen: (event, handler) => backend.listen(event, handler),

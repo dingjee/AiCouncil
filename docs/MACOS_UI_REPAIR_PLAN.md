@@ -1,10 +1,29 @@
 # macOS 0.2.1: UI and credential repair plan
 
+FINAL USER ICON OVERRIDE: icon work is cancelled; the user will edit it
+personally. Restore logo.svg/logo.png to the pre-repair 0.2.0 baseline,
+remove trial ICNS/icon-generation tooling and its exclusive dependencies,
+and bundle the original icon. Do not make any further icon variants.
+Eight remaining UI/theme/credential items continue unchanged. This overrides
+all earlier icon specifications and icon acceptance gates below.
+
 Date: 2026-10-28. Continue `codex/tauri-macos`. User requests nine specific
 repairs after the agents completed 0.2.0. This document supersedes earlier
 unfinished migration work for this repair. Finish, self-check, publish locally
 to dist, clean task remnants and hand back for review. Do not shut down or arm
 WatchDog during this round; the user is actively reviewing the application.
+
+LATEST ICON DESIGN OVERRIDE: user rejects the first sky-blue background with
+large grayscale dots. Add generous padding; use a dark BLUE base and layered
+BLUE mark (all blue shades, no grayscale/black/white disks). Add contemporary
+macOS glass-like edge highlights and restrained specular highlights. Preserve
+the council mark's recognizable arrangement but inset it enough to read as an
+intentional Mac app icon. C generates a preview promptly; parent displays it
+while A/B continue. B must bundle the revised final PNG/ICNS, not the rejected
+first icon. This overrides the earlier Mail-like sky-blue-only specification.
+User further clarifies `overlap`: visibly overlapping shapes with both dark
+and light blue, including translucent/intersection color changes. Use actual
+overlapping glass-like blue forms, not merely separate dots with blue fills.
 
 ## Research: observed defects and causes
 
@@ -200,3 +219,14 @@ test databases, task-owned processes and task-created WebKit/cache/saved-state
 remnants. Preserve real user data, source/lockfiles/assets/docs, shared tools
 and other chats' files/processes. Screenshots never enter Git. Keep final
 0.2.1 application/executable in dist. Do not shutdown during this repair round.
+
+## Completion record
+
+Delivered 0.2.1. Icon changes were cancelled and the original source assets
+restored. Remaining eight items passed their assigned gates: frontend163/163,
+real-browser geometry19/19 with old-CSS negative control, live light/dark
+contrast checks, Rust fmt/clippy/full tests and real WKWebView49-step gate.
+Parent completed the planned minimal visual/artifact/private-data checks;
+current results and final artifact hashes are in MACOS_ACCEPTANCE.md. Temporary
+per-agent status documents were consolidated there and removed. The final app
+was opened for user review; this repair does not shut down the machine.

@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { t } from "../i18n/strings";
 import { presentation } from "../model/presentation";
 import type { Generation, Id, Message } from "../ipc/types";
+import { threadControls } from "../state/selectors";
 import { buildThread, type AnswerItem } from "../state/tree";
 import { useStore } from "../state/store";
 import { Icon } from "./Icon";
@@ -27,6 +28,18 @@ export function MessageThread() {
     [messages, generations, conversation?.main_leaf_id],
   );
 
+  /**
+   * What the controls may show.
+   *
+   * A single-model conversation without branches gets neither an answer tab
+   * strip nor branch buttons: there is nothing to compare and nothing to
+   * branch from.
+   */
+  const controls = useMemo(
+    () => threadControls(messages, generations),
+    [messages, generations],
+  );
+
   const split = conversationId ? (state.splitView[conversationId] ?? false) : false;
 
   if (!conversationId) {
@@ -37,7 +50,7 @@ export function MessageThread() {
         <button
           type="button"
           className="btn btn--accent"
-          onClick={() => actions.setPanel("models")}
+          onClick={() => actions.openModal("models")}
         >
           {t("empty.configure")}
         </button>
@@ -60,6 +73,7 @@ export function MessageThread() {
       role="log"
       aria-live="polite"
       aria-label={t("a11y.messages")}
+      data-testid="thread"
     >
       {turns.map((turn) => (
         <TurnView
@@ -69,6 +83,7 @@ export function MessageThread() {
           generations={generations}
           messages={messages}
           split={split}
+          showBranchControls={controls.showBranchControls}
           branchSelection={state.branchSelection}
           showAttempts={state.showAttempts[conversationId] ?? false}
           activeAnswerId={
@@ -100,6 +115,7 @@ interface TurnViewProps {
   generations: Generation[];
   messages: Message[];
   split: boolean;
+  showBranchControls: boolean;
   branchSelection: Id[];
   showAttempts: boolean;
   activeAnswerId: string | null;
@@ -114,6 +130,7 @@ function TurnView({
   generations,
   messages,
   split,
+  showBranchControls,
   branchSelection,
   showAttempts,
   activeAnswerId,
@@ -140,29 +157,46 @@ function TurnView({
   // The backend tells us which question may be edited (`edit_latest`).
   const editableQuestion = state.editLatestEligible;
 
+  // The tab strip only makes sense when the question really has several
+  // answers (a parallel comparison); a single answer needs no tabs.
+  const showTabs = visible.length > 1;
+
   return (
-    <section className="turn">
+    <section className="turn" data-testid="turn">
       <div
-        className={`turn__question${long && !expanded ? " turn__question--collapsed" : ""}`}
+        className="turn__question"
         data-message-id={question.id}
+        data-testid="question"
       >
-        <div>{question.content}</div>
-        {question.attachments.length > 0 ? (
-          <div className="composer__chips" style={{ marginTop: "var(--space-xs)" }}>
-            {question.attachments.map((attachment, index) => (
-              <span className="chip" key={`${attachment.name}-${index}`}>
-                <Icon name="paperclip" size={11} />
-                <span className="chip__name">{attachment.name}</span>
-              </span>
-            ))}
-          </div>
-        ) : null}
-        <div className="turn__question-actions">
+        <div
+          className="turn__question-body"
+          data-collapsed={long && !expanded ? "true" : "false"}
+          data-testid="question-body"
+        >
+          <div>{question.content}</div>
+          {question.attachments.length > 0 ? (
+            <div className="composer__chips" style={{ marginTop: "var(--space-xs)" }}>
+              {question.attachments.map((attachment, index) => (
+                <span className="chip" key={`${attachment.name}-${index}`}>
+                  <Icon name="paperclip" size={11} />
+                  <span className="chip__name">{attachment.name}</span>
+                </span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
+        {/*
+          The footer is always visible: collapsing the body must never hide
+          the controls that expand it again.
+        */}
+        <div className="turn__question-footer" data-testid="question-actions">
           {long ? (
             <button
               type="button"
               className="btn"
               aria-expanded={expanded}
+              data-testid="question-toggle"
               onClick={() => setExpanded((value) => !value)}
             >
               {expanded ? t("message.collapse") : t("message.expand")}
@@ -182,9 +216,22 @@ function TurnView({
           ) : null}
           <button
             type="button"
+            className="btn btn--icon"
+            title={t("message.copy_question_tooltip")}
+            aria-label={t("message.copy_question_tooltip")}
+            data-testid="question-copy"
+            onClick={() => {
+              void navigator.clipboard?.writeText(question.content);
+            }}
+          >
+            <Icon name="copy" size={12} />
+          </button>
+          <button
+            type="button"
             className="btn btn--danger"
             title={t("message.delete_tooltip")}
             aria-label={t("message.delete_tooltip")}
+            data-testid="question-delete"
             onClick={() => void actions.deleteMessage(question.id)}
           >
             <Icon name="trash" size={12} />
@@ -194,71 +241,76 @@ function TurnView({
 
       {answers.length > 0 ? (
         <>
-          <div
-            className="answer-tabs"
-            role="tablist"
-            aria-label={t("a11y.answer_tabs")}
-          >
-            {visible.map((item) => {
-              const selected = activeIds.includes(item.message_id);
-              const label = modelLabel(state.catalog, item.model_id);
-              return (
-                <button
-                  key={item.message_id}
-                  type="button"
-                  role="tab"
-                  className="answer-tab"
-                  aria-selected={selected}
-                  tabIndex={selected ? 0 : -1}
-                  onClick={() => onSelectAnswer(item.message_id)}
-                  onKeyDown={(event) => {
-                    if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
-                      event.preventDefault();
-                      const index = visible.findIndex(
-                        (entry) => entry.message_id === item.message_id,
-                      );
-                      const delta = event.key === "ArrowRight" ? 1 : -1;
-                      const next =
-                        visible[(index + delta + visible.length) % visible.length];
-                      if (next) onSelectAnswer(next.message_id);
-                    }
-                  }}
-                  title={label}
-                >
-                  <span
-                    className="answer-tab__dot"
-                    data-status={item.status ?? "unknown"}
-                    aria-hidden="true"
-                  />
-                  <span>{label}</span>
-                  {item.attempt > 1 ? (
-                    <span className="muted small">
-                      {t("answers.attempt").replace("{n}", String(item.attempt))}
-                    </span>
-                  ) : null}
-                </button>
-              );
-            })}
+          {showTabs ? (
+            <div
+              className="answer-tabs"
+              role="tablist"
+              aria-label={t("a11y.answer_tabs")}
+              data-testid="answer-tabs"
+            >
+              {visible.map((item) => {
+                const selected = activeIds.includes(item.message_id);
+                const label = modelLabel(state.catalog, item.model_id);
+                return (
+                  <button
+                    key={item.message_id}
+                    type="button"
+                    role="tab"
+                    className="answer-tab"
+                    aria-selected={selected}
+                    tabIndex={selected ? 0 : -1}
+                    onClick={() => onSelectAnswer(item.message_id)}
+                    onKeyDown={(event) => {
+                      if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+                        event.preventDefault();
+                        const index = visible.findIndex(
+                          (entry) => entry.message_id === item.message_id,
+                        );
+                        const delta = event.key === "ArrowRight" ? 1 : -1;
+                        const next =
+                          visible[(index + delta + visible.length) % visible.length];
+                        if (next) onSelectAnswer(next.message_id);
+                      }
+                    }}
+                    title={label}
+                  >
+                    <span
+                      className="answer-tab__dot"
+                      data-status={item.status ?? "unknown"}
+                      aria-hidden="true"
+                    />
+                    <span>{label}</span>
+                    {item.attempt > 1 ? (
+                      <span className="muted small">
+                        {t("answers.attempt").replace("{n}", String(item.attempt))}
+                      </span>
+                    ) : null}
+                  </button>
+                );
+              })}
 
-            {answers.length > 1 ? (
-              <button
-                type="button"
-                className="btn btn--icon"
-                style={{ marginLeft: "auto" }}
-                title={t("answers.split_tooltip")}
-                aria-label={t("answers.split_tooltip")}
-                aria-pressed={split}
-                onClick={onToggleSplit}
-              >
-                <Icon name="split" size={13} />
-              </button>
-            ) : null}
-          </div>
+              {visible.length > 1 ? (
+                <button
+                  type="button"
+                  className="btn btn--icon"
+                  style={{ marginLeft: "auto" }}
+                  title={t("answers.split_tooltip")}
+                  aria-label={t("answers.split_tooltip")}
+                  aria-pressed={split}
+                  data-testid="answer-split"
+                  onClick={onToggleSplit}
+                >
+                  <Icon name="split" size={13} />
+                </button>
+              ) : null}
+            </div>
+          ) : null}
 
           {hiddenCount > 0 ? (
             <button
               type="button"
               className="btn small"
+              data-testid="answer-attempts"
               onClick={onToggleAttempts}
             >
               {showAttempts
@@ -279,6 +331,7 @@ function TurnView({
                   item={item}
                   generations={generations}
                   branchSelected={branchSelection.includes(messageId)}
+                  showBranchControls={showBranchControls}
                 />
               );
             })}
@@ -294,9 +347,16 @@ interface AnswerCardProps {
   item: AnswerItem;
   generations: Generation[];
   branchSelected: boolean;
+  showBranchControls: boolean;
 }
 
-function AnswerCard({ message, item, generations, branchSelected }: AnswerCardProps) {
+function AnswerCard({
+  message,
+  item,
+  generations,
+  branchSelected,
+  showBranchControls,
+}: AnswerCardProps) {
   const { state, actions } = useStore();
   const generation = generations.find(
     (entry) => entry.assistant_message_id === message.id,
@@ -312,68 +372,17 @@ function AnswerCard({ message, item, generations, branchSelected }: AnswerCardPr
   const label = modelLabel(state.catalog, item.model_id);
 
   return (
-    <article className="card" aria-label={`${t("message.role.assistant")}: ${label}`}>
+    <article
+      className="card"
+      aria-label={`${t("message.role.assistant")}: ${label}`}
+      data-testid="answer"
+    >
       <header className="card__header">
         <span className="card__model">{label}</span>
         {item.attempt > 1 ? (
           <span>{t("answers.attempt").replace("{n}", String(item.attempt))}</span>
         ) : null}
         {item.status ? <span>{statusLabel(item.status)}</span> : null}
-        <div className="card__actions">
-          <button
-            type="button"
-            className="btn btn--icon"
-            title={t("message.copy_tooltip")}
-            aria-label={t("message.copy_tooltip")}
-            onClick={() => {
-              void navigator.clipboard?.writeText(message.content);
-            }}
-          >
-            <Icon name="copy" size={13} />
-          </button>
-          <button
-            type="button"
-            className="btn btn--icon"
-            title={t("message.select_branch_tooltip")}
-            aria-label={t("message.select_branch_tooltip")}
-            aria-pressed={branchSelected}
-            onClick={() => actions.toggleBranch(message.id)}
-          >
-            <Icon name="branchSelect" size={13} />
-          </button>
-          <button
-            type="button"
-            className="btn btn--icon"
-            title={t("message.continue_tooltip")}
-            aria-label={t("message.continue_tooltip")}
-            disabled={item.status !== "completed"}
-            onClick={() => void actions.continueFrom(message.id)}
-          >
-            <Icon name="branch" size={13} />
-          </button>
-          {live && generation ? (
-            <button
-              type="button"
-              className="btn btn--icon"
-              title={t("message.stop")}
-              aria-label={t("message.stop")}
-              onClick={() => void actions.cancel(generation.request_id)}
-            >
-              <Icon name="stop" size={13} />
-            </button>
-          ) : null}
-          {failed && generation ? (
-            <button
-              type="button"
-              className="btn btn--icon"
-              title={t("message.retry")}
-              aria-label={t("message.retry")}
-              onClick={() => void actions.retry(generation.request_id)}
-            >
-              <Icon name="retry" size={13} />
-            </button>
-          ) : null}
-        </div>
       </header>
 
       <SelectableMarkdown
@@ -400,6 +409,77 @@ function AnswerCard({ message, item, generations, branchSelected }: AnswerCardPr
           {generation.error}
         </p>
       ) : null}
+
+      {/*
+        The actions follow the answer: they sit below the text, at the
+        bottom right of the card, and never cover it.
+      */}
+      <footer className="card__footer" data-testid="answer-actions">
+        <div className="card__actions">
+          <button
+            type="button"
+            className="btn btn--icon"
+            title={t("message.copy_tooltip")}
+            aria-label={t("message.copy_tooltip")}
+            data-testid="answer-copy"
+            onClick={() => {
+              void navigator.clipboard?.writeText(message.content);
+            }}
+          >
+            <Icon name="copy" size={13} />
+          </button>
+          {showBranchControls ? (
+            <>
+              <button
+                type="button"
+                className="btn btn--icon"
+                title={t("message.select_branch_tooltip")}
+                aria-label={t("message.select_branch_tooltip")}
+                aria-pressed={branchSelected}
+                data-testid="answer-branch-select"
+                onClick={() => actions.toggleBranch(message.id)}
+              >
+                <Icon name="branchSelect" size={13} />
+              </button>
+              <button
+                type="button"
+                className="btn btn--icon"
+                title={t("message.continue_tooltip")}
+                aria-label={t("message.continue_tooltip")}
+                disabled={item.status !== "completed"}
+                data-testid="answer-branch-continue"
+                onClick={() => void actions.continueFrom(message.id)}
+              >
+                <Icon name="branch" size={13} />
+              </button>
+            </>
+          ) : null}
+          {live && generation ? (
+            <button
+              type="button"
+              className="btn btn--icon"
+              title={t("message.stop")}
+              aria-label={t("message.stop")}
+              data-testid="answer-stop"
+              onClick={() => void actions.cancel(generation.request_id)}
+            >
+              <Icon name="stop" size={13} />
+            </button>
+          ) : null}
+          {failed && generation ? (
+            <button
+              type="button"
+              className="btn btn--icon"
+              title={t("message.retry")}
+              aria-label={t("message.retry")}
+              data-testid="answer-retry"
+              onClick={() => void actions.retry(generation.request_id)}
+            >
+              <Icon name="retry" size={13} />
+            </button>
+          ) : null}
+        </div>
+      </footer>
     </article>
   );
 }

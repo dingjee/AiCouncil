@@ -235,7 +235,7 @@ export function fixtureBootstrap(
   conversations: ConversationSummary[],
 ): BootstrapState {
   return {
-    app_version: "0.2.0",
+    app_version: "0.2.1",
     settings: {
       max_concurrent_requests: 4,
       assumed_output_tokens: 1000,

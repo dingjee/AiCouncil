@@ -110,7 +110,7 @@ pub fn page_load_script() -> &'static str {
     // 1. bootstrap:真实启动状态
     const boot = await step('bootstrap', async () => {
       const b = await invoke('bootstrap');
-      if (!b || b.app_version !== '0.2.0') throw new Error('app_version != 0.2.0: ' + JSON.stringify(b && b.app_version));
+      if (!b || b.app_version !== '0.2.1') throw new Error('app_version != 0.2.1: ' + JSON.stringify(b && b.app_version));
       if (!b.credentials || b.credentials.openrouter !== true) throw new Error('fixture .env 未生效: credentials.openrouter != true');
       if (!Array.isArray(b.conversations)) throw new Error('conversations 不是数组');
       if (!b.catalog || typeof b.catalog !== 'object') throw new Error('catalog 缺失');
@@ -389,7 +389,335 @@ pub fn page_load_script() -> &'static str {
       });
     }
 
-    // 12. 合成 IME 组合测试(仅 DOM 合成事件;不切换输入源、不发全局按键):
+    // 12. 原生几何回归(计划用户问题 1/2/3/4,在真实 WebKit 布局里断言,
+    //     不是源码文本断言):composer 可见可编辑、长问答真实滚轮滚动、
+    //     20 次侧栏开合 main 宽度不塌缩、长问题只折叠正文且页脚始终可点。
+    //     长内容来自**真实发送**(IPC → 本地 mock 回显),不伪造 DOM 状态。
+    await step('geometry_native_layout', async () => {
+      const ckpt = (name, value) => {
+        out.steps.push({ name: `geo:${name}`, ok: true, value: value === undefined ? null : value });
+        flush();
+      };
+      ckpt('entered');
+      if (!entry) throw new Error('目录为空,无法进行几何发送');
+      const mainEl = () => document.querySelector('[data-testid="main"]');
+      const appEl = () => document.querySelector('[data-testid="app"]');
+      const composerEl = () =>
+        document.querySelector('.composer__input') ||
+        document.querySelector('textarea');
+      const inViewport = (el) => {
+        const r = el.getBoundingClientRect();
+        return (
+          r.width > 0 && r.height > 0 &&
+          r.top >= 0 && r.left >= 0 &&
+          r.bottom <= window.innerHeight + 1 && r.right <= window.innerWidth + 1
+        );
+      };
+      const setNativeValue = (el, v) => {
+        const proto =
+          el instanceof HTMLTextAreaElement
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      // 打开会话(与 IME 步骤同一真实点击路径),等 thread + composer 挂载
+      const deadlineOpen = Date.now() + 5000;
+      let opened = false;
+      while (Date.now() < deadlineOpen && !opened) {
+        const items = Array.from(document.querySelectorAll('button, [role="button"], li, div')).filter(
+          (el) => el.textContent && el.textContent.includes('Smoke Conv') && el.offsetParent !== null
+        );
+        const clickable = items.filter(
+          (el) => el.tagName === 'BUTTON' || el.getAttribute('role') === 'button'
+        );
+        const pool = clickable.length ? clickable : items;
+        const target = pool[pool.length - 1];
+        if (target) {
+          target.click();
+          opened = true;
+          break;
+        }
+        await sleep(300);
+      }
+      if (!opened) throw new Error('geometry: 侧栏未渲染可点击的会话项');
+      let thread = null;
+      let composer = null;
+      const deadlineMount = Date.now() + 8000;
+      while (Date.now() < deadlineMount && !(thread && composer)) {
+        thread = document.querySelector('[data-testid="thread"]');
+        composer = composerEl();
+        if (!(thread && composer)) await sleep(200);
+      }
+      if (!thread) throw new Error('geometry: [data-testid="thread"] 未挂载');
+      if (!composer) throw new Error('geometry: composer 未挂载');
+      ckpt('mounted', { tag: composer.tagName });
+
+      // (a) 问题 3:composer 在真实窗口内可见、可编辑(设置值可读回,不发送)。
+      //     关系断言(UI_REPAIR_A 契约,测 .composer 包装层而非 textarea:
+      //     textarea 只是包装层内的输入框):包装层底边≈窗口底边、右缘≈窗口右缘,
+      //     main 高≈窗口高(WebKit 度量差异 ±4px 容差)。
+      const composerWrap = composer.closest('.composer') || composer;
+      const cw = composerWrap.getBoundingClientRect();
+      if (
+        Math.abs(cw.bottom - window.innerHeight) > 4 ||
+        Math.abs(cw.right - window.innerWidth) > 4
+      ) {
+        throw new Error(
+          'geometry: composer 包装层未贴满窗口底/右(用户问题 3): ' +
+            JSON.stringify({
+              wrap: [cw.left, cw.top, cw.width, cw.height],
+              bottom: cw.bottom, innerH: window.innerHeight,
+              right: cw.right, innerW: window.innerWidth,
+            })
+        );
+      }
+      const mr0 = mainEl().getBoundingClientRect();
+      if (Math.abs(mr0.height - window.innerHeight) > 4) {
+        throw new Error(
+          'geometry: main 高度未占满窗口: ' + JSON.stringify({ h: mr0.height, innerH: window.innerHeight })
+        );
+      }
+      if (!inViewport(composer)) {
+        throw new Error(
+          'geometry: composer 不在视口内: ' + JSON.stringify(composer.getBoundingClientRect())
+        );
+      }
+      composer.focus();
+      setNativeValue(composer, 'geometry-edit-probe');
+      const probeOk = composer.value === 'geometry-edit-probe';
+      setNativeValue(composer, '');
+      if (!probeOk) throw new Error('geometry: composer 不可编辑(值无法设置/读回)');
+      ckpt('composer_visible_editable');
+
+      // (b) 真实 UI 路径的长内容:composer 写入长文本 + Enter(与真人同一路径;
+      //     后端直接 IPC 发送不进入前端线程状态,不是用户路径,已验证)。
+      const lines = Array.from({ length: 120 }, (_, i) =>
+        `Geometry long history line ${String(i).padStart(3, '0')} ABCDEFGHIJKLMNOPQRSTUVWXYZ.`
+      );
+      const longText = lines.join('\n');
+      composer.focus();
+      setNativeValue(composer, longText);
+      if (composer.value !== longText) throw new Error('geometry: 长文本未能写入 composer');
+      composer.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      ckpt('long_ui_send_entered', { chars: longText.length, lines: lines.length });
+
+      // (c0) 等长问题渲染并展开(长问题默认折叠;展开后才有完整溢出——用户真实操作)
+      let qtoggle = null;
+      const toggleDeadline = Date.now() + 10000;
+      while (Date.now() < toggleDeadline && !qtoggle) {
+        qtoggle = Array.from(
+          document.querySelectorAll('[data-testid="turn"] [data-testid="question-toggle"]')
+        ).find((b) => b.offsetParent !== null);
+        if (!qtoggle) await sleep(300);
+      }
+      if (!qtoggle) throw new Error('geometry: 长问题的 question-toggle 未渲染');
+      qtoggle.click();
+      const expandedDeadline = Date.now() + 3000;
+      while (Date.now() < expandedDeadline) {
+        const body = document.querySelector('[data-testid="turn"] [data-testid="question-body"]');
+        if (body && body.getAttribute('data-collapsed') === 'false') break;
+        await sleep(150);
+      }
+      ckpt('long_question_expanded');
+
+      // (c) 问题 2:UI 真正渲染长历史 → thread 溢出 → 真实 wheel 改变 scrollTop
+      let overflowed = false;
+      let turnCount = -1;
+      const scrollDeadline = Date.now() + 15000;
+      while (Date.now() < scrollDeadline && !overflowed) {
+        thread = document.querySelector('[data-testid="thread"]');
+        if (thread) {
+          turnCount = document.querySelectorAll('[data-testid="turn"]').length;
+          overflowed = thread.scrollHeight > thread.clientHeight + 50;
+        }
+        if (!overflowed) await sleep(300);
+      }
+      if (!overflowed) {
+        throw new Error(
+          'geometry: 长历史未产生滚动溢出 scrollHeight=' +
+            (thread ? thread.scrollHeight : -1) + ' clientHeight=' +
+            (thread ? thread.clientHeight : -1) + ' turns=' + turnCount
+        );
+      }
+      thread.scrollTop = thread.scrollHeight;
+      await sleep(200);
+      const bottomTop = thread.scrollTop;
+      if (bottomTop <= 0) {
+        throw new Error(
+          'geometry: thread 无法滚动(scrollTop=0)' +
+            ' scrollHeight=' + thread.scrollHeight + ' clientHeight=' + thread.clientHeight
+        );
+      }
+      // 注:合成 dispatchEvent 的 wheel 事件是**不可信**的,WebKit/Chrome 都不会
+      // 为它执行默认滚动;真实滚轮输入由 A 的可信 CDP 输入 harness(Chrome)覆盖。
+      // 这里在真实 WebKit 里验证滚动机制本身:内容真溢出、scrollTop 真可变、
+      // 程序化滚动触发真实 scroll 事件(与用户滚动同一事件通路)。
+      let scrollEventFired = false;
+      const onScroll = () => {
+        scrollEventFired = true;
+      };
+      thread.addEventListener('scroll', onScroll);
+      thread.scrollTop = Math.max(0, bottomTop - 400);
+      await sleep(300);
+      thread.removeEventListener('scroll', onScroll);
+      const afterTop = thread.scrollTop;
+      if (!(afterTop < bottomTop)) {
+        throw new Error(
+          'geometry: thread scrollTop 不可变 before=' + bottomTop + ' after=' + afterTop
+        );
+      }
+      if (!scrollEventFired) {
+        throw new Error('geometry: thread 滚动未触发真实 scroll 事件');
+      }
+      ckpt('thread_scrolled', { bottom: bottomTop, after: afterTop });
+
+      // (d) 问题 1:20 次侧栏开合,main 宽度不塌缩、composer 始终可见
+      const visibleToggle = () =>
+        Array.from(document.querySelectorAll('button[aria-label="Toggle sidebar"]')).find(
+          (b) => b.offsetParent !== null
+        );
+      const waitForSidebar = async (want) => {
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          const app = appEl();
+          if (app && app.getAttribute('data-sidebar') === want) return true;
+          await sleep(80);
+        }
+        return false;
+      };
+      const measure = () => {
+        const app = appEl();
+        const m = mainEl().getBoundingClientRect();
+        const c = composerEl();
+        const cr = c ? c.getBoundingClientRect() : null;
+        return {
+          sidebar: app ? app.getAttribute('data-sidebar') : null,
+          main_w: Math.round(m.width),
+          main_h: Math.round(m.height),
+          composer_visible: c ? inViewport(c) : false,
+          composer_top: cr ? Math.round(cr.top) : null,
+          composer_h: cr ? Math.round(cr.height) : null,
+        };
+      };
+      if (!(await waitForSidebar('expanded'))) {
+        throw new Error('geometry: 测量前未处于展开态');
+      }
+      const expandedFirst = measure();
+      if (expandedFirst.main_w < window.innerWidth * 0.35 || expandedFirst.main_w > window.innerWidth * 0.95) {
+        throw new Error('geometry: 展开态 main 宽度异常: ' + JSON.stringify(expandedFirst));
+      }
+      for (let i = 0; i < 20; i++) {
+        const t1 = visibleToggle();
+        if (!t1) throw new Error('geometry: 第 ' + (i + 1) + ' 轮找不到可见的侧栏开关');
+        t1.click();
+        if (!(await waitForSidebar('collapsed'))) {
+          throw new Error('geometry: 第 ' + (i + 1) + ' 轮折叠未生效');
+        }
+        const collapsed = measure();
+        if (collapsed.main_w < window.innerWidth * 0.8) {
+          throw new Error('geometry: 折叠态 main 宽度塌缩(用户问题 1): ' + JSON.stringify(collapsed));
+        }
+        if (!collapsed.composer_visible) {
+          throw new Error('geometry: 折叠态 composer 不可见(用户问题 3): ' + JSON.stringify(collapsed));
+        }
+        const t2 = visibleToggle();
+        if (!t2) throw new Error('geometry: 折叠态找不到展开开关');
+        t2.click();
+        if (!(await waitForSidebar('expanded'))) {
+          throw new Error('geometry: 第 ' + (i + 1) + ' 轮展开未生效');
+        }
+        const expanded = measure();
+        if (
+          expanded.main_w < window.innerWidth * 0.35 ||
+          expanded.main_w > window.innerWidth * 0.95
+        ) {
+          throw new Error('geometry: 展开态 main 宽度异常: ' + JSON.stringify(expanded));
+        }
+        if (!expanded.composer_visible) {
+          throw new Error('geometry: 展开态 composer 不可见: ' + JSON.stringify(expanded));
+        }
+      }
+      const expandedLast = measure();
+      if (Math.abs(expandedLast.main_w - expandedFirst.main_w) > 1) {
+        throw new Error(
+          'geometry: 20 次开合后 main 宽度漂移 first=' + expandedFirst.main_w + ' last=' + expandedLast.main_w
+        );
+      }
+      ckpt('toggles_20_stable', { first_w: expandedFirst.main_w, last_w: expandedLast.main_w });
+
+      // (e) 问题 3/4:长问题只折叠正文;页脚(Expand/Collapse)两种状态都可见可点。
+      //     与进入状态无关:先折叠(记录),再展开(记录),再折叠回初始态。
+      const longTurn = Array.from(document.querySelectorAll('[data-testid="turn"]'))
+        .reverse()
+        .find((turn) => turn.querySelector('[data-testid="question-toggle"]'));
+      if (!longTurn) throw new Error('geometry: 长问题的 question-toggle 未渲染');
+      const qbody = longTurn.querySelector('[data-testid="question-body"]');
+      const qactions = longTurn.querySelector('[data-testid="question-actions"]');
+      const qtoggle2 = longTurn.querySelector('[data-testid="question-toggle"]');
+      const bodyH = () => Math.round(qbody.getBoundingClientRect().height);
+      const waitCollapsed = async (want) => {
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          if (qbody.getAttribute('data-collapsed') === want) return true;
+          await sleep(100);
+        }
+        return false;
+      };
+      const footerOk = () =>
+        inViewport(qtoggle2) &&
+        qactions.getBoundingClientRect().top >= qbody.getBoundingClientRect().bottom - 2 &&
+        longTurn.getBoundingClientRect().bottom >= qactions.getBoundingClientRect().bottom - 1;
+      // 先折叠(页脚滚入视口后点击——点击本身就是可用性证明)
+      qtoggle2.scrollIntoView({ block: 'center' });
+      await sleep(150);
+      qtoggle2.click();
+      if (!(await waitCollapsed('true'))) throw new Error('geometry: 折叠切换未生效');
+      const collapsedH = bodyH();
+      if (!footerOk()) throw new Error('geometry: 折叠态页脚不可见/越界(用户问题 3)');
+      // 展开必须显著增高正文
+      qtoggle2.scrollIntoView({ block: 'center' });
+      await sleep(150);
+      qtoggle2.click();
+      if (!(await waitCollapsed('false'))) throw new Error('geometry: 展开切换未生效');
+      const expandedH = bodyH();
+      if (expandedH < collapsedH + 100) {
+        throw new Error(
+          'geometry: 展开未显著增高正文 collapsed=' + collapsedH + ' expanded=' + expandedH
+        );
+      }
+      // 展开态正文超出视口属正常;把页脚滚入视口后必须可见、仍真实可点
+      qtoggle2.scrollIntoView({ block: 'center' });
+      await sleep(150);
+      if (!inViewport(qtoggle2)) {
+        throw new Error('geometry: 展开态页脚滚动后仍不可见');
+      }
+      if (
+        qactions.getBoundingClientRect().top < qbody.getBoundingClientRect().bottom - 2 ||
+        longTurn.getBoundingClientRect().bottom < qactions.getBoundingClientRect().bottom - 1
+      ) {
+        throw new Error('geometry: 页脚与正文重叠或被问题盒裁剪(用户问题 3/4)');
+      }
+      // 再次折叠必须生效(全部几何操作之后控件仍可用)
+      qtoggle2.click();
+      if (!(await waitCollapsed('true'))) throw new Error('geometry: 再次折叠未生效');
+      const collapsedH1 = bodyH();
+      if (collapsedH1 > collapsedH + 20) {
+        throw new Error(
+          'geometry: 再次折叠高度异常 collapsed0=' + collapsedH + ' collapsed1=' + collapsedH1
+        );
+      }
+      if (!footerOk()) throw new Error('geometry: 折叠态页脚不可见(用户问题 3)');
+      ckpt('question_toggle_footer', { collapsed: collapsedH1, expanded: expandedH });
+
+      return {
+        main_w: expandedLast.main_w,
+        composer: { top: expandedLast.composer_top, h: expandedLast.composer_h },
+        question: { collapsed: collapsedH1, expanded: expandedH },
+      };
+    });
+
+    // 13. 合成 IME 组合测试(仅 DOM 合成事件;不切换输入源、不发全局按键):
     //     先通过真实 DOM 点击打开会话(composer 挂载后才有 textarea),
     //     compositionstart 后的 Enter(isComposing:true) 不得触发发送;
     //     compositionend 后的正常 Enter 必须发送(走真实 UI→IPC→本地 mock)。
@@ -575,7 +903,7 @@ pub fn page_load_script() -> &'static str {
       );
     });
 
-    // 13. DOM 真渲染(前端把会话标题画进侧栏;最多等 10s)
+    // 14. DOM 真渲染(前端把会话标题画进侧栏;最多等 10s)
     await step('dom_renders_conversation', async () => {
       const deadline = Date.now() + 10000;
       while (Date.now() < deadline) {
@@ -635,6 +963,7 @@ mod tests {
             "cancel_request",
             "export_markdown",
             "reload_credentials",
+            "geometry_native_layout",
             "ime_composition_enter_gate",
             "dom_renders_conversation",
         ] {

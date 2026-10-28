@@ -38,7 +38,7 @@ import type {
   Settings,
 } from "../ipc/types";
 import { reducer, type Action } from "./reducer";
-import { initialState, type AppState, type Panel } from "./types";
+import { initialState, type AppState, type ModalKind } from "./types";
 import { enabledModels, resolveSelection } from "./selectors";
 import { isAnthropic } from "../model/presentation";
 import {
@@ -104,7 +104,8 @@ export interface Actions {
   continueFrom(messageId: Id): Promise<void>;
   toggleBranch(messageId: Id): void;
   exportMarkdown(scope: ExportScope): Promise<void>;
-  setPanel(panel: Panel): void;
+  openModal(modal: ModalKind): void;
+  closeModal(): void;
   toggleSidebar(collapsed?: boolean): void;
   showToast(text: string, options?: ToastOptions): void;
   dismissToast(): void;
@@ -1265,8 +1266,12 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     [client, showToast],
   );
 
-  const setPanel = useCallback(
-    (panel: Panel) => dispatch({ type: "panel/set", panel }),
+  const openModal = useCallback(
+    (modal: ModalKind) => dispatch({ type: "modal/set", modal }),
+    [dispatch],
+  );
+  const closeModal = useCallback(
+    () => dispatch({ type: "modal/set", modal: null }),
     [dispatch],
   );
   const toggleSidebar = useCallback(
@@ -1544,7 +1549,8 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       continueFrom,
       toggleBranch,
       exportMarkdown,
-      setPanel,
+      openModal,
+      closeModal,
       toggleSidebar,
       showToast,
       dismissToast,
@@ -1591,7 +1597,8 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       continueFrom,
       toggleBranch,
       exportMarkdown,
-      setPanel,
+      openModal,
+      closeModal,
       toggleSidebar,
       showToast,
       dismissToast,

@@ -1,9 +1,11 @@
 # AiCouncil
 
 A minimal native AI chat client for OpenRouter. English UI, local SQLite
-persistence, no telemetry. Version 0.2.0 ships as a Tauri 2 desktop app for
+persistence, no telemetry. Version 0.2.1 ships as a Tauri 2 desktop app for
 macOS (Apple Silicon); the previous Windows/iced build is superseded on this
-branch (historical sources remain recoverable via git).
+branch (historical sources remain recoverable via git). 0.2.1 repairs the
+desktop UI layout/scrolling/message controls, adds system light/dark theming
+and a new app icon, and makes bundled credential delivery deterministic.
 
 ## Features
 
@@ -29,8 +31,8 @@ branch (historical sources remain recoverable via git).
   its own text and attachments, and "New chat" returns to the same unsent
   slot instead of creating empty shells.
 - Automatic chat titles via DeepSeek (optional); manual renames always win.
-- Soft Sage reading theme, draggable right pane, Markdown export, exact cost
-  labels.
+- Soft Sage light identity with automatic system light/dark theming, draggable
+  right pane, Markdown export, exact cost labels.
 
 ## Run on macOS (Apple Silicon)
 
@@ -62,12 +64,21 @@ scripts/macos_release_check.sh      # verify dist artifacts (arch/signature/deps
   the `.app` bundle (`<bundle dir>/../data/aicouncil.db`, e.g. `dist/data`)
   via a WAL-safe SQLite snapshot: never overwrites an existing database,
   idempotent on later launches, source file left byte-identical.
+- The same first launch imports a bundled `data/.env` (if present) into the
+  data directory when no `.env` exists there yet: atomic non-overwriting
+  write, owner-only `0600` permissions, path derived from the bundle location
+  (independent of the working directory), idempotent.
 - Tests and isolated runs: set `AICOUNCIL_DATA_DIR=/some/tmp/dir` — the app
   then uses exactly that directory and performs no legacy import.
 
 ## API keys (.env is the single source)
 
-Put your keys in the data-directory `.env` (copy `.env.example` there):
+On this machine the real `.env` with both named keys is already in place (data
+directory and `dist/data/.env`, mode 0600) — no manual key entry is needed;
+launch the app and it is configured. For a fresh machine, put your keys in the
+data-directory `.env` (copy `.env.example` there), or ship them as a
+`data/.env` next to the `.app` bundle and let the first-launch import place
+them:
 
 ```
 OPENROUTER_API_KEY=...
@@ -77,18 +88,20 @@ DEEPSEEK_API_KEY=...
 The app reads only these named variables, re-reads the file on every lookup,
 and never writes, logs, or exports them. After placing or changing `.env`,
 call the in-app reload (or restart): the OpenRouter and DeepSeek title clients
-are rebuilt from the file. There is no Keychain or DPAPI storage in 0.2.0.
+are rebuilt from the file. There is no Keychain or DPAPI storage in 0.2.1.
 
 ## Windows → macOS migration notes
 
 - Chats/settings: the bundled app auto-imports the legacy PC `data/` directory
   that sits next to it (non-overwriting; see above). A byte-identical labeled
   backup of the original PC data is kept in `dist/pc-data-backup/`.
-- API keys: the existing private `.env` (already containing both named keys)
-  is copied to the runtime data directory; the app's reload then rebuilds both
-  provider clients from it. The Windows `credentials.dpapi` ciphertext cannot
-  be decrypted on macOS and is NOT imported — it stays only in the archived
-  backup (`dist/pc-data-backup/`) for reference.
+- API keys: the bundled app auto-imports a `data/.env` found next to it on
+  first launch (non-overwriting, 0600; see above). The existing private
+  `.env` (already containing both named keys) is in place in the runtime data
+  directory; the app's reload rebuilds both provider clients from it. The
+  Windows `credentials.dpapi` ciphertext cannot be decrypted on macOS and is
+  NOT imported — it stays only in the archived backup
+  (`dist/pc-data-backup/`) for reference.
 
 ## Verification
 

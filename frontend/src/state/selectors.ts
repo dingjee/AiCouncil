@@ -9,7 +9,9 @@
 import type {
   CatalogEntry,
   ConversationSummary,
+  Generation,
   Id,
+  Message,
   ModelPreferenceEntry,
 } from "../ipc/types";
 import {
@@ -18,6 +20,7 @@ import {
   type ModelPresentation,
 } from "../model/presentation";
 import { sumCosts } from "../util/money";
+import { answerSet, buildTree } from "./tree";
 import type { AppState, ModelSelectionState } from "./types";
 
 export interface NormalizedSelection {
@@ -293,4 +296,93 @@ export function usageSummary(
     }
   }
   return { knownTotal: sumCosts(known), pending, unavailable };
+}
+
+/**
+ * What the message thread may show for the conversation it renders.
+ *
+ * The user asked for a **simple** surface: in a conversation that uses a
+ * single model and has no branches, the answer tab strip and the branch
+ * controls are noise. They only carry meaning when the conversation really
+ * compares models or really branches, so they are derived from the data
+ * instead of being hard-coded.
+ */
+export interface ThreadControls {
+  /** Distinct models behind the answers the user can see. */
+  modelIds: string[];
+  /** More than one model answered in this conversation. */
+  multiModel: boolean;
+  /** The message tree has more than one leaf (a real branch exists). */
+  branched: boolean;
+  /**
+   * Answers the user could branch from.
+   *
+   * Superseded retry attempts do **not** count: a retry of the same model
+   * must never look like a multi-model comparison.
+   */
+  candidates: number;
+  /** Whether the branch controls (select branch / continue) are meaningful. */
+  showBranchControls: boolean;
+}
+
+/**
+ * Derive the thread controls of a conversation.
+ *
+ * Every user question is inspected, not only the ones on the main path: a
+ * branch only exists when the other answers are still there.
+ */
+export function threadControls(
+  messages: Message[] | undefined,
+  generations: Generation[] | undefined,
+): ThreadControls {
+  const empty: ThreadControls = {
+    modelIds: [],
+    multiModel: false,
+    branched: false,
+    candidates: 0,
+    showBranchControls: false,
+  };
+  if (!messages || messages.length === 0) return empty;
+
+  const tree = buildTree(messages);
+  const modelIds = new Set<string>();
+  let candidates = 0;
+
+  for (const message of messages) {
+    if (message.role !== "user") continue;
+    for (const answer of answerSet(tree, generations, message.id)) {
+      // A superseded attempt is an older try of the same lineage: it is
+      // hidden by default and must not turn a single-model chat into a
+      // comparison.
+      if (answer.superseded) continue;
+      candidates += 1;
+      if (answer.model_id) modelIds.add(answer.model_id);
+    }
+  }
+
+  // A branch exists when the conversation was continued from the same
+  // answer twice: the tree then has a fork at an assistant node. Two
+  // answers to the same question are **not** a branch — that is either a
+  // parallel comparison (handled by `multiModel`) or a retry.
+  let branched = false;
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    const children = messages.filter((child) => child.parent_id === message.id);
+    if (children.length > 1) {
+      branched = true;
+      break;
+    }
+  }
+
+  const ids = [...modelIds].sort();
+  const multiModel = ids.length > 1;
+  return {
+    modelIds: ids,
+    multiModel,
+    branched,
+    candidates,
+    // The branch controls only carry meaning when the conversation compares
+    // models or really branches. A linear single-model chat has neither.
+    showBranchControls: multiModel || branched,
+  };
 }

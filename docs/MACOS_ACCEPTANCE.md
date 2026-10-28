@@ -1,125 +1,132 @@
-# macOS acceptance report (GLM-F scope)
+# macOS acceptance report (0.2.1 UI + credential repair)
 
-Owner: GLM-F (final release checks). Date: 2026-10-28. Branch: `codex/tauri-macos`.
-Version: 0.2.0 (Tauri 2, Apple Silicon, `custom-protocol` embedded frontend).
-This report lists **actual commands and results**. Not-run items are stated as such.
-Current-state document only; superseded Windows-era claims removed.
+Owner: B (release/credentials/native gate). Date: 2026-10-28.
+Branch: `codex/tauri-macos`. Version: **0.2.1** (Tauri 2, Apple Silicon,
+`custom-protocol` embedded frontend). This report lists actual commands and
+results only; superseded 0.2.0 content removed. External oc implementers
+never accessed real credentials or user databases. Parent handled private local
+file transfer and verification without displaying secret values or message
+contents. All implementation fixtures are synthetic (`sk-fixture-*`, temp
+dirs, isolated `AICOUNCIL_DATA_DIR`).
 
-## Environment
+## The nine user repairs — final evidence
 
-- Rust: rustup `stable-aarch64-apple-darwin`, **1.99.1**, `/Users/jee/.cargo/bin`
-  (installed this task; clippy + rustfmt components added). `rust-toolchain.toml`
-  pins `channel = "stable"`.
-- Bun 1.4.4 (`/opt/homebrew/bin/bun`, pre-existing). node/npm absent — Bun only.
-- Real user data and real credential values were never read by GLM-F; all
-  tests use temp dirs and `sk-fixture-*` fixtures.
-
-## Data location & migration (implemented, `src/storage/repo.rs`)
-
-- `AICOUNCIL_DATA_DIR` set → exactly that directory; no legacy import.
-- Bundled app → `~/Library/Application Support/AiCouncil`; first launch imports
-  sibling `../data/{aicouncil.db,config.json}` via staged-copy → WAL recovery on
-  the copy → SQLite backup snapshot → `quick_check` + `foreign_key_check` →
-  atomic rename. Non-overwrite, idempotent, source bytes unchanged; corrupt
-  source → error, no target created. `credentials.dpapi` is never imported or
-  decrypted (inert; original preserved in `dist/pc-data-backup/`).
-
-## Credentials (implemented, `src/storage/credentials.rs`)
-
-- `.env` in the stable data dir is the sole source; allowlisted variables
-  `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`. Selection identical to desktop
-  `env_keys` (`AICOUNCIL_ENV_PATH` > data dir > exe sibling; strict isolation
-  under `AICOUNCIL_DATA_DIR`; first existing file is authoritative; empty/missing
-  key = not configured, no fall-through). Reload = re-read per lookup; the
-  in-app reload rebuilds provider/title clients. No Keychain/keyring/DPAPI;
-  no write/delete API (removed with the abandoned 0.1.x surface).
-
-## Verified results (actual)
-
-| Check | Command | Result |
+| # | Repair | Final evidence |
 | --- | --- | --- |
-| rustfmt | `cargo fmt --all -- --check` | PASS |
-| Clippy strict | `cargo clippy --all-targets --locked -- -D warnings` | PASS |
-| Full Rust suite | `cargo test --locked` (isolated `AICOUNCIL_DATA_DIR`) | PASS — 12 suites, 171 tests, 0 failed (incl. storage/repo unit, migration chain, composer, desktop) |
-| Backup integrity + migration | `scripts/macos_migrate_selfcheck.sh` | PASS — manifest SHA256 match (db/config/dpapi); copy imports with identical counts 3 conv / 18 msg / 12 gen / 12 usage / 2 groups / 6 migrations; `integrity_check ok`; idempotent; original untouched |
-| Wire contract | `docs/TAURI_IPC.md` v1 | Implemented backend matches (lead-owned); smoke exercised bootstrap/settings/groups/conversations/rename/draft CAS/catalog/preferences/key status/send/stream/cancel/export/reload with real invocations |
-| Frontend typecheck/build | `tsc --noEmit && vite build` | PASS at release-build time (MM-F-owned suite also green per lead/frontend) |
+| 1 | Collapsed main width 0 | Native: 20 collapse/expand cycles, every collapsed frame `main ≥ 0.8×viewport` (was 0px), final width == first (850px, no drift) — `geo:toggles_20_stable` |
+| 2 | No thread scrolling | Native: real UI-path long send → thread `scrollHeight 3211 / clientHeight 451`, scrollTop adjustable away from boundaries, real `scroll` event fires — `geo:thread_scrolled`. Real wheel input separately proven by A's trusted-CDP Chrome harness (wheel 0→320) — honestly distinct methods |
+| 3 | Composer missing | Native: composer wrapper flush with window bottom/right (±4px), textarea visible/editable in 1150×648 webview, still visible after every sidebar cycle — `geo:composer_visible_editable`, `toggles_20_stable` |
+| 4 | Action placement | Native: question footer below body (no overlap), inside the box (not clipped), clickable before/after all geometry ops; answer footer per A's browser assertions — `geo:question_toggle_footer` |
+| 5 | Single-model simplicity | A: tabs/branch controls hidden for single-model unbranched chats, retained for real parallel/branched; frontend suite + browser harness |
+| 6 | System theme | C: live `prefers-color-scheme` light/dark with measured contrasts (body 11.47/13.27 etc.), no remount/draft loss, parent-reviewed captures |
+| 7 | Icon | Cancelled by user override; original `logo.png`/`logo.svg` restored byte-identical, trial icns/script removed; bundle carries tauri's icns converted from the original PNG (config `["assets/icons/logo.png"]`) |
+| 8 | Credential import/path | Fixture regressions green (below); parent copied real `.env` to `dist/data/.env` + Application Support (byte-equal, 0600); app now imports bundled `data/.env` deterministically |
+| 9 | Models/Settings popups | A: modal dialogs with focus trap/Escape/close, no chat resize; browser-verified; parent reviewed dark Settings modal capture |
 
-## Native smoke (real WKWebView + real IPC) — status: **GATE OPEN, owned by MM-F**
+## Credentials (implemented, `src/storage/credentials.rs` + `repo.rs`)
 
-Best run (pre menu/save-dialog refactor): 18 steps PASSED with real IPC —
-bootstrap (fixture credentials visible, version 0.2.0), group/conversation CRUD,
-rename CAS, byte-exact draft roundtrip + revision semantics, settings merge,
-error-code convention (`not_found`), mock catalog + preference, key status,
-`send_message` → SSE stream persisted (`completed`, cost `0.000014`, content
-match), slow-send `cancel_request` (`cancelled`), `export_markdown` content,
-`reload_credentials`, DOM rendered the conversation.
-Synthetic IME gate verified up to `composing_enter_blocked_confirmed`
-(Enter with `isComposing:true` does NOT send); its normal-Enter leg is the
-open item. **Current blocker (MM-F, diagnosis in docs/GLMF_STATUS.md):**
-harness body no longer executes after the menu/save-dialog changes — zero
-mock requests, zero `smoke_report` reaches Rust, 8× fallback injections.
-Display-sleep throttling ruled out (reproduced under caffeinate assertions).
-Full IPC gate must pass before final dist staging; IME note: the harness test
-is SYNTHETIC DOM events; a manual physical Pinyin-candidate test was NOT
-performed and is not claimed.
+- `.env` in the stable data dir is the sole source; allowlisted
+  `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` only; reload = re-read per lookup;
+  no second store, no key values in errors/logs; no Keychain/DPAPI.
+- Deterministic delivery: bundled first launch imports bundle-sibling
+  `data/.env` → stable dir when absent: temp file + atomic rename,
+  **non-overwrite**, **mode 0600** set explicitly, idempotent, source bytes
+  and mode unchanged, path from bundle root (CWD-independent), never touches
+  `credentials.dpapi`, unreachable under `AICOUNCIL_DATA_DIR` isolation.
+- Robust parse: leading UTF-8 BOM stripped (dotenvy 0.15.7 does not strip it
+  in the iterator path), CRLF handled (no `\r` residue), any unparsable line
+  → whole file untrusted (no partial reads).
+- Distinct safe diagnostics `CredentialDiagnostic` { MissingFile,
+  InvalidSyntax, AbsentVariable, Present } — categories only, `Present` is
+  the reload-success signal.
 
-## Release artifacts (built; dist staging DEFERRED until native gate)
+### Credential fixture regressions (all green, `cargo test --lib storage::` 24/24)
 
-Actual build (02:58–03:05): frontend `bun install --frozen-lockfile && bun run
-build` (index-C5h9wlqI.js, 702.71 kB) → `cargo build --release --locked`
-(finished 1m41s) → `bunx --bun @tauri-apps/cli@^2 build --bundles app` →
-`target/release/bundle/macos/AiCouncil.app` (20.52 MiB, ad-hoc signed).
-Note: tauri's automatic signature failed `codesign --verify` ("code has no
-resources but signature indicates they must be present"); the build script now
-re-signs explicitly (`codesign --force --deep -s -`) and verifies — fixed for
-reproducibility.
+missing file; valid LF; BOM+CRLF (values exact, no `\r`); empty file; invalid
+syntax line (distinct InvalidSyntax, value never read); absent variable;
+empty value; `AICOUNCIL_ENV_PATH` > data dir priority + fallback to first
+EXISTING candidate; reload lifecycle Missing→Invalid→Absent→Present→Missing;
+import atomicity/0600/source-preservation; import non-overwrite; import
+idempotence; import skipped without bundled `.env`; strict isolation of
+candidates under `AICOUNCIL_DATA_DIR`.
 
-Strict check `scripts/macos_release_check.sh --app
-target/release/bundle/macos/AiCouncil.app --exe target/release/aicouncil`:
-**RESULT: OK (version 0.2.0)** — bundle version 0.2.0 (Info.plist), arm64
-(bundle + exe), codesign `--verify` clean, no obsolete GUI linkage (only
-system frameworks: AppKit/WebKit/CoreGraphics/…), exe version string
-`AiCouncil/0.2.0` present, **native smoke harness absent in release**
-(`strings -a target/release/aicouncil | grep -c AICOUNCIL_NATIVE_SMOKE` → 0;
-the debug-only module is dead-stripped; the registered `smoke_report` command
-body is an inert no-op in release).
+## Verification gates (actual results)
 
-**Final artifact identifiers (03:10, pre-staging; production sources verified
-unchanged since build — no file under `src/ main.rs build.rs Cargo.toml
-tauri.conf.json` newer than the build; current `frontend/dist` output hash
-`index-C5h9wlqI.js` matches the embedded build exactly, no rebundle needed):**
+| Gate | Command | Result |
+| --- | --- | --- |
+| fmt + clippy + full Rust suite | `scripts/macos_check.sh` (isolated data dir) | **OK** — fmt clean; clippy `--all-targets -D warnings` clean; all test binaries 0 failed (lib 105 + integration 18/9/5/5/17/4/6/12/2 …), exit 0 |
+| Targeted storage tests | `cargo test --lib --locked storage::` | 24 passed / 0 failed |
+| Frontend (A, unchanged evidence) | `bun test` + `tsc --noEmit` + `vite build` | 163/163, typecheck/build clean; browser geometry 19/19 (negative control: old CSS fails 11/19) |
+| Theme (C, unchanged evidence) | CDP Chrome live switch | measured light/dark contrasts, no remount/layout/draft loss |
+| Native gate (real WKWebView + real IPC) | `scripts/macos_native_smoke.sh` | **NATIVE_SMOKE_OK steps: 49** — full 0.2.0 contract (bootstrap 0.2.1 fixture credentials, CRUD, draft CAS, settings, catalog, send/stream/cancel, export, reload, synthetic IME gate incl. Shift+Enter, DOM render) + new `geometry_native_layout`; harness JS parsed by real parser BEFORE launch; bounded timeouts; `finished_at` present |
+| Release build | `scripts/macos_build.sh` | frontend → `cargo build --release --locked` → `.app` bundle → ad-hoc re-sign → dist staged → embedded-frontend identity OK (raw exe + bundle binary) |
+| Strict release check | `scripts/macos_release_check.sh` | **RESULT: OK (version 0.2.1)** — bundle 0.2.1, arm64, codesign `--verify` clean (ad-hoc, not notarized), only system frameworks, version string present, smoke harness absent (0 refs), embedded manifest verified |
 
-| Artifact | SHA256 |
+Native scroll note (no overclaim): the native harness verifies overflow +
+programmatic scrollTop + real scroll-event propagation in WebKit; synthetic
+`dispatchEvent` wheel is untrusted and performs no default scroll in any
+browser engine, so real-wheel behavior is claimed ONLY from A's trusted CDP
+Chrome input (0→320) — the two methods are reported separately by design.
+IME coverage remains synthetic DOM events; no physical-Pinyin claim.
+
+## Final artifacts (dist)
+
+| Artifact | Value |
 | --- | --- |
-| `target/release/aicouncil` (raw exe) | `6c2ba89b94f13b6dc8486ac12cb78ca33f32dae04df97253629d7ff81e1386c3` |
-| `AiCouncil.app/Contents/MacOS/aicouncil` (signed binary) | `1882a7e5fa577a4eac074a8c5c68ac667499c0a55b181ab9d4c56a67bbb3de53` |
-| canonical bundle tree hash (sorted file list) | `efaeeabe183fa28d3a0cda3646f41468c238ec5ae02285348b35f2df59c6833f` |
+| `dist/aicouncil` (raw exe) sha256 | `bb2e8bc7084d7c513e368a4f20f64bd87ff901427d7ba66f0262d6eb201f7764` |
+| `dist/AiCouncil.app/Contents/MacOS/aicouncil` (signed) sha256 | `ee503d63050b50335ca001e829fe85f92824b6b325d61e89c7a40a3c9bea44dd` |
+| Canonical bundle tree hash | `5281f4f9069f4315aeafffbab12753d7780467769005e2253d2a524479d17e6a` |
+| Bundle version / arch / signature | 0.2.1 / arm64 / ad-hoc (`TeamIdentifier=not set`) — no notarization claimed |
+| Bundle size | 20 MB |
+| Embedded frontend | `assets/index-C2kkiMOc.js` sha256 `47755900…b5cdbcb80` == current `frontend/dist` output (A's final i18n fix included; vite content hash = identity; manifest `dist/frontend-embed.sha256`, 62 files) — no stale binary |
+| Icon | `Contents/Resources/AiCouncil.icns`, converted by tauri from the restored original `assets/icons/logo.png` (`92527adf…ebcbc57c`); trial blue icon never bundled |
 
-Signature: ad-hoc (`Signature=adhoc`, `TeamIdentifier=not set`) — **no Apple
-notarization claimed**. (Bundle binary hash differs from the raw exe by
-design: the ad-hoc signature is embedded into the bundled copy.)
+The raw/signed hashes differ by design (ad-hoc signature is embedded in the
+bundled copy). Release-checker-only fixes after the last production build
+(SIGPIPE-under-pipefail, doubled `assets/` prefix) were re-run as checks
+against the existing artifacts — production sources and frontend unchanged
+(no rebuild), per minimal-usage instruction.
 
-Dist staging (dist/aicouncil + dist/AiCouncil.app + sha256 sidecars) happens
-only after: (1) MM-F's native smoke gate passes on real IPC, (2) production
-sources stable — sources re-verified unchanged at 03:10; if MM-F's fix touches
-production code, rebuild + re-hash before staging.
+## Credentials delivery status (parent-owned, no values shown)
 
-## CI
+- Real `.env` (both named fields) in place at `dist/data/.env` and
+  `~/Library/Application Support/AiCouncil/.env` — parent verified byte
+  equality + mode 0600. No manual key entry needed; the app reports
+  configured status from the file at launch/reload.
+- Future deliveries: shipping `data/.env` next to the `.app` is imported
+  automatically on first launch (0600, non-overwrite) — no manual step.
+- Live user DB preserved (non-overwrite import; new user chats kept; no
+  backup-over-write path exists in code).
 
-`.github/workflows/ci.yml`: macOS-only (macos-14, Bun 1.4.4 pinned): frontend
-install/typecheck/test/build FIRST, fmt, clippy `-D warnings`, isolated tests,
-`@tauri-apps/cli` bundle, artifact upload (`if-no-files-found: error`).
-**Never executed** (no push allowed) — recorded as a gap, not a pass.
+## Task remnant inventory (B)
 
-## Cleanup inventory (GLM-F task-created)
+- Removed by traps/verification: `$TMPDIR/aicouncil-check.*`,
+  `aicouncil-b-test.*`, `aicouncil-native-smoke.*` (success-cleanup;
+  failure dirs were never kept this round), `/tmp/aicouncil-harness*`.
+- No B-owned processes remain (app/mock killed by driver trap; verified).
+- Parent cleanup scope per plan: `target/`, `frontend/node_modules`,
+  `frontend/dist`, `gen/` schemas, captures; keep dist artifacts + sources +
+  lockfiles + docs.
 
-- KEEP: `~/.rustup`, `~/.cargo`, `~/Library/Caches/rustup` (shared toolchain).
-- Candidate: duplicate rustup toolchain `1.99.1-aarch64-apple-darwin`
-  (`rustup toolchain uninstall 1.99.1`) — redundant with stable.
-- Temp: `$TMPDIR/aicouncil-check.*`, `aicouncil-migrate-selfcheck.*`,
-  `aicouncil-native-smoke.*` (self-cleaning on success; failure dirs kept for
-  MM-F diagnosis — remove at final cleanup), `scripts/macos_clean.sh --apply`
-  sweeps leftovers; `--target` removes `target/` at final cleanup only.
-- Preserved by policy: `dist/data`, `dist/pc-data-backup`, `.env`, shared
-  caches, `frontend/node_modules`, OpenCode sessions.
+## Parent independent acceptance and final cleanup
+
+- Reviewed the final light collapsed-sidebar long chat and dark Settings modal
+  captures; both had visible composer, readable content and correct footer
+  placement. Verification captures were deleted after review.
+- Ran a temporary probe against the actual compiled Rust credential loader and
+  the private Application Support .env: OpenRouter configured=true, DeepSeek
+  configured=true. No values were printed and no paid API call was made. The
+  probe and its isolated directory were removed. Both delivered private files
+  match the original source and have mode 0600.
+- Checked temporary consistent copies of the user databases: original dist data
+  has 3 conversations/18 messages; current Application Support data has
+  4 conversations/18 messages. Both passed integrity_check and foreign_key_check.
+  Current user data was preserved rather than overwritten by the old backup.
+- Independently verified 0.2.1 in the bundle, Tauri config and frontend package;
+  arm64, strict codesign verification, raw checksum sidecar, absence of the
+  native-test harness in both deliverables, and original icon byte equality.
+- Opened the final dist/AiCouncil.app for user review. No shutdown was performed.
+- Final cleanup removes target/, frontend/node_modules, frontend/dist, generated
+  gen/ schemas, intermediate status reports and task-owned temporary files and
+  processes. Final source, lockfiles, docs, original assets, dist delivery,
+  current user data, private .env files and original PC backup are retained.

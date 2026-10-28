@@ -152,8 +152,8 @@ const required = [
   "error_not_found_code", "refresh_catalog", "set_model_preference",
   "list_preferences", "check_key_status", "send_message_single",
   "stream_persists_and_completes", "send_message_slow", "cancel_request",
-  "export_markdown", "reload_credentials", "ime_composition_enter_gate",
-  "dom_renders_conversation",
+  "export_markdown", "reload_credentials", "geometry_native_layout",
+  "ime_composition_enter_gate", "dom_renders_conversation",
 ];
 const missing = required.filter((n) => !r.steps.some((s) => s.name === n));
 if (!r.enabled) { console.error("FAIL: harness not enabled in webview"); process.exit(1); }

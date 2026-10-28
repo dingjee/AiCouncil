@@ -20,7 +20,13 @@ import type {
   UsageRecord,
 } from "../ipc/types";
 
-export type Panel = "history" | "models" | "settings";
+/**
+ * The popup dialogs the shell can show.
+ *
+ * Models and Settings are **modals**, not layout columns: the chat keeps
+ * its width and scroll position while a dialog is open.
+ */
+export type ModalKind = "models" | "settings";
 export type ToastKind = "info" | "error" | "success";
 
 export interface Toast {
@@ -85,7 +91,8 @@ export interface AppState {
    */
   editLatestEligible: Id | null;
 
-  panel: Panel;
+  /** The open popup dialog (`null` = no dialog). */
+  modal: ModalKind | null;
   sidebarCollapsed: boolean;
   conversationSearch: string;
   modelSearch: string;
@@ -123,7 +130,7 @@ export const DEFAULT_SETTINGS: Settings = {
 export const initialState: AppState = {
   status: "booting",
   bootError: null,
-  appVersion: "0.2.0",
+  appVersion: "0.2.1",
 
   conversations: [],
   groups: [],
@@ -149,7 +156,7 @@ export const initialState: AppState = {
   editAttachments: [],
   editLatestEligible: null,
 
-  panel: "history",
+  modal: null,
   sidebarCollapsed: false,
   conversationSearch: "",
   modelSearch: "",

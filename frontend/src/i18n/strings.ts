@@ -30,6 +30,7 @@ const TABLE: Record<string, string> = {
   "message.role.assistant": "Assistant",
   "message.copy": "Copy source",
   "message.copy_tooltip": "Copy full Markdown source of this message",
+  "message.copy_question_tooltip": "Copy the question",
   "message.retry": "Retry",
   "message.continue": "Continue from here",
   "message.continue_tooltip": "Make this answer the main branch and continue",
@@ -120,6 +121,23 @@ const TABLE: Record<string, string> = {
   "panel.back_bottom": "Back to bottom",
   "panel.back_bottom_tooltip": "Jump to the latest messages",
 
+  "modal.close": "Close",
+  "modal.close_tooltip": "Close this dialog",
+  "modal.models_title": "Models",
+  "modal.settings_title": "Settings",
+
+  "dialog.db.title": "The chat database is not available",
+
+  "egress.title": "Network region check",
+  "egress.cancel": "Cancel",
+  "egress.blocked":
+    "Anthropic models cannot be used from this network region ({country}).",
+  "egress.unknown":
+    "The network region could not be verified, so Anthropic models are blocked.",
+  "egress.detail": "Details: {detail}",
+  "egress.recheck": "Check again",
+  "egress.send_without": "Send without Anthropic",
+
   "group.new": "New group",
   "group.new_placeholder": "Group name",
   "group.create": "Create",
@@ -129,6 +147,11 @@ const TABLE: Record<string, string> = {
   "group.delete_confirm": "Delete group \"{name}\"? Its chats become ungrouped.",
 
   "models.test_connection": "Test connection",
+  "models.refreshing": "Refreshing…",
+  "models.testing": "Testing…",
+  "models.connect_failed": "Connection failed ({error})",
+  "models.connected_no_support": "This provider does not report a quota",
+  "models.connected_no_quota": "No quota information available",
   "models.refresh_catalog": "Refresh catalog",
   "models.search_placeholder": "Search models (name/ID)",
   "models.mine": "My models",
@@ -160,7 +183,7 @@ const TABLE: Record<string, string> = {
   "settings.credentials_reloading": "Reloading…",
   "settings.credentials_source": "Configuration source: {source}",
   "settings.credentials_env_hint":
-    "Provider keys are read from the local .env file (the only source). Put it next to the application, in ~/.aicouncil/.env, or point AICOUNCIL_ENV_FILE at it. The app never stores keys in the browser.",
+    "Provider keys are read from the local .env file (the only source): ~/Library/Application Support/AiCouncil/.env. On the first start of the bundled app, a data/.env next to the application is imported into that folder (an existing file is never overwritten). AICOUNCIL_ENV_PATH selects a different file. Use \"Reload credentials\" to re-read it. The app never stores keys in the browser.",
   "settings.credentials_reload_credentials": "Reload credentials",
   "settings.credentials_missing": "Missing: {providers}",
   "settings.data_dir": "Data directory",

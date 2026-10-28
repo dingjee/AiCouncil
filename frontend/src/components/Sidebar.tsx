@@ -358,17 +358,9 @@ export function Sidebar() {
         <button
           type="button"
           className="btn"
-          onClick={() => actions.setPanel("history")}
-          aria-current={state.panel === "history"}
-        >
-          <Icon name="chats" />
-          {t("panel.history")}
-        </button>
-        <button
-          type="button"
-          className="btn"
-          onClick={() => actions.setPanel("models")}
-          aria-current={state.panel === "models"}
+          aria-haspopup="dialog"
+          aria-expanded={state.modal === "models"}
+          onClick={() => actions.openModal("models")}
         >
           <Icon name="models" />
           {t("panel.models")}
@@ -376,8 +368,9 @@ export function Sidebar() {
         <button
           type="button"
           className="btn"
-          onClick={() => actions.setPanel("settings")}
-          aria-current={state.panel === "settings"}
+          aria-haspopup="dialog"
+          aria-expanded={state.modal === "settings"}
+          onClick={() => actions.openModal("settings")}
         >
           <Icon name="settings" />
           {t("panel.settings")}

@@ -20,3 +20,6 @@ frontend/dist/
 # macOS packaging artifacts
 *.dmg
 *.app
+
+# Tauri-generated schemas (recreated by builds)
+/gen/

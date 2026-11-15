@@ -71,13 +71,27 @@ export function compareMessages(a: Message, b: Message): number {
 }
 
 export interface AnswerItem {
+  /** The message the slot shows: the **newest** attempt of the lineage. */
   message_id: Id;
   model_id: string;
   request_id: Id | null;
+  /** This slot's attempt number within its lineage (1-based). */
   attempt: number;
   attempts_total: number;
   status: string | null;
+  /**
+   * True only for the older attempts listed in `older_attempts`: the folded
+   * slot itself is always the visible representative.
+   */
   superseded: boolean;
+  /**
+   * The superseded attempts of this lineage, oldest first.
+   *
+   * A retry replaces the failed attempt **in place**: the slot keeps the
+   * original tab position and shows the newest attempt; the replaced ones
+   * stay reachable through the "show attempts" history toggle.
+   */
+  older_attempts: AnswerItem[];
 }
 
 /** Latest generation for an assistant message. */
@@ -99,8 +113,11 @@ export function latestGeneration(
 /**
  * Build the answer set of a question.
  *
- * Retry attempts of the same lineage are folded: the newest attempt stays
- * visible, older ones are marked `superseded` but keep their attempt number.
+ * Retry attempts of the same lineage are folded into **one** slot: the slot
+ * sits at the first attempt's position (so a retried model keeps its tab),
+ * and shows the newest attempt. A retry therefore replaces the failed
+ * answer in place instead of appending another tab. The replaced attempts
+ * stay available through `older_attempts` (the history toggle).
  */
 export function answerSet(
   tree: MessageTree,
@@ -113,38 +130,65 @@ export function answerSet(
     generationById.set(id.id, latestGeneration(generations, id.id));
   }
 
-  const rootOf = (id: string) => {
+  /**
+   * Lineage key of an answer.
+   *
+   * The retry root identifies every attempt of the same logical request. An
+   * answer without a generation is its own slot (a message the backend has
+   * not described yet must still be visible).
+   */
+  const rootOf = (id: string): string => {
     const generation = generationById.get(id);
-    if (!generation) return null;
+    if (!generation) return `message:${id}`;
     return generation.retry_root_id ?? generation.request_id;
   };
 
-  return ids.map((message, index) => {
-    const generation = generationById.get(message.id);
-    const root = rootOf(message.id);
-    let attempt = 1;
-    let attemptsTotal = 1;
-    let superseded = false;
-    if (root) {
-      attempt =
-        ids.slice(0, index).filter((other) => rootOf(other.id) === root).length + 1;
-      attemptsTotal = Math.max(
-        1,
-        ids.filter((other) => rootOf(other.id) === root).length,
-      );
-      superseded = ids
-        .slice(index + 1)
-        .some((other) => rootOf(other.id) === root);
-    }
+  const makeItem = (message: {
+    id: string;
+  }): AnswerItem => {
+    const generation = generationById.get(message.id) ?? null;
     return {
       message_id: message.id,
       model_id: generation?.model_id ?? "",
       request_id: generation?.request_id ?? null,
-      attempt,
-      attempts_total: attemptsTotal,
+      attempt: 1,
+      attempts_total: 1,
       status: generation?.status ?? null,
-      superseded,
+      superseded: false,
+      older_attempts: [],
     };
+  };
+
+  // Group the answers by lineage, remembering the order of the FIRST
+  // attempt of each group — that position is where the slot stays.
+  const order: string[] = [];
+  const groups = new Map<string, AnswerItem[]>();
+  for (const message of ids) {
+    const root = rootOf(message.id);
+    let group = groups.get(root);
+    if (!group) {
+      group = [];
+      groups.set(root, group);
+      order.push(root);
+    }
+    group.push(makeItem(message));
+  }
+
+  return order.map((root) => {
+    const group = groups.get(root)!;
+    const total = group.length;
+    const newest = group[total - 1];
+    newest.attempt = total;
+    newest.attempts_total = total;
+    newest.older_attempts = group
+      .slice(0, -1)
+      .map((item, index) => ({
+        ...item,
+        attempt: index + 1,
+        attempts_total: total,
+        superseded: true,
+      }));
+    return newest;
   });
 }
 

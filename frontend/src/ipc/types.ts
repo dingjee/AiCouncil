@@ -25,6 +25,8 @@ export interface ConversationSummary {
   title_source: TitleSource;
   title_status: TitleStatus;
   title_revision: number;
+  /** Auto-title attempts so far (0 = never tried; failures keep fallback). */
+  title_attempt_count: number;
   main_leaf_id: Id | null;
   draft_revision: number;
   created_at_ms: number;

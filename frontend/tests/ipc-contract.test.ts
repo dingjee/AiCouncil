@@ -211,6 +211,7 @@ export function fixtureConversation(
     title_source: "manual",
     title_status: "ready",
     title_revision: 1,
+    title_attempt_count: 0,
     main_leaf_id: mainLeafId,
     draft_revision: 0,
     created_at_ms: 0,

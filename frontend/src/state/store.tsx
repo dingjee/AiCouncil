@@ -24,8 +24,10 @@ import {
 } from "react";
 
 import { IpcClient } from "../ipc/client";
+import { f, t } from "../i18n/strings";
 import type {
   Attachment,
+  CatalogEntry,
   ChatEvent,
   ModelPreferenceEntry,
   ConversationSummary,
@@ -60,6 +62,147 @@ const DELTA_FLUSH_MS = 50;
  * does not answer in time.
  */
 const DRAFT_FLUSH_TIMEOUT_MS = 5000;
+
+/**
+ * Upper bound for a single draft write.
+ *
+ * A write that does not answer in time is abandoned so that the queue of
+ * its conversation continues (one hanging write must not block every
+ * conversation). The late answer is watched separately: the write may still
+ * have reached the database.
+ */
+const DRAFT_WRITE_TIMEOUT_MS = 5000;
+
+/** The composer content of one buffer (the normal one or the edit one). */
+interface DraftContent {
+  text: string;
+  attachments: Attachment[];
+}
+
+/**
+ * One composer buffer.
+ *
+ * `local` is the truth (what the user has right now), `saved` is what the
+ * backend is known to hold. `version` counts the local edits: it tells a
+ * **new** input apart from a repeated save of the same content — the
+ * backend counts a retyped text as a new revision, so the frontend has to
+ * count it as well.
+ */
+interface DraftSlot {
+  /** What the user has right now. */
+  local: DraftContent;
+  /** What the backend is known to hold (`null` = unknown). */
+  saved: DraftContent | null;
+  /** The number of local edits. */
+  version: number;
+  /** The version at which the local content was last in sync with the backend. */
+  syncedVersion: number;
+  /** The local content is a new edit the backend has not counted yet. */
+  dirty: boolean;
+  /**
+   * The row must be empty.
+   *
+   * A send consumed the content of this buffer: the database has to be
+   * empty as well. A read that still carries content is a **stale write**
+   * (a save that landed after the send) — it must neither come back into
+   * the composer nor stay in the row.
+   */
+  expectEmpty: boolean;
+  /** The pending autosave timer. */
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+/**
+ * The composer lifecycle of one conversation.
+ *
+ * The normal draft and the edit buffer are separate buffers, but the
+ * backend counts them in **one** revision (`draft_revision`): a write of
+ * one buffer moves the compare-and-swap token of the other.
+ */
+interface ConvDraft {
+  normal: DraftSlot;
+  edit: DraftSlot;
+  /** The message the edit buffer belongs to. */
+  editTarget: Id | null;
+  /** The normal content a send consumed (it must never come back). */
+  consumed: DraftContent | null;
+  /** The edit content a send consumed. */
+  consumedEdit: DraftContent | null;
+  /** The tail of the per conversation write queue. */
+  queue: Promise<unknown>;
+  /** The number of the newest started read. */
+  readSeq: number;
+  /** The number of the newest applied read. */
+  appliedRead: number;
+  /** Bumped by every accepted send: reads that started earlier are stale. */
+  clearGen: number;
+  /** The revision the backend last reported for this conversation. */
+  revision: number;
+}
+
+/** The snapshot of a send: what was submitted and when. */
+interface SendSnapshot {
+  conversationId: Id;
+  mode: "normal" | "edit";
+  text: string;
+  attachments: Attachment[];
+  /** The local version of the submitted buffer at the time of the send. */
+  version: number;
+  branchSelection: Id[];
+}
+
+/** A fresh (empty) composer buffer. */
+function newSlot(): DraftSlot {
+  return {
+    local: { text: "", attachments: [] },
+    saved: null,
+    version: 0,
+    syncedVersion: 0,
+    dirty: false,
+    expectEmpty: false,
+    timer: null,
+  };
+}
+
+/** Compare two composer contents by value. */
+function sameContent(a: DraftContent | null, b: DraftContent | null): boolean {
+  if (!a || !b) return false;
+  return a.text === b.text && sameAttachments(a.attachments, b.attachments);
+}
+
+/** True when a composer buffer holds nothing. */
+function isEmptyContent(content: DraftContent): boolean {
+  return content.text.length === 0 && content.attachments.length === 0;
+}
+
+/**
+ * Run a promise with a deadline.
+ *
+ * The promise itself is always handled, so an abandoned write can never
+ * raise an unhandled rejection.
+ */
+async function withDeadline<T>(
+  work: Promise<T>,
+  ms: number,
+): Promise<
+  | { status: "done"; value: T }
+  | { status: "failed"; error: unknown }
+  | { status: "timeout" }
+> {
+  const guarded = work.then(
+    (value) => ({ status: "done", value }) as const,
+    (error) => ({ status: "failed", error }) as const,
+  );
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const deadline = new Promise<{ status: "timeout" }>((resolve) => {
+    timer = setTimeout(() => resolve({ status: "timeout" }), ms);
+  });
+  try {
+    return await Promise.race([guarded, deadline]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
 
 export interface ToastOptions {
   kind?: "info" | "error" | "success";
@@ -98,6 +241,8 @@ export interface Actions {
   cancelEdit(): void;
   setComposerText(text: string): void;
   setComposerAttachments(attachments: Attachment[]): void;
+  setEditText(text: string): void;
+  setEditAttachments(attachments: Attachment[]): void;
   addAttachments(files: File[]): Promise<void>;
   addPastedText(text: string): void;
   removeAttachment(index: number): void;
@@ -135,23 +280,24 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
   /** Guards against late replies of a chat the user already left. */
   const selectionToken = useRef(0);
-  /** Guards the draft autosave against out-of-order replies. */
-  const draftToken = useRef(0);
   /** Monotonic id for the egress intent (matches the native behaviour). */
   const egressIntent = useRef(0);
   /**
-   * Per conversation: the composer content the backend is known to hold.
+   * The composer lifecycle of every conversation the frontend knows.
    *
-   * A refetch may only overwrite the composer when it still matches this
-   * baseline — otherwise input the user typed meanwhile would be lost.
+   * It replaces the two former maps (`draftBaselines` / `lastSavedDrafts`):
+   * one record per conversation holds the local content, the content the
+   * backend is known to hold, the local edit counter and the write queue.
    */
-  const draftBaselines = useRef(
-    new Map<Id, { text: string; attachments: Attachment[] }>(),
-  );
-  /** Per conversation: the last content we actually wrote to the backend. */
-  const lastSavedDrafts = useRef(
-    new Map<Id, { text: string; attachments: Attachment[] }>(),
-  );
+  const convDrafts = useRef(new Map<Id, ConvDraft>());
+  /**
+   * The conversation the composer content belongs to.
+   *
+   * The composer shows the content of the **open** chat only; while another
+   * chat is loading the content on screen is stale and must not be written
+   * into the slot of the chat that is opening.
+   */
+  const composerOwner = useRef<Id | null>(null);
   /**
    * Buffered stream deltas.
    *
@@ -167,6 +313,23 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
   const deltaTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Last send intent, kept for the "send without Anthropic" path. */
   const pendingSend = useRef<SendMessageRequest | null>(null);
+  /** The snapshot of the pending send (the same intent). */
+  const pendingSnapshot = useRef<SendSnapshot | null>(null);
+  /**
+   * Per model: the number of the newest enable/disable request.
+   *
+   * A late reply of an older request must not roll back a newer choice, so
+   * every request carries its number and only the newest one may undo
+   * anything.
+   */
+  const modelToggleSeq = useRef(new Map<string, number>());
+  /**
+   * Per model: the tail of the write queue.
+   *
+   * The writes of one model are serialised, so a fast double click cannot
+   * persist the older value after the newer one.
+   */
+  const modelWriteQueue = useRef(new Map<string, Promise<unknown>>());
 
   const showToast = useCallback(
     (text: string, options?: ToastOptions) => {
@@ -177,10 +340,272 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
   const dismissToast = useCallback(() => dispatch({ type: "toast/hide" }), [dispatch]);
 
+  // ----- composer lifecycle -----
+
+  /** The lifecycle record of a conversation (created on demand). */
+  const draftOf = useCallback((conversationId: Id): ConvDraft => {
+    let entry = convDrafts.current.get(conversationId);
+    if (!entry) {
+      entry = {
+        normal: newSlot(),
+        edit: newSlot(),
+        editTarget: null,
+        consumed: null,
+        consumedEdit: null,
+        queue: Promise.resolve(),
+        readSeq: 0,
+        appliedRead: 0,
+        clearGen: 0,
+        revision: 0,
+      };
+      convDrafts.current.set(conversationId, entry);
+    }
+    return entry;
+  }, []);
+
+  /**
+   * Record a local edit of a buffer.
+   *
+   * The version is the "input generation": it tells a new input apart from
+   * a repeated save of the same content. `dirty` marks the content as a
+   * change the backend has not counted yet — it has to be written with
+   * `changed = true`, even when the text is identical to the saved one.
+   */
+  const markLocalEdit = useCallback(
+    (slot: DraftSlot, content: DraftContent) => {
+      if (sameContent(slot.local, content)) return;
+      slot.local = content;
+      slot.version += 1;
+      slot.dirty = true;
+      // The user wrote something again: the row may hold their content.
+      slot.expectEmpty = false;
+    },
+    [],
+  );
+
+  /** Stop the pending autosave of a buffer (the write queue takes over). */
+  const cancelPendingSave = useCallback((slot: DraftSlot) => {
+    if (slot.timer !== null) {
+      clearTimeout(slot.timer);
+      slot.timer = null;
+    }
+  }, []);
+
+  /**
+   * Run a write in the per conversation queue.
+   *
+   * The writes of one conversation are serialised: the revision is a
+   * compare-and-swap token, so two overlapping writes would let the older
+   * one win. The task must always settle (it carries its own deadline),
+   * otherwise the queue of the conversation would stall forever.
+   */
+  const enqueueDraftWrite = useCallback(
+    <T,>(conversationId: Id, task: () => Promise<T>): Promise<T> => {
+      const entry = draftOf(conversationId);
+      const run = entry.queue.then(task, task);
+      entry.queue = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    },
+    [draftOf],
+  );
+
+  /** The raw IPC call that persists the normal draft. */
+  const saveNormal = useCallback(
+    (conversationId: Id, content: DraftContent, changed: boolean) =>
+      client.saveDraft({
+        conversation_id: conversationId,
+        text: content.text,
+        attachments: content.attachments,
+        changed,
+      }),
+    [client],
+  );
+
+  /** The raw IPC call that persists the edit buffer. */
+  const saveEdit = useCallback(
+    (conversationId: Id, content: DraftContent, changed: boolean) =>
+      client.saveEditBuffer({
+        conversation_id: conversationId,
+        text: content.text,
+        attachments: content.attachments,
+        target_id: draftOf(conversationId).editTarget,
+        changed,
+      }),
+    [client, draftOf],
+  );
+
+  /**
+   * Write one buffer of a conversation (runs inside the write queue).
+   *
+   * The content is read **when the write runs**, not when it was
+   * scheduled: a save that was scheduled before a send must never write the
+   * consumed snapshot again. A buffer whose content the backend already
+   * holds is not written at all — unless the local content is a new edit
+   * (the backend counts a retyped text as a new revision).
+   */
+  const persistSlot = useCallback(
+    async (
+      conversationId: Id,
+      kind: "normal" | "edit",
+    ): Promise<{ ok: boolean; revision: number | null; error?: unknown }> => {
+      const entry = draftOf(conversationId);
+      const slot = kind === "normal" ? entry.normal : entry.edit;
+      const content = slot.local;
+      if (slot.saved && sameContent(slot.saved, content) && !slot.dirty) {
+        return { ok: true, revision: entry.revision };
+      }
+      const changed = slot.dirty;
+      const version = slot.version;
+      const promise =
+        kind === "normal"
+          ? saveNormal(conversationId, content, changed)
+          : saveEdit(conversationId, content, changed);
+      const outcome = await withDeadline(promise, DRAFT_WRITE_TIMEOUT_MS);
+      if (outcome.status === "timeout") {
+        // The write may still reach the database — and it carries the
+        // content of the moment it was started, which is not the current
+        // content any more: the row has to be corrected when it lands.
+        void promise.then(
+          () => {
+            if (sameContent(slot.local, content)) return;
+            void enqueueDraftWrite(conversationId, () => {
+              // The row has to be corrected: its content is unknown.
+              slot.saved = null;
+              return persistSlot(conversationId, kind);
+            });
+          },
+          () => undefined,
+        );
+        return {
+          ok: false,
+          revision: null,
+          error: new Error("draft write timed out"),
+        };
+      }
+      if (outcome.status === "failed") {
+        showToast(`Draft could not be saved: ${describe(outcome.error)}`, {
+          kind: "error",
+        });
+        return { ok: false, revision: null, error: outcome.error };
+      }
+      slot.saved = { text: content.text, attachments: content.attachments };
+      if (slot.version === version) {
+        slot.dirty = false;
+        slot.syncedVersion = version;
+      }
+      entry.revision = outcome.value.revision;
+      // The revision in the state belongs to the **open** chat: a reply of
+      // another chat must not overwrite it.
+      if (stateRef.current.currentConversationId === conversationId) {
+        dispatch({ type: "draft/revision", revision: outcome.value.revision });
+      }
+      return { ok: true, revision: outcome.value.revision };
+    },
+    [dispatch, draftOf, enqueueDraftWrite, saveEdit, saveNormal, showToast],
+  );
+
+  /** Persist a buffer of a conversation (queued). */
+  const writeSlot = useCallback(
+    (conversationId: Id, kind: "normal" | "edit"): Promise<unknown> =>
+      enqueueDraftWrite(conversationId, () =>
+        persistSlot(conversationId, kind),
+      ),
+    [enqueueDraftWrite, persistSlot],
+  );
+
+  /** Persist the normal draft of a conversation (queued). */
+  const writeNormal = useCallback(
+    (conversationId: Id): Promise<unknown> =>
+      writeSlot(conversationId, "normal"),
+    [writeSlot],
+  );
+
+  /** Persist the edit buffer of a conversation (queued). */
+  const writeEdit = useCallback(
+    (conversationId: Id): Promise<unknown> => writeSlot(conversationId, "edit"),
+    [writeSlot],
+  );
+
+  /**
+   * Flush the composer before a send and return the revision to freeze.
+   *
+   * The flush runs **inside** the write queue of the conversation: a save
+   * that is still running has to be finished first, otherwise it would move
+   * the revision after the freeze and break the compare-and-swap of the
+   * send. The normal draft is written before the edit buffer because both
+   * share one revision counter.
+   *
+   * The flush is time-boxed: a slow backend must never block the composer.
+   */
+  const flushBeforeSend = useCallback(
+    async (
+      conversationId: Id,
+      mode: "normal" | "edit",
+    ): Promise<number | null> => {
+      const entry = draftOf(conversationId);
+      const work = enqueueDraftWrite(conversationId, async () => {
+        await persistSlot(conversationId, "normal");
+        if (mode === "edit") {
+          await persistSlot(conversationId, "edit");
+        }
+        return entry.revision;
+      });
+      const outcome = await withDeadline(work, DRAFT_FLUSH_TIMEOUT_MS);
+      if (outcome.status === "done") return outcome.value;
+      if (outcome.status === "failed") {
+        showToast(`Draft could not be saved: ${describe(outcome.error)}`, {
+          kind: "error",
+        });
+      }
+      return null;
+    },
+    [draftOf, enqueueDraftWrite, persistSlot, showToast],
+  );
+
   // ----- conversation helpers -----
 
   const applyConversationDetail = useCallback(
-    (conversationId: Id, detail: Awaited<ReturnType<IpcClient["loadConversation"]>>, draft: Draft | null) => {
+    (
+      conversationId: Id,
+      detail: Awaited<ReturnType<IpcClient["loadConversation"]>>,
+      draft: Draft | null,
+      options: { stale?: boolean } = {},
+    ) => {
+      const entry = draftOf(conversationId);
+      const slot = entry.normal;
+      const editSlot = entry.edit;
+      // The revision only moves forward.
+      if (draft) {
+        entry.revision = Math.max(entry.revision, draft.revision);
+      }
+      // A read that started before an accepted send is stale: its draft may
+      // still be the snapshot the send consumed.
+      const stale = options.stale === true;
+      const editFetched: DraftContent = {
+        text: draft?.edit_text ?? "",
+        attachments: draft?.edit_attachments ?? [],
+      };
+      // The consumed edit must never come back, not even when the database
+      // still holds it (the compare-and-swap lost the race).
+      const editConsumed =
+        entry.consumedEdit !== null &&
+        sameContent(entry.consumedEdit, editFetched) &&
+        isEmptyContent(editSlot.local);
+      // The edit row must be empty (an edit send consumed it) but still
+      // carries something: a save landed after the send.
+      const editStaleRow =
+        editSlot.expectEmpty && !isEmptyContent(editFetched);
+      // The edit buffer of the user is newer than the backend's when the
+      // user changed it since the last synchronisation — and a stale read
+      // must never throw it away either.
+      const preserveEditBuffer =
+        stale ||
+        editConsumed ||
+        editStaleRow ||
+        editSlot.version !== editSlot.syncedVersion;
       dispatch({
         type: "conversation/loaded",
         conversationId,
@@ -190,36 +615,72 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
         usage: detail.usage,
         // Keep the known revision when the draft could not be read: the
         // backend uses it as the send CAS token.
-        draftRevision: draft ? draft.revision : stateRef.current.draftRevision,
+        draftRevision: entry.revision,
         // An **active** edit lives in the draft; `edit_latest` only says
         // that the latest question *may* be edited.
         editTargetId: draft?.edit_target_id ?? null,
         editText: draft?.edit_text ?? "",
         editAttachments: draft?.edit_attachments ?? [],
         editLatestEligible: detail.edit_latest?.target_id ?? null,
+        preserveEditBuffer,
       });
       if (draft) {
-        const baseline = draftBaselines.current.get(conversationId);
-        const current = stateRef.current;
-        const hasNewerInput = baseline
-          ? current.composerText !== baseline.text ||
-            !sameAttachments(current.composerAttachments, baseline.attachments)
-          : false;
-        if (!hasNewerInput) {
-          dispatch({ type: "composer/text", text: draft.text });
-          dispatch({ type: "composer/attachments", attachments: draft.attachments });
-          draftBaselines.current.set(conversationId, {
-            text: draft.text,
-            attachments: draft.attachments,
-          });
-          lastSavedDrafts.current.set(conversationId, {
-            text: draft.text,
-            attachments: draft.attachments,
-          });
+        const fetched: DraftContent = {
+          text: draft.text,
+          attachments: draft.attachments,
+        };
+        // The consumed snapshot must never come back, not even when the
+        // database still holds it (the compare-and-swap lost the race).
+        const consumed =
+          entry.consumed !== null &&
+          sameContent(entry.consumed, fetched) &&
+          isEmptyContent(slot.local);
+        const inSync = slot.version === slot.syncedVersion;
+        // The row must be empty (a send consumed the content) but still
+        // carries something: a save landed after the send. It must not come
+        // back into the composer, and the row is corrected.
+        const staleRow = slot.expectEmpty && !isEmptyContent(fetched);
+        if (consumed || staleRow) {
+          slot.saved = null;
+          slot.dirty = false;
+          void writeSlot(conversationId, "normal");
+        } else if (!stale && inSync) {
+          dispatch({ type: "composer/text", text: fetched.text });
+          dispatch({ type: "composer/attachments", attachments: fetched.attachments });
+          composerOwner.current = conversationId;
+          slot.local = {
+            text: fetched.text,
+            attachments: fetched.attachments,
+          };
+          slot.saved = {
+            text: fetched.text,
+            attachments: fetched.attachments,
+          };
+          slot.dirty = false;
+          slot.syncedVersion = slot.version;
+          if (isEmptyContent(fetched)) slot.expectEmpty = false;
+        }
+        // The edit buffer follows the same rule as the normal draft.
+        if (editConsumed || editStaleRow) {
+          // The row still holds the consumed edit: it must not come back
+          // into the composer, and the row is corrected.
+          editSlot.saved = null;
+          editSlot.dirty = false;
+          void writeSlot(conversationId, "edit");
+        } else if (!preserveEditBuffer) {
+          editSlot.local = editFetched;
+          editSlot.saved = {
+            text: editFetched.text,
+            attachments: editFetched.attachments,
+          };
+          editSlot.dirty = false;
+          editSlot.syncedVersion = editSlot.version;
+          if (isEmptyContent(editFetched)) editSlot.expectEmpty = false;
+          entry.editTarget = draft.edit_target_id;
         }
       }
     },
-    [dispatch],
+    [dispatch, draftOf, writeSlot],
   );
 
   /**
@@ -244,16 +705,29 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
    * to another chat in the meantime. The token check happens **before** the
    * state is touched, so a late reply can neither repaint the current chat
    * nor overwrite the composer of the chat that is open now.
+   *
+   * Two reads of the same chat may also answer out of order: the older one
+   * is dropped instead of rolling the newer snapshot back. A read that was
+   * started before an accepted send is marked stale — its draft may still
+   * be the snapshot the send consumed.
    */
   const loadConversation = useCallback(
     async (conversationId: Id): Promise<void> => {
       const token = selectionToken.current;
+      const entry = draftOf(conversationId);
+      const seq = (entry.readSeq += 1);
+      const clearGen = entry.clearGen;
       const { detail, draft } = await fetchConversation(conversationId);
       if (token !== selectionToken.current) return;
       if (stateRef.current.currentConversationId !== conversationId) return;
-      applyConversationDetail(conversationId, detail, draft);
+      // An older snapshot must not overwrite a newer one.
+      if (seq < entry.appliedRead) return;
+      entry.appliedRead = seq;
+      applyConversationDetail(conversationId, detail, draft, {
+        stale: clearGen !== entry.clearGen,
+      });
     },
-    [applyConversationDetail, fetchConversation],
+    [applyConversationDetail, draftOf, fetchConversation],
   );
 
   const bootstrap = useCallback(async () => {
@@ -283,9 +757,15 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
         selectionToken.current += 1;
         const token = selectionToken.current;
         try {
+          const entry = draftOf(first);
+          const seq = (entry.readSeq += 1);
+          const clearGen = entry.clearGen;
           const { detail, draft } = await fetchConversation(first);
           if (token !== selectionToken.current) return;
-          applyConversationDetail(first, detail, draft);
+          entry.appliedRead = seq;
+          applyConversationDetail(first, detail, draft, {
+            stale: clearGen !== entry.clearGen,
+          });
           dispatch({ type: "conversation/selected", conversationId: first });
         } catch (error) {
           showToast(`Failed to open chat: ${describe(error)}`, { kind: "error" });
@@ -294,7 +774,7 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     } catch (error) {
       dispatch({ type: "boot/failed", error: describe(error) });
     }
-  }, [applyConversationDetail, client, fetchConversation, showToast]);
+  }, [applyConversationDetail, client, draftOf, fetchConversation, showToast]);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -311,35 +791,49 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       const previousId = current.currentConversationId;
       // Flush the pending draft of the chat we are leaving before the new
       // chat paints over the composer.
-      if (
-        previousId &&
-        previousId !== conversationId &&
-        (current.composerText.trim().length > 0 ||
-          current.composerAttachments.length > 0)
-      ) {
-        await persistDraft(
-          previousId,
-          current.composerText,
-          current.composerAttachments,
-          true,
-        );
+      if (previousId && previousId !== conversationId) {
+        const previous = draftOf(previousId);
+        // The pending autosave must not write the same content again after
+        // the queue wrote it.
+        cancelPendingSave(previous.normal);
+        await writeNormal(previousId);
       }
       selectionToken.current += 1;
       const token = selectionToken.current;
       dispatch({ type: "conversation/selected", conversationId });
       if (!conversationId) return;
+      // The composer shows the content of the open chat: the draft of the
+      // chat we are leaving must not stay on screen (and must not be
+      // written into the chat that is opening).
+      composerOwner.current = null;
+      dispatch({ type: "composer/text", text: "" });
+      dispatch({ type: "composer/attachments", attachments: [] });
+      dispatch({ type: "edit/cancel" });
       try {
+        const entry = draftOf(conversationId);
+        const seq = (entry.readSeq += 1);
+        const clearGen = entry.clearGen;
         const { detail, draft } = await fetchConversation(conversationId);
         // A newer selection happened meanwhile: drop the stale snapshot
         // *before* it can touch the composer or the message list.
         if (token !== selectionToken.current) return;
-        applyConversationDetail(conversationId, detail, draft);
+        if (seq < entry.appliedRead) return;
+        entry.appliedRead = seq;
+        applyConversationDetail(conversationId, detail, draft, {
+          stale: clearGen !== entry.clearGen,
+        });
       } catch (error) {
         if (token !== selectionToken.current) return;
         showToast(`Failed to open chat: ${describe(error)}`, { kind: "error" });
       }
     },
-    [loadConversation, showToast],
+    [
+      cancelPendingSave,
+      draftOf,
+      fetchConversation,
+      showToast,
+      writeNormal,
+    ],
   );
 
   const createConversation = useCallback(async () => {
@@ -461,29 +955,91 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
   // ----- models -----
 
+  /**
+   * Enable or disable a model.
+   *
+   * A model of the catalogue that has **no** preference yet can be added to
+   * "My models": a complete preference is built from the catalogue entry
+   * (its provider id) and persisted through the existing upsert command.
+   * The existing sort order, the default flag and the parameter overrides
+   * of a known model are never touched.
+   *
+   * A failed write restores the previous state and reports the error. The
+   * writes of one model are serialised and every request carries a number,
+   * so a fast double click can neither roll back the newer choice nor
+   * persist the older value.
+   */
   const setModelEnabled = useCallback(
     async (modelId: string, enabled: boolean) => {
       const current = stateRef.current;
-      const preference = current.preferences.find(
+      const existing = current.preferences.find(
         (entry) => entry.model_id === modelId,
       );
-      if (!preference) return;
-      const next = {
+      const catalogEntry = current.catalog.find((entry) => entry.id === modelId);
+      const providerId = existing?.provider_id ?? catalogEntry?.provider_id;
+      if (!providerId) {
+        showToast(t("toast.model_unknown"), { kind: "error" });
+        return;
+      }
+
+      const next: ModelPreferenceEntry = existing
+        ? { ...existing, enabled }
+        : {
+            provider_id: providerId,
+            model_id: modelId,
+            enabled,
+            // A new model joins at the end of the panel order.
+            sort_order: nextSortOrder(current.preferences),
+            is_default: false,
+            overrides: null,
+          };
+
+      const seq = (modelToggleSeq.current.get(modelId) ?? 0) + 1;
+      modelToggleSeq.current.set(modelId, seq);
+
+      dispatch({
+        type: "model/enabled",
+        modelId,
         enabled,
-        sort_order: preference.sort_order,
-        is_default: preference.is_default,
-        overrides: preference.overrides,
-      };
-      dispatch({ type: "model/enabled", modelId, enabled });
+        preference: existing ? undefined : next,
+      });
+
+      // The writes of one model run one after the other.
+      const previous = modelWriteQueue.current.get(modelId) ?? Promise.resolve();
+      const write = previous
+        .catch(() => undefined)
+        .then(() =>
+          client.setModelPreference({
+            provider_id: next.provider_id,
+            model_id: modelId,
+            preference: {
+              enabled: next.enabled,
+              sort_order: next.sort_order,
+              is_default: next.is_default,
+              overrides: next.overrides,
+            },
+          }),
+        );
+      modelWriteQueue.current.set(
+        modelId,
+        write.catch(() => undefined),
+      );
+
       try {
-        await client.setModelPreference({
-          provider_id: preference.provider_id,
-          model_id: modelId,
-          preference: next,
-        });
+        await write;
       } catch (error) {
-        dispatch({ type: "model/enabled", modelId, enabled: !enabled });
-        showToast(`Could not update model: ${describe(error)}`, { kind: "error" });
+        // A newer click owns the model now: its result must not be undone.
+        if (modelToggleSeq.current.get(modelId) !== seq) return;
+        dispatch({
+          type: "model/enabled",
+          modelId,
+          enabled: !enabled,
+          // A model that had no preference before must not keep one.
+          preference: existing ? undefined : null,
+        });
+        showToast(f("toast.model_update_failed", { error: describe(error) }), {
+          kind: "error",
+        });
       }
     },
     [client, showToast],
@@ -564,20 +1120,16 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     [client, showToast],
   );
 
+  /**
+   * Compatibility shim for the old "parallel" toggle.
+   *
+   * There is no parallel mode any more: the checked models **are** the
+   * selection. `true` checks every enabled model, `false` keeps only the
+   * primary one.
+   */
   const setParallel = useCallback(
     (value: boolean) => {
       dispatch({ type: "model/parallel", value });
-      if (!value) return;
-      const current = stateRef.current;
-      const enabled = enabledModels(current);
-      const checked = current.modelSelection.checked.filter((id) => enabled.includes(id));
-      if (checked.length === 0) {
-        const primary =
-          current.modelSelection.primary && enabled.includes(current.modelSelection.primary)
-            ? current.modelSelection.primary
-            : (enabled[0] ?? null);
-        dispatch({ type: "model/checkedSet", modelIds: primary ? [primary] : [] });
-      }
     },
     [dispatch],
   );
@@ -621,6 +1173,14 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
   const refreshPreferences = useCallback(async (): Promise<ModelPreferenceEntry[] | null> => {
     try {
       const preferences = await client.listPreferences();
+      // A backend that answers with something else must not wipe the list —
+      // and must not pass unnoticed: a non-array means a broken bridge.
+      if (!Array.isArray(preferences)) {
+        console.warn(
+          "list_preferences answered with a non-array; keeping the current list",
+        );
+        return null;
+      }
       dispatch({ type: "preferences/loaded", preferences });
       return preferences;
     } catch (error) {
@@ -690,92 +1250,69 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
   // ----- composer / drafts -----
 
+  /**
+   * Note a local edit of the composer.
+   *
+   * The slot of the open conversation is updated **immediately** (not only
+   * after the next render): a write that is already queued has to see the
+   * content the user has right now.
+   */
+  const noteComposerEdit = useCallback(
+    (text: string, attachments: Attachment[]) => {
+      const conversationId = stateRef.current.currentConversationId;
+      if (!conversationId) return;
+      composerOwner.current = conversationId;
+      markLocalEdit(draftOf(conversationId).normal, { text, attachments });
+    },
+    [draftOf, markLocalEdit],
+  );
+
   const setComposerText = useCallback(
-    (text: string) => dispatch({ type: "composer/text", text }),
-    [dispatch],
+    (text: string) => {
+      dispatch({ type: "composer/text", text });
+      noteComposerEdit(text, stateRef.current.composerAttachments);
+    },
+    [dispatch, noteComposerEdit],
   );
 
   const setComposerAttachments = useCallback(
-    (attachments: Attachment[]) =>
-      dispatch({ type: "composer/attachments", attachments }),
-    [dispatch],
-  );
-
-  const persistDraft = useCallback(
-    async (conversationId: Id, text: string, attachments: Attachment[], changed: boolean) => {
-      draftToken.current += 1;
-      const token = draftToken.current;
-      try {
-        const result = await client.saveDraft({
-          conversation_id: conversationId,
-          text,
-          attachments,
-          changed,
-        });
-        if (token !== draftToken.current) return;
-        dispatch({ type: "draft/revision", revision: result.revision });
-        // The backend now holds exactly this content.
-        draftBaselines.current.set(conversationId, { text, attachments });
-        lastSavedDrafts.current.set(conversationId, { text, attachments });
-      } catch (error) {
-        if (token !== draftToken.current) return;
-        showToast(`Draft could not be saved: ${describe(error)}`, { kind: "error" });
-      }
+    (attachments: Attachment[]) => {
+      dispatch({ type: "composer/attachments", attachments });
+      noteComposerEdit(stateRef.current.composerText, attachments);
     },
-    [client, showToast],
+    [dispatch, noteComposerEdit],
   );
 
   /**
-   * Flush the composer draft before a send and return the revision the
-   * backend handed back.
+   * Note a local edit of the edit buffer.
    *
-   * The backend consumes the draft only if the stored revision still equals
-   * the `expected_draft_revision` we send, so the flush has to happen
-   * **before** the snapshot. The flush is time-boxed: a slow backend must
-   * never block the composer.
+   * The edit buffer is a buffer of its own: an edit send consumes it, the
+   * normal draft stays untouched.
    */
-  const flushDraftBeforeSend = useCallback(
-    async (
-      conversationId: Id,
-      mode: "normal" | "edit",
-      text: string,
-      attachments: Attachment[],
-      targetId: Id | null,
-    ): Promise<number | null> => {
-      const write =
-        mode === "edit"
-          ? client.saveEditBuffer({
-              conversation_id: conversationId,
-              text,
-              attachments,
-              target_id: targetId,
-              changed: true,
-            })
-          : client.saveDraft({
-              conversation_id: conversationId,
-              text,
-              attachments,
-              changed: true,
-            });
-      const guarded = write.catch((error) => {
-        showToast(`Draft could not be saved: ${describe(error)}`, {
-          kind: "error",
-        });
-        return null;
-      });
-      const timeout = new Promise<null>((resolve) => {
-        setTimeout(() => resolve(null), DRAFT_FLUSH_TIMEOUT_MS);
-      });
-      const result = await Promise.race([guarded, timeout]);
-      if (result && typeof result.revision === "number") {
-        dispatch({ type: "draft/revision", revision: result.revision });
-        draftBaselines.current.set(conversationId, { text, attachments });
-        lastSavedDrafts.current.set(conversationId, { text, attachments });
-        return result.revision;
-      }
-      return null;
+  const noteEditEdit = useCallback(
+    (text: string, attachments: Attachment[]) => {
+      const current = stateRef.current;
+      const conversationId = current.currentConversationId;
+      if (!conversationId || !current.editingLatest) return;
+      markLocalEdit(draftOf(conversationId).edit, { text, attachments });
     },
-    [client, showToast],
+    [draftOf, markLocalEdit],
+  );
+
+  const setEditText = useCallback(
+    (text: string) => {
+      dispatch({ type: "edit/text", text });
+      noteEditEdit(text, stateRef.current.editAttachments);
+    },
+    [dispatch, noteEditEdit],
+  );
+
+  const setEditAttachments = useCallback(
+    (attachments: Attachment[]) => {
+      dispatch({ type: "edit/attachments", attachments });
+      noteEditEdit(stateRef.current.editText, attachments);
+    },
+    [dispatch, noteEditEdit],
   );
 
   const addAttachments = useCallback(
@@ -796,6 +1333,7 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       if (rejection) showToast(rejection, { kind: "error" });
       if (next.length !== current.composerAttachments.length) {
         dispatch({ type: "composer/attachments", attachments: next });
+        noteComposerEdit(current.composerText, next);
       }
     },
     [showToast],
@@ -813,9 +1351,10 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       }
       next.push({ name: pasteAttachmentName(Date.now()), content: text });
       dispatch({ type: "composer/attachments", attachments: next });
+      noteComposerEdit(stateRef.current.composerText, next);
       showToast(`Long paste attached (${text.length} chars)`);
     },
-    [showToast],
+    [noteComposerEdit, showToast],
   );
 
   const removeAttachment = useCallback(
@@ -823,8 +1362,9 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       const current = stateRef.current;
       const next = current.composerAttachments.filter((_, i) => i !== index);
       dispatch({ type: "composer/attachments", attachments: next });
+      noteComposerEdit(current.composerText, next);
     },
-    [dispatch],
+    [dispatch, noteComposerEdit],
   );
 
   // ----- messaging -----
@@ -881,6 +1421,59 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
   );
 
   /**
+   * Consume the snapshot of an accepted send.
+   *
+   * Only the buffer that was sent is cleared, and only when it still holds
+   * exactly what was submitted — the local version tells a new input apart
+   * from the same text typed again. Another chat is never touched.
+   *
+   * The consumed snapshot is remembered: a read that still carries it must
+   * not put it back into the composer (the compare-and-swap of the send may
+   * have lost the race, so the row can still hold it).
+   */
+  const consumeSnapshot = useCallback(
+    (snapshot: SendSnapshot) => {
+      const entry = draftOf(snapshot.conversationId);
+      // Reads that started before the clear are stale.
+      entry.clearGen += 1;
+      const content: DraftContent = {
+        text: snapshot.text,
+        attachments: snapshot.attachments,
+      };
+      const slot = snapshot.mode === "edit" ? entry.edit : entry.normal;
+      if (snapshot.mode === "edit") {
+        entry.consumedEdit = content;
+      } else {
+        entry.consumed = content;
+      }
+      const unchanged =
+        slot.version === snapshot.version && sameContent(slot.local, content);
+      if (!unchanged) return;
+      // The buffer is empty now; the backend consumed it with the
+      // compare-and-swap of the send.
+      slot.local = { text: "", attachments: [] };
+      slot.dirty = false;
+      // The compare-and-swap may have lost the race: the row can still hold
+      // the snapshot — or a save that landed after the send. The next read
+      // notices it and corrects the row.
+      slot.saved = { text: "", attachments: [] };
+      slot.syncedVersion = slot.version;
+      slot.expectEmpty = true;
+      if (snapshot.mode === "edit") {
+        entry.editTarget = null;
+        if (stateRef.current.currentConversationId === snapshot.conversationId) {
+          dispatch({ type: "edit/clear" });
+        }
+      } else if (
+        stateRef.current.currentConversationId === snapshot.conversationId
+      ) {
+        dispatch({ type: "composer/clear" });
+      }
+    },
+    [dispatch, draftOf],
+  );
+
+  /**
    * Submit a send and reconcile.
    *
    * The submission is asynchronous: while it is in flight the user may type
@@ -890,47 +1483,37 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
    * chat is never touched.
    */
   const dispatchSend = useCallback(
-    async (
-      request: SendMessageRequest,
-      submitted: {
-        conversationId: Id;
-        revision: number;
-        text: string;
-        attachments: Attachment[];
-        branchSelection: Id[];
-      },
-    ) => {
-      const conversationId = submitted.conversationId;
+    async (request: SendMessageRequest, snapshot: SendSnapshot) => {
+      const conversationId = snapshot.conversationId;
+      let receipt: unknown;
       try {
-        const receipt = await client.sendMessage(request);
-        // The receipt is advisory; the DB is authoritative. Refetch.
-        const current = stateRef.current;
-        if (current.currentConversationId === conversationId) {
-          const composerUnchanged =
-            current.composerText === submitted.text &&
-            sameAttachments(current.composerAttachments, submitted.attachments);
-          if (composerUnchanged) {
-            dispatch({ type: "composer/clear" });
-            draftBaselines.current.set(conversationId, {
-              text: "",
-              attachments: [],
-            });
-            lastSavedDrafts.current.set(conversationId, {
-              text: "",
-              attachments: [],
-            });
-          }
-          if (sameIds(current.branchSelection, submitted.branchSelection)) {
-            dispatch({ type: "branch/selection", messageIds: [] });
-          }
-          await loadConversation(conversationId);
-        }
-        void receipt;
+        receipt = await client.sendMessage(request);
       } catch (error) {
+        // The backend did not accept the message: the draft and the
+        // attachments stay in the composer — nothing is cleared.
         showToast(`Send failed (draft kept): ${describe(error)}`, { kind: "error" });
+        return;
+      }
+      void receipt;
+      // The message is stored: the submitted snapshot may be consumed.
+      consumeSnapshot(snapshot);
+      const current = stateRef.current;
+      if (current.currentConversationId === conversationId) {
+        if (sameIds(current.branchSelection, snapshot.branchSelection)) {
+          dispatch({ type: "branch/selection", messageIds: [] });
+        }
+      }
+      // The database is authoritative: refresh the chat. A failing refresh
+      // is **not** a failing send.
+      try {
+        await loadConversation(conversationId);
+      } catch (error) {
+        showToast(`Could not refresh the chat: ${describe(error)}`, {
+          kind: "error",
+        });
       }
     },
-    [client, loadConversation, showToast],
+    [client, consumeSnapshot, dispatch, loadConversation, showToast],
   );
 
   const send = useCallback(async () => {
@@ -940,6 +1523,9 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
     let enabled = enabledModels(current);
     let selection = resolveSelection(enabled, [], current.modelSelection);
+    // The state the request is built from; it may hold fresher preferences
+    // than the snapshot at the beginning of the send.
+    let effective = current;
     if (selection.invalidReason === "composer.send_disabled_no_model") {
       // The cached preference list may be stale (the preferences can change
       // outside the webview). Re-read it once before refusing the send, and
@@ -947,8 +1533,9 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       // render, which has not happened yet at this point.
       const fresh = await refreshPreferences();
       if (fresh) {
-        enabled = enabledModels({ ...stateRef.current, preferences: fresh });
-        selection = resolveSelection(enabled, [], stateRef.current.modelSelection);
+        effective = { ...stateRef.current, preferences: fresh };
+        enabled = enabledModels(effective);
+        selection = resolveSelection(enabled, [], effective.modelSelection);
       }
     }
     if (selection.invalidReason) {
@@ -966,34 +1553,43 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     const attachments = editing ? current.editAttachments : current.composerAttachments;
     if (!prompt.trim() && attachments.length === 0) return;
 
-    // Flush the composer draft **before** the snapshot: the backend only
-    // consumes the draft when the stored revision still equals the
+    const entry = draftOf(conversationId);
+    const mode: "normal" | "edit" = editing ? "edit" : "normal";
+    const slot = mode === "edit" ? entry.edit : entry.normal;
+    // Freeze the snapshot: the content **and** the local version. The
+    // version tells a new input apart from the same text typed again.
+    const snapshot: SendSnapshot = {
+      conversationId,
+      mode,
+      text: prompt,
+      attachments,
+      version: slot.version,
+      branchSelection: [...current.branchSelection],
+    };
+
+    // A pending autosave must not write the snapshot again after the flush:
+    // the write queue of the conversation takes over from here.
+    cancelPendingSave(slot);
+
+    // Flush the composer **before** the snapshot: the backend only consumes
+    // the draft when the stored revision still equals the
     // `expected_draft_revision` we send, so the revision has to come from
     // the flush itself.
-    let revision = current.draftRevision;
-    const saved = lastSavedDrafts.current.get(conversationId);
-    const alreadySaved =
-      saved !== undefined &&
-      saved.text === prompt &&
-      sameAttachments(saved.attachments, attachments);
-    if (!alreadySaved) {
-      const flushed = await flushDraftBeforeSend(
-        conversationId,
-        editing ? "edit" : "normal",
-        prompt,
-        attachments,
-        editing,
-      );
-      if (flushed !== null) revision = flushed;
-    }
+    const flushed = await flushBeforeSend(conversationId, mode);
+    const revision = flushed ?? entry.revision;
 
     const request: SendMessageRequest = {
       conversation_id: conversationId,
-      mode: editing ? "edit" : "normal",
+      mode,
       prompt,
       attachments,
       expected_draft_revision: revision,
-      selection: buildSelection(current, selection.targets, selection.primary, current.branchSelection),
+      selection: buildSelection(
+        effective,
+        selection.targets,
+        selection.primary,
+        current.branchSelection,
+      ),
     };
 
     // Anthropic models are gated on the network region.
@@ -1007,6 +1603,7 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
         if (egress.verdict !== "allowed") {
           if (intent !== egressIntent.current) return;
           pendingSend.current = request;
+          pendingSnapshot.current = snapshot;
           dispatch({
             type: "egress/modal",
             modal: {
@@ -1028,18 +1625,14 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     // Diagnostic: the last submitted payload (native smoke harness reads it).
     (globalThis as { __AICOUNCIL_LAST_SEND__?: unknown }).__AICOUNCIL_LAST_SEND__ =
       request;
-    await dispatchSend(request, {
-      conversationId,
-      revision: current.draftRevision,
-      text: prompt,
-      attachments,
-      branchSelection: [...current.branchSelection],
-    });
+    await dispatchSend(request, snapshot);
   }, [
     buildSelection,
+    cancelPendingSave,
     client,
     dispatchSend,
-    flushDraftBeforeSend,
+    draftOf,
+    flushBeforeSend,
     refreshPreferences,
     showToast,
   ]);
@@ -1089,10 +1682,11 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
   const sendWithoutAnthropic = useCallback(async () => {
     const request = pendingSend.current;
+    const snapshot = pendingSnapshot.current;
     pendingSend.current = null;
+    pendingSnapshot.current = null;
     dispatch({ type: "egress/modal", modal: null });
-    if (!request) return;
-    const current = stateRef.current;
+    if (!request || !snapshot) return;
     const filtered = request.selection.targets?.filter(
       (target) => !isAnthropic(target.model_id),
     ) ?? [];
@@ -1105,13 +1699,7 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
         ...request,
         selection: { ...request.selection, targets: filtered, primary: 0 },
       },
-      {
-        conversationId: request.conversation_id,
-        revision: current.draftRevision,
-        text: request.prompt,
-        attachments: request.attachments,
-        branchSelection: [...current.branchSelection],
-      },
+      snapshot,
     );
   }, [dispatchSend, showToast]);
 
@@ -1126,6 +1714,21 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     [client, showToast],
   );
 
+  /**
+   * Retry a failed generation.
+   *
+   * The backend's admission control decides whether a retry may run; its
+   * verdicts are surfaced verbatim instead of a generic "not available":
+   *
+   *   - `admission.cooldown`   → the lineage is cooling down (Retry-After or
+   *     backoff); the toast says when the retry becomes possible again;
+   *   - `admission.needs_action` → something on the user's side must change
+   *     first (key, balance, IP, input, model);
+   *   - `admission.duplicate`  → an attempt of this lineage is already live.
+   *
+   * Together with the disabled countdown button this keeps dead retries
+   * from ever reaching the backend.
+   */
   const retry = useCallback(
     async (requestId: Id) => {
       const conversationId = stateRef.current.currentConversationId;
@@ -1133,7 +1736,35 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
         await client.retryRequest(requestId);
         if (conversationId) await loadConversation(conversationId);
       } catch (error) {
-        showToast(`Retry not available: ${describe(error)}`, { kind: "error" });
+        const code =
+          error && typeof error === "object"
+            ? String((error as { code?: unknown }).code ?? "")
+            : "";
+        const detail =
+          error && typeof error === "object"
+            ? String((error as { detail?: unknown }).detail ?? "")
+            : "";
+        if (code === "admission.cooldown") {
+          const untilMs = Number(detail);
+          const seconds = Number.isFinite(untilMs)
+            ? Math.max(0, Math.ceil((untilMs - Date.now()) / 1000))
+            : 0;
+          showToast(t("retry.cooldown").replace("{s}", String(seconds)), {
+            kind: "error",
+          });
+        } else if (code === "admission.needs_action") {
+          const remedy = t(`retry.needs.${detail || "none"}`);
+          showToast(remedy.startsWith("retry.needs.") ? t("retry.needs.none") : remedy, {
+            kind: "error",
+          });
+        } else if (code === "admission.duplicate") {
+          showToast(t("toast.retry_in_flight"), { kind: "error" });
+        } else {
+          showToast(
+            t("toast.retry_rejected").replace("{reason}", describe(error)),
+            { kind: "error" },
+          );
+        }
       }
     },
     [client, loadConversation, showToast],
@@ -1166,31 +1797,48 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
         text: message.content,
         attachments: message.attachments ?? [],
       });
+      const entry = draftOf(conversationId);
+      entry.editTarget = messageId;
+      // The edit buffer is a local edit: the backend has to count it.
+      markLocalEdit(entry.edit, {
+        text: message.content,
+        attachments: message.attachments ?? [],
+      });
       // The edit buffer is durable: it survives a restart like the draft.
-      void client
-        .saveEditBuffer({
-          conversation_id: conversationId,
-          text: message.content,
-          attachments: message.attachments ?? [],
-          target_id: messageId,
-          changed: true,
-        })
-        .catch((error) => {
-          showToast(`Draft could not be saved: ${describe(error)}`, { kind: "error" });
-        });
+      void writeEdit(conversationId).catch((error) => {
+        showToast(`Draft could not be saved: ${describe(error)}`, { kind: "error" });
+      });
     },
-    [client, dispatch, showToast],
+    [dispatch, draftOf, markLocalEdit, showToast, writeEdit],
   );
 
   const cancelEdit = useCallback(() => {
     dispatch({ type: "edit/cancel" });
     const current = stateRef.current;
-    if (current.currentConversationId) {
-      void client
-        .clearEditBuffer(current.currentConversationId)
-        .catch(() => undefined);
-    }
-  }, [client, dispatch]);
+    const conversationId = current.currentConversationId;
+    if (!conversationId) return;
+    const entry = draftOf(conversationId);
+    entry.editTarget = null;
+    entry.edit.local = { text: "", attachments: [] };
+    entry.edit.dirty = false;
+    entry.edit.saved = { text: "", attachments: [] };
+    entry.edit.syncedVersion = entry.edit.version;
+    // The clear moves the revision: it runs in the write queue of the
+    // conversation so it cannot overtake a running write.
+    void enqueueDraftWrite(conversationId, async () => {
+      const outcome = await withDeadline(
+        client.clearEditBuffer(conversationId),
+        DRAFT_WRITE_TIMEOUT_MS,
+      );
+      if (outcome.status === "done") {
+        entry.revision = outcome.value.revision;
+        // The revision in the state belongs to the **open** chat.
+        if (stateRef.current.currentConversationId === conversationId) {
+          dispatch({ type: "draft/revision", revision: outcome.value.revision });
+        }
+      }
+    });
+  }, [client, dispatch, draftOf, enqueueDraftWrite]);
 
   const continueFrom = useCallback(
     async (messageId: Id) => {
@@ -1302,66 +1950,94 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
   const handleChatEvent = useCallback(
     (payload: ChatEvent) => {
       const { event } = payload;
-      switch (event.type) {
-        case "started": {
-          dispatch({
-            type: "generation/upserted",
-            conversationId: payload.conversation_id,
-            generation: {
-              request_id: payload.request_id,
-              batch_id: payload.batch_id,
-              user_message_id: "",
-              assistant_message_id: payload.assistant_message_id,
-              provider_id: "",
-              model_id: "",
-              status: "streaming",
-              system_prompt: null,
-              price_prompt: null,
-              price_completion: null,
-              remote_generation_id: null,
-              error: null,
-              retry_of: null,
-              retry_root_id: null,
-              retry_not_before_ms: null,
-              dispatch_phase: "attempted",
-              failure_kind: null,
-              failure_message: null,
-              started_at_ms: Date.now(),
-              finished_at_ms: null,
-            },
-          });
-          break;
-        }
-        case "text_delta": {
-          const messageId = payload.assistant_message_id;
-          const buffered = deltaBuffer.current.get(messageId);
-          deltaBuffer.current.set(messageId, {
-            conversationId: payload.conversation_id,
-            delta: (buffered?.delta ?? "") + event.delta,
-          });
-          if (deltaTimer.current === null) {
-            deltaTimer.current = setTimeout(flushDeltas, DELTA_FLUSH_MS);
+
+      /**
+       * Progress for the **existing** generation row: dispatched as a patch
+       * the reducer merges against the current row, so synchronous
+       * back-to-back events (remote id + first delta in one tick) cannot
+       * overwrite each other with a stale full-object snapshot. Terminal
+       * generations are never resurrected, and streaming never regresses.
+       */
+      const markStatus = (
+        status: "connecting" | "streaming",
+        remoteId?: string,
+      ) => {
+        dispatch({
+          type: "generation/progress",
+          conversationId: payload.conversation_id,
+          requestId: payload.request_id,
+          status,
+          remoteId,
+        });
+      };
+
+      // The UI must reach the authoritative refetch below **no matter what a
+      // single malformed event does** (a thrown handler is how 0.2.2 froze
+      // generations on "Connecting"). Warn without logging payloads.
+      try {
+        switch (event.type) {
+          case "started": {
+            // Connecting only; Streaming is reserved for the first real
+            // remote response (text or remote generation id).
+            markStatus("connecting");
+            break;
           }
-          break;
+          case "text_delta": {
+            markStatus("streaming");
+            const messageId = payload.assistant_message_id;
+            const buffered = deltaBuffer.current.get(messageId);
+            deltaBuffer.current.set(messageId, {
+              conversationId: payload.conversation_id,
+              delta: (buffered?.delta ?? "") + event.delta,
+            });
+            if (deltaTimer.current === null) {
+              deltaTimer.current = setTimeout(flushDeltas, DELTA_FLUSH_MS);
+            }
+            break;
+          }
+          case "remote_generation_id": {
+            markStatus("streaming", event.id);
+            break;
+          }
+          case "usage_updated": {
+            // The ledger changed (a known cost, a late repair): re-read the
+            // conversation so the amount in the toolbar follows the ledger.
+            if (
+              stateRef.current.currentConversationId === payload.conversation_id
+            ) {
+              void loadConversation(payload.conversation_id);
+            }
+            break;
+          }
+          case "failed": {
+            // The canonical native format nests the error; a legacy/malformed
+            // backend may send it flat — normalize instead of throwing.
+            const legacy = event as Partial<{
+              error: { message?: string };
+              message?: string;
+            }>;
+            const message =
+              event?.error?.message ?? legacy?.message ?? "Generation failed";
+            showToast(message, { kind: "error" });
+            break;
+          }
+          case "rejected": {
+            showToast(`Request blocked before sending: ${event.detail}`, {
+              kind: "error",
+            });
+            break;
+          }
+          case "persist_error": {
+            showToast(`Storage error (state may not be saved): ${event.error}`, {
+              kind: "error",
+            });
+            break;
+          }
+          default:
+            break;
         }
-        case "failed": {
-          showToast(event.error.message, { kind: "error" });
-          break;
-        }
-        case "rejected": {
-          showToast(`Request blocked before sending: ${event.detail}`, {
-            kind: "error",
-          });
-          break;
-        }
-        case "persist_error": {
-          showToast(`Storage error (state may not be saved): ${event.error}`, {
-            kind: "error",
-          });
-          break;
-        }
-        default:
-          break;
+      } catch (err) {
+        console.warn("chat event handling error", err);
       }
       // The persisted state is authoritative, but only the **terminal**
       // events need a refetch: the text deltas are applied locally, and
@@ -1392,29 +2068,45 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     const attach = async () => {
       let handles: Array<() => void> = [];
       try {
+        /*
+         * Every attach registers its **own** wrapper.
+         *
+         * React's strict mode mounts the effect twice; when both attaches
+         * register the very same function, the cleanup of the first one
+         * would remove the handler of the second one as well and the app
+         * would stop hearing the backend.
+         */
+        const onChat = (payload: ChatEvent) => handleChatEvent(payload);
+        const onConversationChanged = (payload: { conversation_id: Id }) => {
+          if (stateRef.current.currentConversationId === payload.conversation_id) {
+            void loadConversation(payload.conversation_id);
+          }
+        };
+        const onConversationsChanged = () => {
+          void refreshConversations();
+        };
+        const onTitle = () => {
+          void refreshConversations();
+        };
+        const onCatalog = (catalog: {
+          entries: CatalogEntry[];
+          updated_at_ms: number | null;
+        }) => {
+          dispatch({
+            type: "catalog/loaded",
+            entries: catalog.entries,
+            updatedAt: catalog.updated_at_ms,
+          });
+          // The enabled/primary list refers to catalogue entries: keep it
+          // in sync with the catalogue it describes.
+          void refreshPreferences();
+        };
         handles = await Promise.all([
-          client.onChatEvent(handleChatEvent),
-          client.onConversationChanged((payload) => {
-            if (stateRef.current.currentConversationId === payload.conversation_id) {
-              void loadConversation(payload.conversation_id);
-            }
-          }),
-          client.onConversationsChanged(() => {
-            void refreshConversations();
-          }),
-          client.onTitleEvent(() => {
-            void refreshConversations();
-          }),
-          client.onCatalogChanged((catalog) => {
-            dispatch({
-              type: "catalog/loaded",
-              entries: catalog.entries,
-              updatedAt: catalog.updated_at_ms,
-            });
-            // The enabled/primary list refers to catalogue entries: keep it
-            // in sync with the catalogue it describes.
-            void refreshPreferences();
-          }),
+          client.onChatEvent(onChat),
+          client.onConversationChanged(onConversationChanged),
+          client.onConversationsChanged(onConversationsChanged),
+          client.onTitleEvent(onTitle),
+          client.onCatalogChanged(onCatalog),
         ]);
       } catch (error) {
         // A missing event bridge must not block the bootstrap: the app shows
@@ -1449,35 +2141,53 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
 
   // ----- draft autosave -----
 
+  /**
+   * Save the composer draft of the open chat 600 ms after the last edit.
+   *
+   * The timer is only a debounce: the write itself reads the content
+   * **when it runs**, so a save that was scheduled before a send can never
+   * write the consumed snapshot again.
+   *
+   * An empty composer is a draft too: deleting the last character has to be
+   * persisted, otherwise the old text comes back when the chat is opened
+   * again.
+   */
   useEffect(() => {
     const conversationId = state.currentConversationId;
     if (!conversationId) return;
-    if (!state.composerText && state.composerAttachments.length === 0) return;
-    // Nothing to do when the backend already holds this exact content:
-    // saving again would emit another change event, which would trigger
-    // another refetch, which would schedule another save … an endless cycle.
-    const saved = lastSavedDrafts.current.get(conversationId);
-    if (
-      saved &&
-      saved.text === state.composerText &&
-      sameAttachments(saved.attachments, state.composerAttachments)
-    ) {
+    const entry = draftOf(conversationId);
+    const slot = entry.normal;
+    // Keep the slot in line with what the composer shows (the content
+    // belongs to the open chat only).
+    if (composerOwner.current === conversationId) {
+      markLocalEdit(slot, {
+        text: state.composerText,
+        attachments: state.composerAttachments,
+      });
+    }
+    // Nothing to do when the backend already holds this exact content and
+    // the content is not a new edit: saving again would emit another change
+    // event, which would trigger another refetch, which would schedule
+    // another save … an endless cycle.
+    if (slot.saved && sameContent(slot.saved, slot.local) && !slot.dirty) {
       return;
     }
     const timer = setTimeout(() => {
-      void persistDraft(
-        conversationId,
-        state.composerText,
-        state.composerAttachments,
-        true,
-      );
+      slot.timer = null;
+      void writeNormal(conversationId);
     }, 600);
-    return () => clearTimeout(timer);
+    slot.timer = timer;
+    return () => {
+      clearTimeout(timer);
+      if (slot.timer === timer) slot.timer = null;
+    };
   }, [
+    draftOf,
+    markLocalEdit,
     state.currentConversationId,
     state.composerText,
     state.composerAttachments,
-    persistDraft,
+    writeNormal,
   ]);
 
   // ----- edit buffer autosave -----
@@ -1486,27 +2196,32 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
     const conversationId = state.currentConversationId;
     const targetId = state.editingLatest;
     if (!conversationId || !targetId) return;
+    const entry = draftOf(conversationId);
+    const slot = entry.edit;
+    markLocalEdit(slot, {
+      text: state.editText,
+      attachments: state.editAttachments,
+    });
+    if (slot.saved && sameContent(slot.saved, slot.local) && !slot.dirty) {
+      return;
+    }
     const timer = setTimeout(() => {
-      void client
-        .saveEditBuffer({
-          conversation_id: conversationId,
-          text: state.editText,
-          attachments: state.editAttachments,
-          target_id: targetId,
-          changed: true,
-        })
-        .catch((error) => {
-          showToast(`Draft could not be saved: ${describe(error)}`, { kind: "error" });
-        });
+      slot.timer = null;
+      void writeEdit(conversationId);
     }, 600);
-    return () => clearTimeout(timer);
+    slot.timer = timer;
+    return () => {
+      clearTimeout(timer);
+      if (slot.timer === timer) slot.timer = null;
+    };
   }, [
-    client,
-    showToast,
+    draftOf,
+    markLocalEdit,
     state.currentConversationId,
     state.editingLatest,
     state.editText,
     state.editAttachments,
+    writeEdit,
   ]);
 
   const actions = useMemo<Actions>(
@@ -1543,6 +2258,8 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       cancelEdit,
       setComposerText,
       setComposerAttachments,
+      setEditText,
+      setEditAttachments,
       addAttachments,
       addPastedText,
       removeAttachment,
@@ -1591,6 +2308,8 @@ export function StoreProvider({ client, children }: StoreProviderProps) {
       cancelEdit,
       setComposerText,
       setComposerAttachments,
+      setEditText,
+      setEditAttachments,
       addAttachments,
       addPastedText,
       removeAttachment,
@@ -1639,6 +2358,21 @@ function sameAttachments(
 /** Compare two id lists by value (order matters for the branch selection). */
 function sameIds(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+/**
+ * The sort order of a model that joins the panel.
+ *
+ * It goes to the end of the list, so enabling a model never reshuffles the
+ * models the user arranged.
+ */
+function nextSortOrder(preferences: ModelPreferenceEntry[]): number {
+  let highest = -1;
+  for (const preference of preferences) {
+    const order = preference.sort_order ?? 0;
+    if (order > highest) highest = order;
+  }
+  return highest + 1;
 }
 
 /** True when the user dismissed the native save panel. */

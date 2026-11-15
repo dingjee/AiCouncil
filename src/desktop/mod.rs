@@ -214,6 +214,16 @@ impl Desktop {
         if Self::active_generation_count(&self.db) > 0 {
             return Err("requests are in flight; retry after they finish".to_string());
         }
+        // 与新生成客户端读取同一网络策略快照:同步重建检测客户端,
+        // 避免检测(旧客户端)与生成(新代理)策略分裂;
+        // rebuild 成功即 bump revision → 既有许可全部失效。
+        let network = NetworkConfig {
+            proxy: crate::services::network::explicit_proxy_from_env(),
+            ..Default::default()
+        };
+        self.egress
+            .rebuild_clients(&network)
+            .map_err(|e| format!("egress guard rebuild: {e}"))?;
         let key = env_keys::load_named_key(env_keys::OPENROUTER_ENV_NAME).unwrap_or_default();
         let max_concurrent = {
             let cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
@@ -224,6 +234,8 @@ impl Desktop {
         *self.chat.lock().unwrap_or_else(|p| p.into_inner()) = chat;
         let title = Self::build_title(&self.db);
         *self.title.lock().unwrap_or_else(|p| p.into_inner()) = title;
+        // 旧许可一律不复用(策略可能已随 reload 变化)。
+        *self.permit.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
     }
 

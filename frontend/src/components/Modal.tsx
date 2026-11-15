@@ -9,6 +9,7 @@ import {
 import { createPortal } from "react-dom";
 
 import { t } from "../i18n/strings";
+import { usePopupDismiss } from "../util/popup";
 import { Icon } from "./Icon";
 
 /**
@@ -59,6 +60,16 @@ export function Modal({ title, onClose, children, testId, size }: ModalProps) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const restoreRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
+
+  // The dialog closes when it is not the active surface any more: the focus
+  // leaves it or the window loses the focus. The scrim, the close button and
+  // `Escape` are handled below (the dialog restores the focus itself).
+  usePopupDismiss({
+    open: true,
+    onDismiss: onClose,
+    popupRef: panelRef,
+    restoreFocus: false,
+  });
 
   // Move the focus into the dialog and give it back on close.
   useEffect(() => {

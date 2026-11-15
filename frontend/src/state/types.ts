@@ -36,11 +36,16 @@ export interface Toast {
 }
 
 export interface ModelSelectionState {
-  /** Same-question multi-model mode. */
+  /**
+   * Derived: more than one model is checked.
+   *
+   * The flag is never a mode of its own — it always follows the checked
+   * models, so there is no hidden parallel mode behind the selection.
+   */
   parallel: boolean;
-  /** Checked model ids (parallel mode). */
+  /** The checked models: the real selection of the next send. */
   checked: string[];
-  /** Primary model; owns the main branch. */
+  /** Primary model; owns the main branch. Always inside `checked`. */
   primary: string | null;
 }
 
@@ -95,7 +100,10 @@ export interface AppState {
   modal: ModalKind | null;
   sidebarCollapsed: boolean;
   conversationSearch: string;
+  /** Search query of the Models panel (the full catalog). */
   modelSearch: string;
+  /** Search query of the composer picker (the enabled models only). */
+  pickerSearch: string;
   pickerOpen: boolean;
   showAttempts: Record<Id, boolean>;
   splitView: Record<Id, boolean>;
@@ -130,7 +138,7 @@ export const DEFAULT_SETTINGS: Settings = {
 export const initialState: AppState = {
   status: "booting",
   bootError: null,
-  appVersion: "0.2.1",
+  appVersion: "0.2.3",
 
   conversations: [],
   groups: [],
@@ -160,6 +168,7 @@ export const initialState: AppState = {
   sidebarCollapsed: false,
   conversationSearch: "",
   modelSearch: "",
+  pickerSearch: "",
   pickerOpen: false,
   showAttempts: {},
   splitView: {},

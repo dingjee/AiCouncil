@@ -33,6 +33,7 @@ describe("conversation state", () => {
         title_source: "empty",
         title_status: "needs_generation",
         title_revision: 0,
+        title_attempt_count: 0,
         main_leaf_id: null,
         draft_revision: 4,
         created_at_ms: 0,
@@ -100,6 +101,7 @@ describe("conversation state", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,
@@ -117,6 +119,7 @@ describe("conversation state", () => {
         title_source: "empty",
         title_status: "needs_generation",
         title_revision: 0,
+        title_attempt_count: 0,
         main_leaf_id: null,
         draft_revision: 0,
         created_at_ms: 0,
@@ -135,6 +138,125 @@ describe("streaming", () => {
       { type: "stream/chunk", conversationId: "c1", messageId: "m1", delta: " world" },
     );
     expect(state.messages.c1[0].content).toBe("Hello world");
+  });
+
+  test("a mid-stream refetch keeps the locally streamed tail", () => {
+    const streamed: Message = { ...message("m1", null, "assistant"), content: "Hello world" };
+    const snapshot: Message = { ...message("m1", null, "assistant"), content: "Hello" };
+    const live: Generation = {
+      request_id: "r1",
+      batch_id: "b1",
+      user_message_id: "q1",
+      assistant_message_id: "m1",
+      provider_id: "p1",
+      model_id: "vendor/alpha",
+      status: "streaming",
+      system_prompt: null,
+      price_prompt: null,
+      price_completion: null,
+      remote_generation_id: null,
+      error: null,
+      retry_of: null,
+      retry_root_id: null,
+      retry_not_before_ms: null,
+      dispatch_phase: "remote_accepted",
+      failure_kind: null,
+      failure_message: null,
+      started_at_ms: 0,
+      finished_at_ms: null,
+    };
+    const state = apply(
+      { ...initialState, messages: { c1: [streamed] } },
+      {
+        type: "conversation/loaded",
+        conversationId: "c1",
+        conversation: {
+          id: "c1",
+          title: "Chat",
+          group_id: null,
+          system_prompt: null,
+          title_source: "empty",
+          title_status: "needs_generation",
+          title_revision: 0,
+          title_attempt_count: 0,
+          main_leaf_id: null,
+          draft_revision: 0,
+          created_at_ms: 0,
+          updated_at_ms: 0,
+        },
+        messages: [snapshot],
+        generations: [live],
+        usage: [],
+        draftRevision: 0,
+        editTargetId: null,
+        editText: "",
+        editAttachments: [],
+        editLatestEligible: null,
+      },
+    );
+    // The snapshot lags the stream (the DB flushes in intervals): the local
+    // tail must survive the refetch instead of visibly rolling back.
+    expect(state.messages.c1[0].content).toBe("Hello world");
+  });
+
+  test("a terminal snapshot replaces the streamed text", () => {
+    const streamed: Message = { ...message("m1", null, "assistant"), content: "Hello wor" };
+    const final: Message = {
+      ...message("m1", null, "assistant"),
+      content: "Hello world, corrected by the backend",
+    };
+    const done: Generation = {
+      request_id: "r1",
+      batch_id: "b1",
+      user_message_id: "q1",
+      assistant_message_id: "m1",
+      provider_id: "p1",
+      model_id: "vendor/alpha",
+      status: "completed",
+      system_prompt: null,
+      price_prompt: null,
+      price_completion: null,
+      remote_generation_id: null,
+      error: null,
+      retry_of: null,
+      retry_root_id: null,
+      retry_not_before_ms: null,
+      dispatch_phase: "remote_accepted",
+      failure_kind: null,
+      failure_message: null,
+      started_at_ms: 0,
+      finished_at_ms: 1,
+    };
+    const state = apply(
+      { ...initialState, messages: { c1: [streamed] } },
+      {
+        type: "conversation/loaded",
+        conversationId: "c1",
+        conversation: {
+          id: "c1",
+          title: "Chat",
+          group_id: null,
+          system_prompt: null,
+          title_source: "empty",
+          title_status: "needs_generation",
+          title_revision: 0,
+          title_attempt_count: 0,
+          main_leaf_id: null,
+          draft_revision: 0,
+          created_at_ms: 0,
+          updated_at_ms: 0,
+        },
+        messages: [final],
+        generations: [done],
+        usage: [],
+        draftRevision: 0,
+        editTargetId: null,
+        editText: "",
+        editAttachments: [],
+        editLatestEligible: null,
+      },
+    );
+    expect(state.messages.c1[0].content).toBe(final.content);
   });
 
   test("ignores a delta for an unknown message", () => {
@@ -227,14 +349,65 @@ describe("model selection", () => {
 });
 
 describe("composer", () => {
-  test("clearing the composer also clears the edit buffer", () => {
+  test("clearing the composer keeps the edit buffer", () => {
+    // The normal composer and the edit buffer are two independent buffers:
+    // a normal send must not end an edit (and an edit send must not throw
+    // the normal draft away).
     const state = apply(
       { ...initialState, composerText: "x", editingLatest: "m1", editText: "y" },
       { type: "composer/clear" },
     );
     expect(state.composerText).toBe("");
+    expect(state.composerAttachments).toEqual([]);
+    expect(state.editingLatest).toBe("m1");
+    expect(state.editText).toBe("y");
+  });
+
+  test("clearing the edit buffer keeps the normal composer", () => {
+    const state = apply(
+      { ...initialState, composerText: "x", editingLatest: "m1", editText: "y" },
+      { type: "edit/clear" },
+    );
     expect(state.editingLatest).toBeNull();
     expect(state.editText).toBe("");
+    expect(state.editAttachments).toEqual([]);
+    expect(state.composerText).toBe("x");
+  });
+
+  test("a snapshot keeps a newer local edit buffer", () => {
+    const state = apply(
+      { ...initialState, editingLatest: "m1", editText: "local edit" },
+      {
+        type: "conversation/loaded",
+        conversationId: "c1",
+        conversation: {
+          id: "c1",
+          title: "Chat",
+          group_id: null,
+          system_prompt: null,
+          title_source: "empty",
+          title_status: "needs_generation",
+          title_revision: 0,
+          title_attempt_count: 0,
+          main_leaf_id: null,
+          draft_revision: 1,
+          created_at_ms: 0,
+          updated_at_ms: 0,
+        },
+        messages: [],
+        generations: [],
+        usage: [],
+        draftRevision: 1,
+        editTargetId: "m1",
+        editText: "backend edit",
+        editAttachments: [],
+        editLatestEligible: "m1",
+        preserveEditBuffer: true,
+      },
+    );
+    expect(state.editingLatest).toBe("m1");
+    expect(state.editText).toBe("local edit");
+    expect(state.editLatestEligible).toBe("m1");
   });
 
   test("the draft revision is updated from the backend reply", () => {

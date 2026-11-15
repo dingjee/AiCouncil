@@ -92,7 +92,7 @@ describe("message tree", () => {
 });
 
 describe("answer sets", () => {
-  test("folds retry attempts of the same lineage", () => {
+  test("folds retry attempts into one slot at the first attempt's position", () => {
     const messages = [
       message("q", null, "user", 1),
       message("first", "q", "assistant", 2),
@@ -105,12 +105,38 @@ describe("answer sets", () => {
     ];
     const tree = buildTree(messages);
     const items = answerSet(tree, generations, "q");
-    expect(items).toHaveLength(2);
-    expect(items[0].superseded).toBe(true);
-    expect(items[0].attempt).toBe(1);
-    expect(items[0].attempts_total).toBe(2);
-    expect(items[1].superseded).toBe(false);
-    expect(items[1].attempt).toBe(2);
+    // One slot per lineage — the retry does not append a second tab.
+    expect(items).toHaveLength(1);
+    const slot = items[0];
+    // The slot shows the NEWEST attempt in place of the failed one.
+    expect(slot.message_id).toBe("retry");
+    expect(slot.attempt).toBe(2);
+    expect(slot.attempts_total).toBe(2);
+    expect(slot.superseded).toBe(false);
+    // The replaced attempt stays available for the history view.
+    expect(slot.older_attempts.map((item) => item.message_id)).toEqual(["first"]);
+    expect(slot.older_attempts[0].superseded).toBe(true);
+    expect(slot.older_attempts[0].attempt).toBe(1);
+  });
+
+  test("a retried model keeps its tab position between other models", () => {
+    const messages = [
+      message("q", null, "user", 1),
+      message("a", "q", "assistant", 2),
+      message("b", "q", "assistant", 3),
+      message("c", "q", "assistant", 4),
+      message("b2", "q", "assistant", 5),
+    ];
+    const generations = [
+      generation("r1", "a", "q", "vendor/alpha", null, 2),
+      generation("r2", "b", "q", "vendor/beta", "root-b", 3),
+      generation("r3", "c", "q", "vendor/gamma", null, 4),
+      generation("r4", "b2", "q", "vendor/beta", "root-b", 5),
+    ];
+    const items = answerSet(buildTree(messages), generations, "q");
+    expect(items.map((item) => item.message_id)).toEqual(["a", "b2", "c"]);
+    expect(items[1].attempts_total).toBe(2);
+    expect(items[1].older_attempts.map((item) => item.message_id)).toEqual(["b"]);
   });
 
   test("keeps different models separate", () => {

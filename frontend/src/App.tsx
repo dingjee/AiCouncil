@@ -2,6 +2,7 @@ import { useEffect } from "react";
 
 import { t } from "./i18n/strings";
 import { Composer } from "./components/Composer";
+import { ConversationTools } from "./components/ConversationTools";
 import { EgressModal } from "./components/EgressModal";
 import { Icon } from "./components/Icon";
 import { MessageThread } from "./components/MessageThread";
@@ -88,32 +89,17 @@ export function App() {
           <h2 className="main__title">
             {conversation?.title.trim() || t("conversation.untitled")}
           </h2>
-          {conversation?.title_source === "fallback" ? (
+          {/* Only a **materialized** failure shows the hint: fallback source +
+              needs_generation + at least one real attempt. A pending first
+              attempt (needs_generation with 0 attempts, or in_flight) is not a
+              failure and keeps the quiet subtitle. */}
+          {conversation?.title_source === "fallback" &&
+          conversation.title_status === "needs_generation" &&
+          conversation.title_attempt_count > 0 ? (
             <span className="main__subtitle">{t("title.auto_failed_hint")}</span>
           ) : null}
 
-          <div className="main__toolbar">
-            <button
-              type="button"
-              className="btn"
-              aria-haspopup="dialog"
-              aria-expanded={state.modal === "models"}
-              onClick={() => actions.openModal("models")}
-            >
-              <Icon name="models" size={14} />
-              {t("panel.models")}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              aria-haspopup="dialog"
-              aria-expanded={state.modal === "settings"}
-              onClick={() => actions.openModal("settings")}
-            >
-              <Icon name="settings" size={14} />
-              {t("panel.settings")}
-            </button>
-          </div>
+          <ConversationTools />
         </header>
 
         <div className="main__body">

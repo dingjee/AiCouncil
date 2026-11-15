@@ -73,8 +73,6 @@ const TABLE: Record<string, string> = {
   "composer.attach_tooltip": "Attach text files; long pastes become attachments",
   "composer.usage": "Usage",
   "composer.usage_tooltip": "Show cost and key quota for this chat",
-  "composer.parallel": "Parallel",
-  "composer.parallel_tooltip": "Ask the same question with multiple models",
   "composer.models_tooltip": "Models: {models}",
   "composer.models_single_tooltip": "Only one model is enabled",
   "composer.model_picker": "Model",
@@ -94,14 +92,19 @@ const TABLE: Record<string, string> = {
   "composer.attachment_total": "Attachments are limited to 1MB in total",
 
   "selector.open": "Models",
-  "selector.single_hint": "Click a model to choose it",
-  "selector.multi_hint": "Check models; star sets the primary",
+  "selector.multi_hint": "Check the models to ask; the star sets the primary",
   "selector.select_all": "Select all",
+  "selector.selected_count": "{n} selected",
   "selector.count.one": "{n} model",
   "selector.count.other": "{n} models",
   "selector.primary_plus": "{primary} +{n}",
   "selector.search_placeholder": "Search family, name or ID",
   "selector.no_results": "No models match \"{query}\"",
+  "selector.empty": "No models enabled yet",
+  "selector.empty_hint":
+    "Enable a model in the Models panel to use it in this chat.",
+  "selector.manage_models": "Manage models",
+  "selector.my_models": "My models",
 
   "attachment.added": "Added {n} attachment(s)",
   "attachment.paste_attached": "Long paste attached ({chars} chars)",
@@ -118,6 +121,12 @@ const TABLE: Record<string, string> = {
   "panel.export_all": "All branches",
   "panel.export_selected": "Selected branches ({n})",
   "panel.export_tooltip": "Export chat as Markdown",
+  "toolbar.cost": "Cost",
+  "toolbar.cost_tooltip": "Cost of this chat (all branches and retries)",
+  "toolbar.cost_details": "Cost details",
+  "toolbar.no_conversation": "—",
+  "toolbar.cost_partial_hint":
+    "Some costs of this chat are not settled yet (+ marks them).",
   "panel.back_bottom": "Back to bottom",
   "panel.back_bottom_tooltip": "Jump to the latest messages",
 
@@ -212,6 +221,8 @@ const TABLE: Record<string, string> = {
   "export.failed": "Export failed: {error}",
 
   "toast.no_model": "Enable a model in the Models panel first",
+  "toast.model_unknown": "This model is not in the catalog",
+  "toast.model_update_failed": "Could not update model: {error}",
   "toast.branch_incomplete":
     "The current answer is not finished; retry or wait before continuing",
   "toast.branch_active":

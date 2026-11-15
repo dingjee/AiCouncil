@@ -23,6 +23,8 @@ fn obs(cc: &str) -> EgressObservation {
         country_code: Some(cc.into()),
         source: "test",
         checked_at: chrono::Utc::now(),
+        families: aicouncil::services::network::RouteFamilies::DUAL,
+        note: None,
     }
 }
 
@@ -412,6 +414,7 @@ async fn a08_stale_permit_rechecks_and_rejects() {
     let stale = EgressPermit {
         checked_at_mono: tokio::time::Instant::now() - PERMIT_TTL - Duration::from_secs(1),
         revision: e.guard.network_revision(),
+        families: aicouncil::services::network::RouteFamilies::DUAL,
     };
     e.guard.set(EgressVerdict::Blocked(obs("CN"))).await;
     let plan = make_plan(conv, vec![anthropic_target("anthropic/claude-opus-5.5")], 0);
@@ -425,7 +428,10 @@ async fn a08_stale_permit_rechecks_and_rejects() {
     assert_eq!(e.mock.count(), 0);
 
     // revision 变化的 permit 同样失效
-    let wrong_rev = EgressPermit::fresh(e.guard.network_revision() + 1);
+    let wrong_rev = EgressPermit::fresh(
+        e.guard.network_revision() + 1,
+        aicouncil::services::network::RouteFamilies::DUAL,
+    );
     let plan = make_plan(conv, vec![anthropic_target("anthropic/claude-opus-5.5")], 0);
     assert!(e
         .svc

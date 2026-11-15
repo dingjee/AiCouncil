@@ -47,6 +47,11 @@ function uuid(seed: string): Id {
 
 const PROVIDER_ID = uuid("provider-openrouter");
 
+/** True when a generation status no longer changes (native parity). */
+function isTerminal(status: string): boolean {
+  return ["completed", "failed", "cancelled", "interrupted"].includes(status);
+}
+
 const CATALOG: CatalogEntry[] = [
   {
     id: "anthropic/claude-sonnet-4.5",
@@ -189,6 +194,7 @@ function seedConversations(): ConversationSummary[] {
       title_source: "manual",
       title_status: "ready",
       title_revision: 1,
+      title_attempt_count: 0,
       main_leaf_id: uuid("msg-a1"),
       draft_revision: 0,
       created_at_ms: now - 7200_000,
@@ -202,12 +208,42 @@ function seedConversations(): ConversationSummary[] {
       title_source: "generated",
       title_status: "ready",
       title_revision: 1,
+      title_attempt_count: 0,
       main_leaf_id: null,
       draft_revision: 3,
       created_at_ms: now - 3600_000,
       updated_at_ms: now - 3600_000,
     },
   ];
+}
+
+/**
+ * The preferences survive a reload of the page.
+ *
+ * The real backend keeps them in its database; the mock keeps them in the
+ * session storage of the browser session, so a reload of the harness page
+ * behaves like a restart of the app. Only model ids and their parameters are
+ * stored — never a key, never a message.
+ */
+const PREFERENCES_KEY = "aicouncil-dev-preferences";
+
+function loadPreferences(): ModelPreferenceEntry[] | null {
+  try {
+    const raw = window.sessionStorage.getItem(PREFERENCES_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ModelPreferenceEntry[];
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function savePreferences(preferences: ModelPreferenceEntry[]): void {
+  try {
+    window.sessionStorage.setItem(PREFERENCES_KEY, JSON.stringify(preferences));
+  } catch {
+    // A browser without a session storage is fine: the mock simply forgets.
+  }
 }
 
 export class MockBackend {
@@ -259,6 +295,9 @@ export class MockBackend {
           revision: 0,
         });
       }
+      // A reload of the page keeps the preferences of the session.
+      const stored = loadPreferences();
+      if (stored) this.preferences = stored;
       return;
     }
     const first = this.conversations[0];
@@ -342,10 +381,36 @@ export class MockBackend {
       edit_target_id: null,
       revision: 3,
     });
+    const stored = loadPreferences();
+    if (stored) this.preferences = stored;
   }
 
   private emit(event: string, payload: unknown): void {
     this.listeners.get(event)?.forEach((handler) => handler(payload));
+  }
+
+  /** Write a known cost into the ledger of a conversation. */
+  private recordUsage(
+    conversationId: Id,
+    requestId: Id,
+    promptTokens: number,
+    completionTokens: number,
+    cost: string,
+  ): void {
+    const records = this.usage.get(conversationId) ?? [];
+    const record: UsageRecord = {
+      request_id: requestId,
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+      cost_text: cost,
+      cost_source: "api",
+      status: "known",
+    };
+    const index = records.findIndex((entry) => entry.request_id === requestId);
+    if (index < 0) records.push(record);
+    else records[index] = record;
+    this.usage.set(conversationId, records);
   }
 
   private bootstrapState(): BootstrapState {
@@ -415,6 +480,8 @@ export class MockBackend {
           remote_generation_id: null,
           finish_state: "stop",
         });
+        // The ledger of the conversation: the cost becomes known.
+        this.recordUsage(conversationId, requestId, 120, 260, "0.0045");
         emit({
           type: "usage_updated",
           prompt_tokens: 120,
@@ -464,6 +531,7 @@ export class MockBackend {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: Date.now(),
@@ -655,12 +723,30 @@ export class MockBackend {
           is_default: boolean;
           overrides: Record<string, unknown> | null;
         };
-        this.preferences = this.preferences.map((preference) => {
-          if (preference.model_id === modelId) return { ...preference, ...patch };
-          return patch.is_default
+        // The backend upserts: a model that has no preference yet gets one.
+        const existing = this.preferences.find(
+          (preference) => preference.model_id === modelId,
+        );
+        if (existing) {
+          this.preferences = this.preferences.map((preference) =>
+            preference.model_id === modelId ? { ...preference, ...patch } : preference,
+          );
+        } else {
+          this.preferences = [
+            ...this.preferences,
+            {
+              provider_id: String(args.provider_id ?? PROVIDER_ID),
+              model_id: modelId,
+              ...patch,
+            },
+          ];
+        }
+        this.preferences = this.preferences.map((preference) =>
+          patch.is_default
             ? { ...preference, is_default: false }
-            : preference;
-        });
+            : preference,
+        );
+        savePreferences(this.preferences);
         return null as T;
       }
 
@@ -670,6 +756,7 @@ export class MockBackend {
           ...preference,
           is_default: preference.model_id === modelId,
         }));
+        savePreferences(this.preferences);
         return null as T;
       }
 
@@ -733,7 +820,9 @@ export class MockBackend {
             assistant_message_id: assistantId,
             provider_id: target.provider_id,
             model_id: target.model_id,
-            status: "streaming",
+            // Native parity: the row starts connecting; the events (started /
+            // first delta) drive it to streaming through generation/progress.
+            status: "connecting",
             system_prompt: null,
             price_prompt: null,
             price_completion: null,
@@ -762,6 +851,20 @@ export class MockBackend {
         }
         this.emit("conversations-changed", {});
 
+        // The send transaction consumes the draft — but only when the
+        // revision still equals the frozen one (the native compare-and-swap).
+        const draft = this.drafts.get(conversation.id);
+        if (draft && draft.revision === request.expected_draft_revision) {
+          if (request.mode === "edit") {
+            draft.edit_text = "";
+            draft.edit_attachments = [];
+            draft.edit_target_id = null;
+          } else {
+            draft.text = "";
+            draft.attachments = [];
+          }
+        }
+
         const receipt: SendReceipt = {
           conversation_id: conversation.id,
           batch_id: batchId,
@@ -778,13 +881,81 @@ export class MockBackend {
       }
 
       case "retry_request": {
+        // Faithful to the native service: a retry creates a NEW assistant
+        // sibling under the same question, linked by retry_of / retry_root,
+        // and refuses when the lineage already has a live attempt. The UI
+        // folds the attempts into one slot.
         const requestId = String(args.request_id ?? "");
+        let original: Generation | undefined;
+        let conversation: ConversationSummary | undefined;
+        for (const entry of this.conversations) {
+          const found = (this.generations.get(entry.id) ?? []).find(
+            (candidate) => candidate.request_id === requestId,
+          );
+          if (found) {
+            original = found;
+            conversation = entry;
+            break;
+          }
+        }
+        if (!original || !conversation) {
+          throw { code: "not_found", message: "generation not found" };
+        }
+        const root = original.retry_root_id ?? original.request_id;
+        const lineage = this.generations.get(conversation.id) ?? [];
+        if (lineage.some((g) => g.retry_root_id === root && !isTerminal(g.status))) {
+          throw {
+            code: "admission.duplicate",
+            message: "An attempt is already in flight",
+            detail: "retry_in_flight",
+          };
+        }
+        const list = this.messages.get(conversation.id) ?? [];
+        const batchId = uuid("batch");
+        const assistantId = uuid(`msg-retry-${list.length}`);
+        const newRequestId = uuid(`gen-retry-${list.length}`);
+        list.push({
+          id: assistantId,
+          conversation_id: conversation.id,
+          parent_id: original.user_message_id,
+          role: "assistant",
+          content: "",
+          attachments: [],
+          created_at_ms: Date.now(),
+        });
+        lineage.push({
+          ...original,
+          request_id: newRequestId,
+          batch_id: batchId,
+          assistant_message_id: assistantId,
+          status: "connecting",
+          remote_generation_id: null,
+          error: null,
+          retry_of: original.request_id,
+          retry_root_id: root,
+          failure_kind: null,
+          failure_message: null,
+          started_at_ms: Date.now(),
+          finished_at_ms: null,
+        });
+        this.messages.set(conversation.id, list);
+        this.generations.set(conversation.id, lineage);
+        // Receipt CAS: the leaf follows the new attempt only while it still
+        // points at the replaced card (same rule as the native backend).
+        if (
+          conversation.main_leaf_id === original.assistant_message_id ||
+          conversation.main_leaf_id === original.user_message_id
+        ) {
+          conversation.main_leaf_id = assistantId;
+        }
+        this.emit("conversation-changed", { conversation_id: conversation.id });
+        this.streamAnswer(conversation.id, assistantId, newRequestId, batchId);
         const receipt: SendReceipt = {
-          conversation_id: this.conversations[0].id,
-          batch_id: uuid("batch"),
-          primary_request_id: requestId,
-          assistant_of: {},
-          adopted_main_leaf: null,
+          conversation_id: conversation.id,
+          batch_id: batchId,
+          primary_request_id: newRequestId,
+          assistant_of: { [newRequestId]: assistantId },
+          adopted_main_leaf: assistantId,
         };
         return receipt as T;
       }

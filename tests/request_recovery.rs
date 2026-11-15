@@ -60,6 +60,8 @@ async fn env_with(respond: impl Fn(&str, &[u8]) -> Vec<u8> + Send + Sync + 'stat
                     country_code: Some("US".into()),
                     source: "test",
                     checked_at: chrono::Utc::now(),
+                    families: aicouncil::services::network::RouteFamilies::DUAL,
+                    note: None,
                 },
             )),
         )),

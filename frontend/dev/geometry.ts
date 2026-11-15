@@ -19,7 +19,11 @@
  *   6. the Models/Settings popups scroll on their own and do not move the
  *      chat; `Escape` closes them and the focus comes back;
  *   7. a single-model conversation shows neither an answer tab strip nor
- *      branch controls, a parallel conversation shows both.
+ *      branch controls, a parallel conversation shows both;
+ *   8. the bottom left entries (Models, Settings) share one row, the top
+ *      right shows the cost of the chat and then the export, and the
+ *      catalogue can be managed (scroll to the bottom, add a model) while
+ *      the picker only offers the models of "My models".
  *
  * Usage (from `frontend/`):
  *
@@ -741,7 +745,7 @@ async function runChecks(cdp: Cdp, captureDir: string): Promise<void> {
     const scrollBefore = await cdp.evaluate<number>(
       `document.querySelector(".thread").scrollTop`,
     );
-    await clickSelector(cdp, ".main__toolbar .btn", label === "models" ? 0 : 1);
+    await clickSelector(cdp, ".sidebar__footer button", label === "models" ? 0 : 1);
     const dialog = await rectOf(cdp, `[data-testid='${testId}-dialog']`);
     const semantics = await cdp.evaluate<{ role: string; modal: string } | null>(
       `(() => {
@@ -824,7 +828,7 @@ async function runChecks(cdp: Cdp, captureDir: string): Promise<void> {
 
   // close button as well
   await setViewport(cdp, 1150, 680);
-  await clickSelector(cdp, ".main__toolbar .btn", 0);
+  await clickSelector(cdp, ".sidebar__footer button", 0);
   await clickSelector(cdp, "[data-testid='modal-close']");
   const closedByButton = await cdp.evaluate<boolean>(
     `!document.querySelector("[data-testid='modal-models-dialog']")`,
@@ -856,7 +860,7 @@ async function runChecks(cdp: Cdp, captureDir: string): Promise<void> {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   })()`);
 
-  await clickSelector(cdp, ".main__toolbar .btn", 0);
+  await clickSelector(cdp, ".sidebar__footer button", 0);
   const selectionAfterOpen = await cdp.evaluate<string>(
     `window.getSelection() ? window.getSelection().toString() : ""`,
   );
@@ -909,7 +913,322 @@ async function runChecks(cdp: Cdp, captureDir: string): Promise<void> {
     input.dispatchEvent(new Event("input", { bubbles: true }));
   })()`);
 
-  // ---------------------------------- 8. single model vs parallel controls
+  // ------------------------- 8. the entries, the cost and the catalogue
+  for (const [width, height] of [
+    [1150, 680],
+    [880, 520],
+  ] as const) {
+    await setViewport(cdp, width, height);
+
+    // 8a. the two bottom left entries share one row.
+    const footerRow = await cdp.evaluate<
+      | { models: Rect; settings: Rect; visible: boolean }
+      | null
+    >(`(() => {
+    const buttons = [...document.querySelectorAll(".sidebar__footer button")];
+    if (buttons.length < 2) return null;
+    const rect = (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height,
+               top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+    };
+    const a = rect(buttons[0]);
+    const b = rect(buttons[1]);
+    return { models: a, settings: b,
+             visible: a.width > 0 && b.width > 0 && a.height > 0 && b.height > 0 };
+  })()`);
+    report(
+      `entries/one-row/${width}x${height}`,
+      Boolean(
+        footerRow &&
+          footerRow.visible &&
+          Math.abs(footerRow.models.top - footerRow.settings.top) <= 2 &&
+          Math.abs(footerRow.models.bottom - footerRow.settings.bottom) <= 2 &&
+          footerRow.models.right <= footerRow.settings.left + 1,
+      ),
+      `models=${JSON.stringify(footerRow?.models)} settings=${JSON.stringify(
+        footerRow?.settings,
+      )}`,
+    );
+
+    // 8b. the top right shows the cost of the chat, then the export.
+    const toolbarRow = await cdp.evaluate<
+      | { cost: Rect; export: Rect; costText: string }
+      | null
+    >(`(() => {
+    const cost = document.querySelector("[data-testid='toolbar-cost']");
+    const exportButton = document.querySelector("[data-testid='toolbar-export']");
+    if (!cost || !exportButton) return null;
+    const rect = (el) => {
+      const r = el.getBoundingClientRect();
+      return { x: r.x, y: r.y, width: r.width, height: r.height,
+               top: r.top, bottom: r.bottom, left: r.left, right: r.right };
+    };
+    return { cost: rect(cost), export: rect(exportButton),
+             costText: (cost.textContent || "").trim() };
+  })()`);
+    report(
+      `toolbar/cost-before-export/${width}x${height}`,
+      Boolean(
+        toolbarRow &&
+          toolbarRow.cost.right <= toolbarRow.export.left + 1 &&
+          toolbarRow.costText === "$0.04",
+      ),
+      `cost=${JSON.stringify(toolbarRow?.cost)} (${
+        toolbarRow?.costText
+      }) export=${JSON.stringify(toolbarRow?.export)}`,
+    );
+
+    // 8c. the popovers hang below their entry and stay inside the window.
+    await clickSelector(cdp, "[data-testid='toolbar-export']");
+    const exportMenu = await rectOf(cdp, "[data-testid='export-menu']");
+    report(
+      `toolbar/export-popover/${width}x${height}`,
+      Boolean(
+        exportMenu &&
+          exportMenu.top >= 0 &&
+          exportMenu.bottom <= height + 1 &&
+          exportMenu.left >= 0 &&
+          exportMenu.right <= width + 1 &&
+          exportMenu.top >= (toolbarRow?.export.bottom ?? 0),
+      ),
+      `menu=${JSON.stringify(exportMenu)}`,
+    );
+    await pressEscape(cdp);
+    const exportClosed = await cdp.evaluate<boolean>(
+      `!document.querySelector("[data-testid='export-menu']")`,
+    );
+    report(
+      `toolbar/export-popover/escape/${width}x${height}`,
+      exportClosed,
+      `closed=${exportClosed}`,
+    );
+
+    await clickSelector(cdp, "[data-testid='toolbar-cost']");
+    const costPopover = await rectOf(cdp, "[data-testid='cost-popover']");
+    const costText = await cdp.evaluate<string>(
+      `document.querySelector("[data-testid='cost-popover']")?.textContent ?? ""`,
+    );
+    report(
+      `toolbar/cost-popover/${width}x${height}`,
+      Boolean(
+        costPopover &&
+          costPopover.top >= 0 &&
+          costPopover.bottom <= height + 1 &&
+          costPopover.right <= width + 1 &&
+          costText.includes("$0.04"),
+      ),
+      `popover=${JSON.stringify(costPopover)} text=${JSON.stringify(costText)}`,
+    );
+    // A click outside closes it.
+    await clickAt(cdp, Math.round(width / 2), Math.round(height / 2));
+    const costClosed = await cdp.evaluate<boolean>(
+      `!document.querySelector("[data-testid='cost-popover']")`,
+    );
+    report(
+      `toolbar/cost-popover/outside-click/${width}x${height}`,
+      costClosed,
+      `closed=${costClosed}`,
+    );
+  }
+
+  await setViewport(cdp, 1150, 680);
+
+  // 8e. the collapsed sidebar keeps the entries reachable through the
+  // existing expand button — and adds no second entry.
+  await setViewport(cdp, 1150, 680);
+  const collapseBox = await boxOf(cdp, ".sidebar__header .btn--icon");
+  if (collapseBox) await clickAt(cdp, collapseBox.x, collapseBox.y);
+  await sleep(200);
+  const collapsedState = await cdp.evaluate<{
+    sidebarVisible: boolean;
+    footerVisible: boolean;
+    headerEntries: number;
+  }>(`(() => {
+    const sidebar = document.querySelector("aside.sidebar");
+    const footer = document.querySelector(".sidebar__footer");
+    const header = document.querySelector(".main__header");
+    const rect = (el) => (el ? el.getBoundingClientRect() : null);
+    const footerRect = rect(footer);
+    const headerEntries = header
+      ? [...header.querySelectorAll("button")].filter((button) =>
+          /Models|Settings/.test(button.textContent || "")).length
+      : 0;
+    return {
+      sidebarVisible: !!(sidebar && sidebar.getBoundingClientRect().width > 0),
+      footerVisible: !!(footerRect && footerRect.width > 0 && footerRect.height > 0),
+      headerEntries,
+    };
+  })()`);
+  const expandBox = await boxOf(cdp, ".main__header .btn--icon");
+  if (expandBox) await clickAt(cdp, expandBox.x, expandBox.y);
+  await sleep(250);
+  const expandedState = await cdp.evaluate<{
+    footerVisible: boolean;
+    models: boolean;
+    settings: boolean;
+  }>(`(() => {
+    const footer = document.querySelector(".sidebar__footer");
+    const rect = footer ? footer.getBoundingClientRect() : null;
+    const buttons = footer ? [...footer.querySelectorAll("button")] : [];
+    return {
+      footerVisible: !!(rect && rect.width > 0 && rect.height > 0),
+      models: buttons.some((b) => (b.textContent || "").includes("Models")),
+      settings: buttons.some((b) => (b.textContent || "").includes("Settings")),
+    };
+  })()`);
+  report(
+    "entries/collapsed-reachable",
+    !collapsedState.sidebarVisible &&
+      !collapsedState.footerVisible &&
+      collapsedState.headerEntries === 0 &&
+      expandedState.footerVisible &&
+      expandedState.models &&
+      expandedState.settings,
+    `collapsed=${JSON.stringify(collapsedState)} expanded=${JSON.stringify(
+      expandedState,
+    )}`,
+  );
+
+  // 8d. the catalogue: scroll to the bottom and add a model.
+  await clickSelector(cdp, ".sidebar__footer button", 0);
+  await sleep(250);
+  await cdp.evaluate(`(() => {
+    const body = document.querySelector("[data-testid='modal-models-body']");
+    if (body) body.scrollTop = body.scrollHeight;
+  })()`);
+  await sleep(250);
+  const lastRow = await cdp.evaluate<
+    | {
+        title: string;
+        top: number;
+        bottom: number;
+        checked: boolean;
+        clickable: boolean;
+        x: number;
+        y: number;
+      }
+    | null
+  >(`(() => {
+    const rows = [...document.querySelectorAll("[data-testid='modal-models-body'] .model-row")]
+      .filter((row) => row.querySelector("input[type=checkbox]"));
+    const row = rows[rows.length - 1];
+    if (!row) return null;
+    const input = row.querySelector("input[type=checkbox]");
+    const r = row.getBoundingClientRect();
+    const b = input.getBoundingClientRect();
+    const hit = document.elementFromPoint(b.left + b.width / 2, b.top + b.height / 2);
+    return {
+      title: row.querySelector(".model-row__name")?.getAttribute("title") || "",
+      top: r.top, bottom: r.bottom, checked: input.checked,
+      clickable: !!hit && (hit === input || input.contains(hit)),
+      x: b.left + b.width / 2, y: b.top + b.height / 2,
+    };
+  })()`);
+  report(
+    "catalog/bottom-reachable",
+    Boolean(
+      lastRow &&
+        lastRow.top >= 0 &&
+        lastRow.bottom <= 681 &&
+        lastRow.clickable &&
+        !lastRow.checked,
+    ),
+    `row=${JSON.stringify(lastRow)}`,
+  );
+  if (lastRow) {
+    await clickAt(cdp, lastRow.x, lastRow.y);
+    await sleep(250);
+  }
+  const added = await cdp.evaluate<boolean>(
+    `(() => {
+      const rows = [...document.querySelectorAll("[data-testid='modal-models-body'] .model-row")]
+        .filter((row) => row.querySelector("input[type=checkbox]"));
+      const row = rows.find((entry) =>
+        (entry.querySelector(".model-row__name")?.getAttribute("title") || "") === ${JSON.stringify(
+          lastRow?.title ?? "",
+        )});
+      const input = row && row.querySelector("input[type=checkbox]");
+      return !!(input && input.checked);
+    })()`,
+  );
+  const inMine = await cdp.evaluate<boolean>(`(() => {
+    const body = document.querySelector("[data-testid='modal-models-body']");
+    const sections = body ? [...body.querySelectorAll("section")] : [];
+    const mine = sections[0];
+    return !!(mine && mine.textContent.includes("Qwen3 Max"));
+  })()`);
+  report("catalog/add-model", added && inMine, `checked=${added} inMine=${inMine}`);
+
+  await pressEscape(cdp);
+  await sleep(200);
+
+  // 8d-2. the preference survives a restart: reload the page, the bootstrap
+  // reads the persisted list again.
+  await cdp.send("Page.reload", { ignoreCache: true });
+  await sleep(1200);
+  let rebooted = false;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const ready = await cdp.evaluate<boolean>(
+      `!!document.querySelector(".thread") && document.querySelectorAll(".turn").length > 3`,
+    );
+    if (ready) {
+      rebooted = true;
+      break;
+    }
+    await sleep(250);
+  }
+  await clickSelector(cdp, ".sidebar__footer button", 0);
+  await sleep(300);
+  const persisted = await cdp.evaluate<boolean>(`(() => {
+    const body = document.querySelector("[data-testid='modal-models-body']");
+    const sections = body ? [...body.querySelectorAll("section")] : [];
+    const mine = sections[0];
+    return !!(mine && mine.textContent.includes("Qwen3 Max"));
+  })()`);
+  report(
+    "catalog/persisted-after-restart",
+    rebooted && persisted,
+    `rebooted=${rebooted} persisted=${persisted}`,
+  );
+  await pressEscape(cdp);
+  await sleep(200);
+
+  // 8e. the picker only offers the models of "My models".
+  await clickSelector(cdp, ".composer__models button[aria-haspopup='dialog']");
+  await sleep(250);
+  const picker = await cdp.evaluate<{
+    rows: number;
+    text: string;
+    rect: Rect | null;
+  }>(`(() => {
+    const el = document.querySelector(".picker");
+    if (!el) return { rows: 0, text: "", rect: null };
+    const r = el.getBoundingClientRect();
+    return {
+      rows: el.querySelectorAll(".picker__row").length,
+      text: el.textContent || "",
+      rect: { x: r.x, y: r.y, width: r.width, height: r.height,
+              top: r.top, bottom: r.bottom, left: r.left, right: r.right },
+    };
+  })()`);
+  report(
+    "picker/enabled-only",
+    Boolean(
+      picker.rows === 3 &&
+        !picker.text.includes("gemini-2.5-flash") &&
+        !picker.text.includes("Gemini") &&
+        picker.rect !== null &&
+        picker.rect.bottom <= 681 &&
+        picker.rect.left >= 0 &&
+        picker.rect.right <= 1151,
+    ),
+    `rows=${picker.rows} rect=${JSON.stringify(picker.rect)}`,
+  );
+  await pressEscape(cdp);
+  await sleep(150);
+
+  // ---------------------------------- 9. single model vs parallel controls
   const singleTabs = await cdp.evaluate<number>(
     `document.querySelectorAll("[data-testid='answer-tabs']").length`,
   );

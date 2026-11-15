@@ -20,6 +20,7 @@ use crate::domain::plan::{ContextMessage, PlannedRequest};
 use crate::domain::recovery::{DispatchPhase, FailureInfo, FailureKind};
 use crate::domain::Attachment;
 use crate::domain::{BatchId, ConversationId, GenerationId, MessageId, Pricing, ProviderId};
+use crate::services::network::RouteFamilies;
 
 /// 生成事件(服务层转发给 UI)。
 #[derive(Debug, Clone)]
@@ -434,6 +435,9 @@ pub struct ImmutableRequest {
     pub history: Vec<ContextMessage>,
     /// 本轮新 user 内容(已按附件拼接后的最终文本)。
     pub prompt: String,
+    /// 出口门禁核验的地址族(仅门禁模型被盖章;其余 DUAL 原语义)。
+    /// 提供方据此选择同族约束的 HTTP 客户端,未核验族不可能被使用。
+    pub route: RouteFamilies,
 }
 
 impl ImmutableRequest {
@@ -457,6 +461,7 @@ impl ImmutableRequest {
             history: req.history.clone(),
             // P7B:附件在此组合为最终 prompt,对提供方透明
             prompt: crate::domain::attachment::compose_prompt(prompt, attachments),
+            route: RouteFamilies::DUAL,
         }
     }
 }

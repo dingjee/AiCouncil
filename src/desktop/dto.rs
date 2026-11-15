@@ -149,6 +149,8 @@ pub struct ConversationSummaryDto {
     pub title_source: String,
     pub title_status: String,
     pub title_revision: i64,
+    /// 标题自动生成尝试次数(0=尚未尝试;失败后保留 fallback 且 >0)。
+    pub title_attempt_count: i64,
     pub main_leaf_id: Option<String>,
     pub draft_revision: i64,
     pub created_at_ms: i64,
@@ -165,6 +167,7 @@ impl From<&Conversation> for ConversationSummaryDto {
             title_source: c.title_source.as_str().to_string(),
             title_status: c.title_status.as_str().to_string(),
             title_revision: c.title_revision,
+            title_attempt_count: c.title_attempt_count,
             main_leaf_id: c.main_leaf_id.map(|m| m.as_str()),
             draft_revision: c.draft_revision,
             created_at_ms: c.created_at.timestamp_millis(),
@@ -548,7 +551,6 @@ pub enum GenEventDto {
         finish_state: String,
     },
     Failed {
-        #[serde(flatten)]
         error: ProviderErrorDto,
     },
     Cancelled,
@@ -648,6 +650,37 @@ impl From<crate::providers::LocatedEvent> for ChatEventDto {
             event,
         }
     }
+}
+
+/// 线格式回归:Failed 必须序列化为嵌套 `error`(前端
+/// `event.error.message` 依赖此形态;0.2.2 曾 flatten 导致
+/// Connecting 卡死)。夹具与前端测试共用同一文件,两侧不得各自
+/// 发明事件形态。
+#[test]
+fn failed_event_serializes_nested_error() {
+    use crate::providers::{GenEvent, LocatedEvent};
+    const FIXTURE: &str = include_str!("../../frontend/tests/fixtures/native_failed_event.json");
+    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).expect("夹具应为合法 JSON");
+
+    let ev = LocatedEvent {
+        conversation_id: crate::domain::ConversationId::new(),
+        batch_id: crate::domain::BatchId::new(),
+        request_id: crate::domain::GenerationId::new(),
+        assistant_message_id: crate::domain::MessageId::new(),
+        event: GenEvent::Failed {
+            // DTO 层渲染完整展示文案(含类别前缀);夹具存完整消息。
+            error: crate::providers::ProviderError::Unauthorized("User not found.".into()),
+        },
+    };
+    let dto = ChatEventDto::from(ev);
+    let json = serde_json::to_value(&dto.event).unwrap();
+    assert_eq!(json, fixture["event"], "线格式必须与共享夹具逐字段一致");
+    let err = json
+        .get("error")
+        .and_then(|e| e.as_object())
+        .expect("error 必须为嵌套对象(不得 flatten 到顶层)");
+    assert_eq!(err["kind"], "unauthorized");
+    assert!(json.get("kind").is_none() && json.get("retry_after_secs").is_none());
 }
 
 /// chat-event 顶层载荷(LocatedEvent 线格式)。

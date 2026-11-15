@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { t } from "../i18n/strings";
 import { presentation } from "../model/presentation";
@@ -86,12 +86,7 @@ export function MessageThread() {
           showBranchControls={controls.showBranchControls}
           branchSelection={state.branchSelection}
           showAttempts={state.showAttempts[conversationId] ?? false}
-          activeAnswerId={
-            state.activeAnswer[turn.question.id] ??
-            turn.answers.find((item) => !item.superseded)?.message_id ??
-            turn.answers[0]?.message_id ??
-            null
-          }
+          storedAnswerId={state.activeAnswer[turn.question.id] ?? null}
           onSelectAnswer={(messageId) =>
             dispatch({
               type: "answer/selected",
@@ -118,7 +113,8 @@ interface TurnViewProps {
   showBranchControls: boolean;
   branchSelection: Id[];
   showAttempts: boolean;
-  activeAnswerId: string | null;
+  /** The answer the user picked for this question (raw store value). */
+  storedAnswerId: string | null;
   onSelectAnswer(messageId: string): void;
   onToggleSplit(): void;
   onToggleAttempts(): void;
@@ -133,7 +129,7 @@ function TurnView({
   showBranchControls,
   branchSelection,
   showAttempts,
-  activeAnswerId,
+  storedAnswerId,
   onSelectAnswer,
   onToggleSplit,
   onToggleAttempts,
@@ -142,8 +138,44 @@ function TurnView({
   const [expanded, setExpanded] = useState(false);
   const long = question.content.length > COLLAPSE_HEIGHT;
 
-  const visible = answers.filter((item) => showAttempts || !item.superseded);
-  const hiddenCount = answers.length - visible.length;
+  /**
+   * What the tabs show.
+   *
+   * Default: one slot per model lineage — a retry replaced its failed
+   * attempt in place, so the replaced ones are hidden (their content lives
+   * on in the store/history, never re-rendered here unless asked for).
+   * History mode: every attempt, oldest first, grouped at its slot.
+   */
+  const visible = showAttempts
+    ? answers.flatMap((item) => [...item.older_attempts, item])
+    : answers;
+  const hiddenCount = answers.reduce(
+    (count, item) => count + item.older_attempts.length,
+    0,
+  );
+
+  /**
+   * Resolve the answer the user is looking at.
+   *
+   * A stored selection may name a replaced (hidden) attempt — the typical
+   * case is "the failed tab was open, the user hit retry": the selection
+   * then resolves to its lineage slot so the new attempt takes over the
+   * very box the user was reading instead of streaming somewhere else.
+   */
+  const activeAnswerId = (() => {
+    // Exactly what the user picked (the history view lists every attempt).
+    if (storedAnswerId && visible.some((item) => item.message_id === storedAnswerId)) {
+      return storedAnswerId;
+    }
+    if (storedAnswerId) {
+      const slot = answers.find(
+        (item) =>
+          item.older_attempts.some((entry) => entry.message_id === storedAnswerId),
+      );
+      if (slot) return slot.message_id;
+    }
+    return answers[0]?.message_id ?? null;
+  })();
 
   const activeIds = split
     ? [
@@ -280,7 +312,9 @@ function TurnView({
                       aria-hidden="true"
                     />
                     <span>{label}</span>
-                    {item.attempt > 1 ? (
+                    {/* Attempt numbers only in the explicit history view;
+                        a retried tab shows no marker in normal use. */}
+                    {showAttempts && item.attempt > 1 ? (
                       <span className="muted small">
                         {t("answers.attempt").replace("{n}", String(item.attempt))}
                       </span>
@@ -321,7 +355,9 @@ function TurnView({
 
           <div className={split ? "answers answers--split" : "answers"}>
             {activeIds.map((messageId) => {
-              const item = answers.find((entry) => entry.message_id === messageId);
+              // History mode also renders replaced attempts, so look the
+              // item up in the visible set (slots + their older attempts).
+              const item = visible.find((entry) => entry.message_id === messageId);
               const message = messages.find((entry) => entry.id === messageId);
               if (!item || !message) return null;
               return (
@@ -329,6 +365,7 @@ function TurnView({
                   key={messageId}
                   message={message}
                   item={item}
+                  history={showAttempts && item.superseded}
                   generations={generations}
                   branchSelected={branchSelection.includes(messageId)}
                   showBranchControls={showBranchControls}
@@ -345,6 +382,8 @@ function TurnView({
 interface AnswerCardProps {
   message: Message;
   item: AnswerItem;
+  /** True when this card is a replaced attempt shown in the history view. */
+  history: boolean;
   generations: Generation[];
   branchSelected: boolean;
   showBranchControls: boolean;
@@ -353,6 +392,7 @@ interface AnswerCardProps {
 function AnswerCard({
   message,
   item,
+  history,
   generations,
   branchSelected,
   showBranchControls,
@@ -371,6 +411,32 @@ function AnswerCard({
     item.status === "interrupted";
   const label = modelLabel(state.catalog, item.model_id);
 
+  /**
+   * Retry cooldown (admission guard).
+   *
+   * The backend refuses a retry while `retry_not_before_ms` is in the
+   * future (Retry-After / backoff). The button is disabled with a visible
+   * countdown for that window, so a blocked retry is never even attempted —
+   * no dead request, no surprise toast.
+   */
+  const retryNotBeforeMs = generation?.retry_not_before_ms ?? null;
+  const [cooldownLeftMs, setCooldownLeftMs] = useState(() =>
+    retryNotBeforeMs ? Math.max(0, retryNotBeforeMs - Date.now()) : 0,
+  );
+  useEffect(() => {
+    if (!retryNotBeforeMs) {
+      setCooldownLeftMs(0);
+      return;
+    }
+    const tick = () =>
+      setCooldownLeftMs(Math.max(0, retryNotBeforeMs - Date.now()));
+    tick();
+    const timer = setInterval(tick, 500);
+    return () => clearInterval(timer);
+  }, [retryNotBeforeMs]);
+  const coolingDown = failed && cooldownLeftMs > 0;
+  const cooldownSeconds = Math.ceil(cooldownLeftMs / 1000);
+
   return (
     <article
       className="card"
@@ -379,7 +445,7 @@ function AnswerCard({
     >
       <header className="card__header">
         <span className="card__model">{label}</span>
-        {item.attempt > 1 ? (
+        {history && item.attempt > 1 ? (
           <span>{t("answers.attempt").replace("{n}", String(item.attempt))}</span>
         ) : null}
         {item.status ? <span>{statusLabel(item.status)}</span> : null}
@@ -467,16 +533,33 @@ function AnswerCard({
             </button>
           ) : null}
           {failed && generation ? (
-            <button
-              type="button"
-              className="btn btn--icon"
-              title={t("message.retry")}
-              aria-label={t("message.retry")}
-              data-testid="answer-retry"
-              onClick={() => void actions.retry(generation.request_id)}
-            >
-              <Icon name="retry" size={13} />
-            </button>
+            <>
+              {coolingDown ? (
+                <span className="muted small" role="status" data-testid="answer-retry-cooldown">
+                  {t("retry.cooldown").replace("{s}", String(cooldownSeconds))}
+                </span>
+              ) : null}
+              <button
+                type="button"
+                className="btn btn--icon"
+                title={
+                  coolingDown
+                    ? t("retry.cooldown").replace("{s}", String(cooldownSeconds))
+                    : t("message.retry")
+                }
+                aria-label={
+                  coolingDown
+                    ? t("retry.cooldown").replace("{s}", String(cooldownSeconds))
+                    : t("message.retry")
+                }
+                disabled={coolingDown}
+                aria-disabled={coolingDown}
+                data-testid="answer-retry"
+                onClick={() => void actions.retry(generation.request_id)}
+              >
+                <Icon name="retry" size={13} />
+              </button>
+            </>
           ) : null}
         </div>
       </footer>

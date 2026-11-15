@@ -1,131 +1,174 @@
 import { useEffect, useMemo, useRef } from "react";
 
 import { t } from "../i18n/strings";
-import { presentation } from "../model/presentation";
 import {
   enabledModels,
   filterModelGroups,
-  groupModels,
+  groupEnabledModels,
   resolveSelection,
 } from "../state/selectors";
 import { useStore } from "../state/store";
+import { usePopupDismiss } from "../util/popup";
 import { Icon } from "./Icon";
 
 export interface ModelPickerProps {
   onClose(): void;
+  /** Opens the Models panel (the management surface). */
+  onManageModels?(): void;
+  /** The control that opened the picker (the focus returns there on Escape). */
+  trigger?: () => HTMLElement | null;
 }
 
 /**
  * Model picker.
  *
- * One entry for both modes: clicking a model selects it (single mode),
- * checking models selects several (parallel mode) and the star marks the
- * primary model that owns the main branch.
+ * The picker is a **selection** surface: it only offers the models the user
+ * enabled in the Models panel ("My models"). It never enables a model of the
+ * full catalogue — that happens in the Models panel only.
+ *
+ * One list for both modes: every entry carries a checkbox, and the checked
+ * entries are the selection. One checked model sends to that model, several
+ * checked models ask the same question in parallel, and no checked model
+ * disables the send. The star marks the primary model that owns the main
+ * branch; it always belongs to the selection.
+ *
+ * Checking a model never closes the picker — the user picks several models
+ * in one go.
  */
-export function ModelPicker({ onClose }: ModelPickerProps) {
+export function ModelPicker({ onClose, onManageModels, trigger }: ModelPickerProps) {
   const { state, actions, dispatch } = useStore();
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
 
+  // The picker only ever shows the enabled models.
   const groups = useMemo(
-    () => groupModels(state.catalog, state.preferences),
-    [state.catalog, state.preferences],
+    () => groupEnabledModels(state.preferences, state.catalog),
+    [state.preferences, state.catalog],
   );
   const filtered = useMemo(
-    () => filterModelGroups(groups, state.modelSearch),
-    [groups, state.modelSearch],
+    () => filterModelGroups(groups, state.pickerSearch),
+    [groups, state.pickerSearch],
   );
   const enabled = useMemo(() => enabledModels(state), [state]);
   const selection = useMemo(
     () => resolveSelection(enabled, [], state.modelSelection),
     [enabled, state.modelSelection],
   );
-  const parallel = state.modelSelection.parallel;
+
+  // The picker closes as soon as it is not the active surface any more.
+  usePopupDismiss({
+    open: true,
+    onDismiss: onClose,
+    popupRef: panelRef,
+    trigger,
+    restoreFocus: true,
+  });
 
   useEffect(() => {
     searchRef.current?.focus();
-  }, []);
+    // A new picker starts with an empty query.
+    dispatch({ type: "picker/search", query: "" });
+  }, [dispatch]);
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  /** The label of every enabled model (the id when the catalogue lost it). */
+  const labels = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const group of groups) {
+      for (const item of group.items) map.set(item.raw_id, item.full_label);
+    }
+    return map;
+  }, [groups]);
 
-  const primaryName = useMemo(() => {
-    if (!selection.primary) return "";
-    const entry = state.catalog.find((item) => item.id === selection.primary);
-    return entry ? presentation(entry.id, entry.name).full_label : selection.primary;
-  }, [selection.primary, state.catalog]);
+  const primaryName = selection.primary
+    ? (labels.get(selection.primary) ?? selection.primary)
+    : "";
+  const checkedCount = state.modelSelection.checked.length;
 
   return (
-    <div className="picker" role="dialog" aria-label={t("selector.open")}>
+    <div className="picker" role="dialog" aria-label={t("selector.open")} ref={panelRef}>
       <input
         ref={searchRef}
         className="input picker__search"
         type="search"
-        value={state.modelSearch}
+        value={state.pickerSearch}
         placeholder={t("selector.search_placeholder")}
         aria-label={t("selector.search_placeholder")}
         onChange={(event) =>
-          dispatch({ type: "model/search", query: event.target.value })
+          dispatch({ type: "picker/search", query: event.target.value })
         }
       />
 
-      {filtered.length === 0 ? (
+      {enabled.length === 0 ? (
+        <div className="picker__empty">
+          <p className="hint" style={{ margin: 0 }}>
+            {t("selector.empty")}
+          </p>
+          <p className="hint" style={{ margin: 0 }}>
+            {t("selector.empty_hint")}
+          </p>
+          {onManageModels ? (
+            <button
+              type="button"
+              className="btn btn--accent"
+              onClick={() => {
+                onClose();
+                onManageModels();
+              }}
+            >
+              <Icon name="models" size={14} />
+              {t("selector.manage_models")}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
+      {enabled.length > 0 && filtered.length === 0 ? (
         <p className="hint" style={{ padding: "var(--space-s)" }}>
-          {t("selector.no_results").replace("{query}", state.modelSearch)}
+          {t("selector.no_results").replace("{query}", state.pickerSearch)}
         </p>
       ) : null}
 
-      <div role="listbox" aria-multiselectable={parallel} aria-label={t("a11y.model_list")}>
+      <div
+        role="listbox"
+        aria-multiselectable
+        aria-label={t("a11y.model_list")}
+      >
         {filtered.map((group) => (
           <div className="picker__group" key={group.label}>
             <div className="picker__group-title">{group.label}</div>
             {group.items.map((item) => {
-              const isEnabled = enabled.includes(item.raw_id);
               const isChecked = state.modelSelection.checked.includes(item.raw_id);
               const isPrimary = selection.primary === item.raw_id;
-              const selected = parallel ? isChecked : isPrimary;
               return (
                 <div
                   key={item.raw_id}
                   className="picker__row"
-                  data-selected={selected}
+                  data-selected={isChecked}
                   role="option"
-                  aria-selected={selected}
+                  aria-selected={isChecked}
                   tabIndex={0}
-                  onClick={() => {
-                    if (parallel) {
-                      actions.toggleChecked(item.raw_id, !isChecked);
-                    } else {
-                      void actions.setPrimaryModel(item.raw_id);
-                      onClose();
-                    }
-                  }}
+                  onClick={() => actions.toggleChecked(item.raw_id, !isChecked)}
                   onKeyDown={(event) => {
+                    // The star and the checkbox are children of the row:
+                    // their own key handling must not toggle the model a
+                    // second time.
+                    if (event.target !== event.currentTarget) return;
                     if (event.key === "Enter" || event.key === " ") {
                       event.preventDefault();
-                      if (parallel) {
-                        actions.toggleChecked(item.raw_id, !isChecked);
-                      } else {
-                        void actions.setPrimaryModel(item.raw_id);
-                        onClose();
-                      }
+                      actions.toggleChecked(item.raw_id, !isChecked);
                     }
                   }}
                 >
-                  {parallel ? (
-                    <input
-                      type="checkbox"
-                      checked={isChecked}
-                      readOnly
-                      tabIndex={-1}
-                      aria-label={item.full_label}
-                      onClick={(event) => event.stopPropagation()}
-                    />
-                  ) : null}
+                  <input
+                    type="checkbox"
+                    checked={isChecked}
+                    tabIndex={-1}
+                    aria-label={item.full_label}
+                    onClick={(event) => event.stopPropagation()}
+                    onChange={(event) =>
+                      actions.toggleChecked(item.raw_id, event.target.checked)
+                    }
+                  />
 
                   <span className="picker__name" title={item.full_label}>
                     {item.full_label}
@@ -145,18 +188,6 @@ export function ModelPicker({ onClose }: ModelPickerProps) {
                   >
                     <Icon name={isPrimary ? "starFilled" : "star"} size={13} />
                   </button>
-
-                  <label className="btn btn--icon" title={t("models.enabled")}>
-                    <input
-                      type="checkbox"
-                      checked={isEnabled}
-                      aria-label={`${t("models.enabled")}: ${item.full_label}`}
-                      onClick={(event) => event.stopPropagation()}
-                      onChange={(event) =>
-                        void actions.setModelEnabled(item.raw_id, event.target.checked)
-                      }
-                    />
-                  </label>
                 </div>
               );
             })}
@@ -165,27 +196,18 @@ export function ModelPicker({ onClose }: ModelPickerProps) {
       </div>
 
       <div className="picker__footer">
-        <span className="small muted">
-          {parallel ? t("selector.multi_hint") : t("selector.single_hint")}
-        </span>
+        <span className="small muted">{t("selector.multi_hint")}</span>
         <span className="small" style={{ marginLeft: "auto" }}>
-          {primaryName
-            ? parallel && selection.targets.length > 1
-              ? t("selector.primary_plus")
-                  .replace("{primary}", primaryName)
-                  .replace("{n}", String(selection.targets.length - 1))
-              : primaryName
-            : t("models.none_enabled")}
+          {t("selector.selected_count").replace("{n}", String(checkedCount))}
+          {primaryName ? ` · ${primaryName}` : ""}
         </span>
-        {parallel ? (
-          <button
-            type="button"
-            className="btn"
-            onClick={() => actions.setChecked(enabled)}
-          >
-            {t("selector.select_all")}
-          </button>
-        ) : null}
+        <button
+          type="button"
+          className="btn"
+          onClick={() => actions.setChecked(enabled)}
+        >
+          {t("selector.select_all")}
+        </button>
       </div>
     </div>
   );

@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { t } from "../i18n/strings";
 import { conversationsByGroup } from "../state/selectors";
 import { useStore } from "../state/store";
 import type { ConversationSummary, Group, Id } from "../ipc/types";
+import { usePopupDismiss } from "../util/popup";
 import { Icon } from "./Icon";
 
 export function Sidebar() {
@@ -17,12 +18,49 @@ export function Sidebar() {
   const [groupNameValue, setGroupNameValue] = useState("");
   const [pendingDelete, setPendingDelete] = useState<ConversationSummary | null>(null);
   const renameRef = useRef<HTMLInputElement | null>(null);
+  const newGroupRef = useRef<HTMLDivElement | null>(null);
+  const newGroupButtonRef = useRef<HTMLButtonElement | null>(null);
+  const deleteDialogRef = useRef<HTMLDivElement | null>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement | null>(null);
+  /** The buttons that opened a transient surface (focus returns to them). */
+  const moveButtonRefs = useRef(new Map<Id, HTMLButtonElement | null>());
+  const deleteButtonRefs = useRef(new Map<Id, HTMLButtonElement | null>());
 
   const buckets = useMemo(() => conversationsByGroup(state), [state]);
 
   useEffect(() => {
     if (renamingId && renameRef.current) renameRef.current.focus();
   }, [renamingId]);
+
+  const closeNewGroup = useCallback(() => {
+    setNewGroupOpen(false);
+    setNewGroupName("");
+  }, []);
+
+  // The new group form is a transient surface: it closes on a press outside,
+  // when the focus leaves it, when the window loses the focus and on Escape.
+  usePopupDismiss({
+    open: newGroupOpen,
+    onDismiss: closeNewGroup,
+    popupRef: newGroupRef,
+    trigger: () => newGroupButtonRef.current,
+    restoreFocus: true,
+  });
+
+  // The delete confirmation is a transient surface as well.
+  usePopupDismiss({
+    open: pendingDelete !== null,
+    onDismiss: () => setPendingDelete(null),
+    popupRef: deleteDialogRef,
+    trigger: () =>
+      pendingDelete ? (deleteButtonRefs.current.get(pendingDelete.id) ?? null) : null,
+    restoreFocus: true,
+  });
+
+  // The confirmation takes the focus, so the keyboard reaches it.
+  useEffect(() => {
+    if (pendingDelete) deleteCancelRef.current?.focus();
+  }, [pendingDelete]);
 
   const startRename = (conversation: ConversationSummary) => {
     setRenamingId(conversation.id);
@@ -41,12 +79,11 @@ export function Sidebar() {
   const commitNewGroup = () => {
     const value = newGroupName.trim();
     if (!value) {
-      setNewGroupOpen(false);
+      closeNewGroup();
       return;
     }
     void actions.createGroup(value);
-    setNewGroupName("");
-    setNewGroupOpen(false);
+    closeNewGroup();
   };
 
   return (
@@ -75,6 +112,7 @@ export function Sidebar() {
           {t("conversation.new_button")}
         </button>
         <button
+          ref={newGroupButtonRef}
           type="button"
           className="btn btn--icon"
           title={t("group.new")}
@@ -87,7 +125,7 @@ export function Sidebar() {
       </div>
 
       {newGroupOpen ? (
-        <div className="sidebar__search">
+        <div className="sidebar__search" ref={newGroupRef}>
           <input
             className="input"
             value={newGroupName}
@@ -264,6 +302,9 @@ export function Sidebar() {
                             title={t("conversation.move_to")}
                             aria-label={`${t("conversation.move_to")} ${conversation.title}`}
                             aria-expanded={movingId === conversation.id}
+                            ref={(element) => {
+                              moveButtonRefs.current.set(conversation.id, element);
+                            }}
                             onClick={(event) => {
                               event.stopPropagation();
                               setMovingId(
@@ -278,6 +319,9 @@ export function Sidebar() {
                             className="btn btn--icon btn--danger"
                             title={t("conversation.delete")}
                             aria-label={`${t("conversation.delete")}: ${conversation.title}`}
+                            ref={(element) => {
+                              deleteButtonRefs.current.set(conversation.id, element);
+                            }}
                             onClick={(event) => {
                               event.stopPropagation();
                               setPendingDelete(conversation);
@@ -294,6 +338,7 @@ export function Sidebar() {
                     <MoveMenu
                       groups={state.groups}
                       conversation={conversation}
+                      trigger={() => moveButtonRefs.current.get(conversation.id) ?? null}
                       onPick={(groupId) => {
                         setMovingId(null);
                         void actions.moveConversation(conversation.id, groupId);
@@ -315,8 +360,13 @@ export function Sidebar() {
       </nav>
 
       {pendingDelete ? (
-        <div className="scrim" role="presentation">
+        <div
+          className="scrim"
+          role="presentation"
+          onClick={() => setPendingDelete(null)}
+        >
           <div
+            ref={deleteDialogRef}
             className="card"
             role="dialog"
             aria-modal="true"
@@ -333,6 +383,7 @@ export function Sidebar() {
             <p>{`Delete "${pendingDelete.title}"?`}</p>
             <div style={{ display: "flex", gap: "var(--space-s)", justifyContent: "flex-end" }}>
               <button
+                ref={deleteCancelRef}
                 type="button"
                 className="btn"
                 onClick={() => setPendingDelete(null)}
@@ -385,24 +436,23 @@ interface MoveMenuProps {
   conversation: ConversationSummary;
   onPick(groupId: Id | null): void;
   onClose(): void;
+  /** The button that opened the menu (the focus returns to it). */
+  trigger?: () => HTMLElement | null;
 }
 
-function MoveMenu({ groups, conversation, onPick, onClose }: MoveMenuProps) {
+function MoveMenu({ groups, conversation, onPick, onClose, trigger }: MoveMenuProps) {
   const ref = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const onDocumentClick = (event: MouseEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) onClose();
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    document.addEventListener("mousedown", onDocumentClick);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDocumentClick);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [onClose]);
+
+  // The menu closes as soon as it is not the active surface any more: a
+  // press outside, the focus leaving it, the window losing the focus or
+  // `Escape`.
+  usePopupDismiss({
+    open: true,
+    onDismiss: onClose,
+    popupRef: ref,
+    trigger,
+    restoreFocus: true,
+  });
 
   return (
     <div

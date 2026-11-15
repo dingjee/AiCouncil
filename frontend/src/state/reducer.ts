@@ -19,7 +19,7 @@ import type {
   Settings,
   UsageRecord,
 } from "../ipc/types";
-import { initialState, type AppState, type EgressModalState, type ModalKind, type ToastKind } from "./types";
+import { initialState, type AppState, type EgressModalState, type ModalKind, type ModelSelectionState, type ToastKind } from "./types";
 
 export type Action =
   | { type: "boot/started" }
@@ -51,6 +51,11 @@ export type Action =
       editText: string;
       editAttachments: Message["attachments"];
       editLatestEligible: Id | null;
+      /**
+       * The local edit buffer is newer than the backend's: the snapshot must
+       * not throw it away.
+       */
+      preserveEditBuffer?: boolean;
     }
   | { type: "conversation/upserted"; conversation: ConversationSummary }
   | { type: "conversation/removed"; conversationId: Id }
@@ -62,6 +67,13 @@ export type Action =
     }
   | { type: "message/removed"; conversationId: Id; messageId: Id }
   | { type: "generation/upserted"; conversationId: Id; generation: Generation }
+  | {
+      type: "generation/progress";
+      conversationId: Id;
+      requestId: Id;
+      status?: "connecting" | "streaming";
+      remoteId?: string | null;
+    }
   | {
       type: "stream/chunk";
       conversationId: Id;
@@ -75,7 +87,19 @@ export type Action =
       updatedAt: number | null;
     }
   | { type: "preferences/loaded"; preferences: ModelPreferenceEntry[] }
-  | { type: "model/enabled"; modelId: string; enabled: boolean }
+  | {
+      type: "model/enabled";
+      modelId: string;
+      enabled: boolean;
+      /**
+       * The preference of a model that has none yet.
+       *
+       * `undefined` leaves the list untouched (the model already has a
+       * preference), an entry adds it (upsert) and `null` removes it again
+       * (the rollback of a failed write).
+       */
+      preference?: ModelPreferenceEntry | null;
+    }
   | { type: "model/primary"; modelId: string }
   | {
       type: "model/overrides";
@@ -90,6 +114,7 @@ export type Action =
   | { type: "composer/text"; text: string }
   | { type: "composer/attachments"; attachments: Message["attachments"] }
   | { type: "composer/clear" }
+  | { type: "edit/clear" }
   | { type: "draft/revision"; revision: number }
   | { type: "edit/start"; messageId: Id; text: string; attachments: Message["attachments"] }
   | { type: "edit/text"; text: string }
@@ -100,6 +125,7 @@ export type Action =
   | { type: "sidebar/width"; width: number }
   | { type: "conversation/search"; query: string }
   | { type: "model/search"; query: string }
+  | { type: "picker/search"; query: string }
   | { type: "picker/toggle"; open?: boolean }
   | { type: "attempts/toggle"; conversationId: Id }
   | { type: "split/toggle"; conversationId: Id }
@@ -123,6 +149,82 @@ function upsertById<T extends { id: string }>(items: T[], item: T): T[] {
   return next;
 }
 
+/** The enabled model ids, in the panel order. */
+function enabledIds(preferences: ModelPreferenceEntry[] | undefined): string[] {
+  const list = Array.isArray(preferences) ? preferences : [];
+  return list
+    .slice()
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
+    .filter((preference) => preference.enabled)
+    .map((preference) => preference.model_id);
+}
+
+/** The default model of the enabled preferences (the star). */
+function defaultModelId(
+  preferences: ModelPreferenceEntry[] | undefined,
+): string | null {
+  const list = Array.isArray(preferences) ? preferences : [];
+  return (
+    list.find((preference) => preference.enabled && preference.is_default)
+      ?.model_id ?? null
+  );
+}
+
+/**
+ * Normalize a selection.
+ *
+ * The primary always belongs to the checked set: when it does not, the
+ * default model takes over and, if that one is not checked either, the first
+ * checked model does. A model the user unchecked is never added back.
+ */
+function normalizeSelection(
+  checked: string[],
+  primary: string | null,
+  defaultId: string | null,
+): ModelSelectionState {
+  const unique = checked.filter((id, index) => checked.indexOf(id) === index);
+  const nextPrimary =
+    (primary && unique.includes(primary) ? primary : null) ??
+    (defaultId && unique.includes(defaultId) ? defaultId : null) ??
+    unique[0] ??
+    null;
+  return { parallel: unique.length > 1, checked: unique, primary: nextPrimary };
+}
+
+/**
+ * Keep the model selection consistent with the preferences.
+ *
+ * A model that is not enabled can neither be the primary nor stay checked.
+ * The selection is only filled when the caller asks for it:
+ *
+ *   - `seed`: the app starts and picks the enabled default **once**;
+ *   - `fallback`: a model left "My models" and took the last place.
+ *
+ * A selection the user emptied on purpose stays empty — the send is then
+ * disabled instead of silently using another model.
+ */
+function syncSelection(
+  preferences: ModelPreferenceEntry[] | undefined,
+  selection: ModelSelectionState,
+  options: { seed?: boolean; fallback?: boolean } = {},
+): ModelSelectionState {
+  const enabled = enabledIds(preferences);
+  const defaultId = defaultModelId(preferences);
+  const checked = selection.checked.filter((id) => enabled.includes(id));
+  if (
+    checked.length === 0 &&
+    (options.seed || options.fallback) &&
+    enabled.length > 0
+  ) {
+    const seed =
+      selection.primary && enabled.includes(selection.primary)
+        ? selection.primary
+        : (defaultId ?? enabled[0]);
+    return normalizeSelection([seed], selection.primary, defaultId);
+  }
+  return normalizeSelection(checked, selection.primary, defaultId);
+}
+
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
     case "boot/started":
@@ -142,6 +244,10 @@ export function reducer(state: AppState, action: Action): AppState {
         catalog: action.catalog,
         catalogUpdatedAt: action.catalogUpdatedAt,
         preferences: action.preferences,
+        modelSelection: syncSelection(action.preferences, state.modelSelection, {
+          // The app starts with the enabled default — once.
+          seed: true,
+        }),
         credentials: action.credentials,
         settings: action.settings,
         sidebarCollapsed: action.settings.sidebar_collapsed,
@@ -154,13 +260,52 @@ export function reducer(state: AppState, action: Action): AppState {
     case "groups/loaded":
       return { ...state, groups: action.groups };
 
-    case "conversation/loaded":
+    case "conversation/loaded": {
+      /**
+       * Keep locally-streamed deltas that the snapshot does not have yet.
+       *
+       * A refetch can land mid-stream (a `usage_updated` or a title event),
+       * and the backend flushes streamed content to the DB only in
+       * intervals. Replacing the message list wholesale would then roll the
+       * visible text back to the last flush until the next delta arrived.
+       * For a message whose generation is still live, the local content is
+       * a strict superset of the snapshot's (deltas only ever append), so
+       * the local tail wins. A **terminal** snapshot is authoritative and
+       * always replaces the local text.
+       */
+      const liveByMessage = new Map<string, boolean>();
+      for (const generation of action.generations) {
+        liveByMessage.set(
+          generation.assistant_message_id,
+          generation.status === "queued" ||
+            generation.status === "connecting" ||
+            generation.status === "streaming",
+        );
+      }
+      const previousById = new Map(
+        (state.messages[action.conversationId] ?? []).map((message) => [
+          message.id,
+          message,
+        ]),
+      );
+      const messages = action.messages.map((message) => {
+        const previous = previousById.get(message.id);
+        if (
+          previous &&
+          previous.content.length > message.content.length &&
+          previous.content.startsWith(message.content) &&
+          liveByMessage.get(message.id) === true
+        ) {
+          return previous;
+        }
+        return message;
+      });
       return {
         ...state,
         conversations: upsertById(state.conversations, action.conversation),
         messages: {
           ...state.messages,
-          [action.conversationId]: action.messages,
+          [action.conversationId]: messages,
         },
         generations: {
           ...state.generations,
@@ -168,11 +313,18 @@ export function reducer(state: AppState, action: Action): AppState {
         },
         usage: { ...state.usage, [action.conversationId]: action.usage },
         draftRevision: action.draftRevision,
-        editingLatest: action.editTargetId,
-        editText: action.editText,
-        editAttachments: action.editAttachments,
+        // The edit buffer of the user may be newer than the backend's: it
+        // must survive the refetch.
+        editingLatest: action.preserveEditBuffer
+          ? state.editingLatest
+          : action.editTargetId,
+        editText: action.preserveEditBuffer ? state.editText : action.editText,
+        editAttachments: action.preserveEditBuffer
+          ? state.editAttachments
+          : action.editAttachments,
         editLatestEligible: action.editLatestEligible,
       };
+    }
 
     case "conversation/upserted": {
       const conversations = upsertById(state.conversations, action.conversation);
@@ -260,6 +412,46 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
 
+    /**
+     * Progress patch for an existing generation (backend events).
+     *
+     * Merges against the **current** reducer row (not a snapshot taken
+     * before dispatch), so synchronous back-to-back events cannot overwrite
+     * each other with stale fields. A terminal generation is never
+     * resurrected, and `streaming` never regresses to `connecting`.
+     */
+    case "generation/progress": {
+      const list = state.generations[action.conversationId] ?? [];
+      const index = list.findIndex(
+        (generation) => generation.request_id === action.requestId,
+      );
+      if (index < 0) return state;
+      const existing = list[index];
+      if (
+        existing.status === "completed" ||
+        existing.status === "cancelled" ||
+        existing.status === "failed" ||
+        existing.status === "interrupted"
+      ) {
+        return state;
+      }
+      const status =
+        action.status === "connecting" && existing.status === "streaming"
+          ? "streaming"
+          : (action.status ?? existing.status);
+      const remote_generation_id =
+        action.remoteId !== undefined ? action.remoteId : existing.remote_generation_id;
+      if (status === existing.status && remote_generation_id === existing.remote_generation_id) {
+        return state;
+      }
+      const next = list.slice();
+      next[index] = { ...existing, status, remote_generation_id };
+      return {
+        ...state,
+        generations: { ...state.generations, [action.conversationId]: next },
+      };
+    }
+
     case "stream/chunk": {
       const list = state.messages[action.conversationId] ?? [];
       const index = list.findIndex((message) => message.id === action.messageId);
@@ -285,33 +477,85 @@ export function reducer(state: AppState, action: Action): AppState {
       };
 
     case "preferences/loaded":
-      return { ...state, preferences: action.preferences };
-
-    case "model/enabled":
       return {
         ...state,
-        preferences: state.preferences.map((preference) =>
+        preferences: action.preferences,
+        modelSelection: syncSelection(action.preferences, state.modelSelection),
+      };
+
+    case "model/enabled": {
+      const index = state.preferences.findIndex(
+        (preference) => preference.model_id === action.modelId,
+      );
+      let preferences: ModelPreferenceEntry[];
+      if (action.preference === null) {
+        if (index < 0) return state;
+        preferences = state.preferences.filter(
+          (preference) => preference.model_id !== action.modelId,
+        );
+      } else if (index < 0) {
+        if (!action.preference) return state;
+        // A catalog model without a preference joins "My models".
+        preferences = [
+          ...state.preferences,
+          { ...action.preference, enabled: action.enabled },
+        ];
+      } else {
+        preferences = state.preferences.map((preference) =>
           preference.model_id === action.modelId
             ? { ...preference, enabled: action.enabled }
             : preference,
+        );
+      }
+
+      // The selection must stay valid: a model that left "My models" can
+      // neither stay the primary nor stay checked.
+      const enabled = enabledIds(preferences);
+      const defaultId = defaultModelId(preferences);
+      const wasChecked = state.modelSelection.checked.includes(action.modelId);
+      const checked = state.modelSelection.checked.filter((id) =>
+        enabled.includes(id),
+      );
+      // The model that left "My models" took the last place: a remaining
+      // enabled model takes over, so the send is not dead. A selection the
+      // user emptied on purpose stays empty.
+      const next =
+        wasChecked && checked.length === 0 && enabled.length > 0
+          ? [defaultId ?? enabled[0]]
+          : checked;
+      return {
+        ...state,
+        preferences,
+        modelSelection: normalizeSelection(
+          next,
+          state.modelSelection.primary,
+          defaultId,
         ),
       };
+    }
 
-    case "model/primary":
+    case "model/primary": {
+      const enabled = enabledIds(state.preferences);
+      const checked = state.modelSelection.checked.includes(action.modelId)
+        ? state.modelSelection.checked
+        : enabled.includes(action.modelId)
+          ? [...state.modelSelection.checked, action.modelId]
+          : state.modelSelection.checked;
       return {
         ...state,
         preferences: state.preferences.map((preference) => ({
           ...preference,
           is_default: preference.model_id === action.modelId,
         })),
+        // The primary belongs to the selection — that is what makes it the
+        // owner of the main branch.
         modelSelection: {
-          ...state.modelSelection,
+          parallel: checked.length > 1,
+          checked,
           primary: action.modelId,
-          checked: state.modelSelection.checked.includes(action.modelId)
-            ? state.modelSelection.checked
-            : [...state.modelSelection.checked, action.modelId],
         },
       };
+    }
 
     case "model/overrides":
       return {
@@ -323,22 +567,66 @@ export function reducer(state: AppState, action: Action): AppState {
         ),
       };
 
-    case "model/parallel":
-      return { ...state, modelSelection: { ...state.modelSelection, parallel: action.value } };
+    case "model/parallel": {
+      // The parallel flag is derived from the selection — this action only
+      // exists for the compatibility with the old callers and maps onto a
+      // real selection.
+      const enabled = enabledIds(state.preferences);
+      const defaultId = defaultModelId(state.preferences);
+      if (action.value) {
+        // Several models: every enabled model answers.
+        return {
+          ...state,
+          modelSelection: normalizeSelection(
+            enabled,
+            state.modelSelection.primary,
+            defaultId,
+          ),
+        };
+      }
+      // One model: only the primary stays checked.
+      const primary =
+        state.modelSelection.primary && enabled.includes(state.modelSelection.primary)
+          ? state.modelSelection.primary
+          : (defaultId ?? enabled[0] ?? null);
+      return {
+        ...state,
+        modelSelection: normalizeSelection(
+          primary ? [primary] : [],
+          primary,
+          defaultId,
+        ),
+      };
+    }
 
     case "model/checked": {
+      const current = state.modelSelection.checked;
       const checked = action.checked
-        ? state.modelSelection.checked.includes(action.modelId)
-          ? state.modelSelection.checked
-          : [...state.modelSelection.checked, action.modelId]
-        : state.modelSelection.checked.filter((id) => id !== action.modelId);
-      return { ...state, modelSelection: { ...state.modelSelection, checked } };
+        ? current.includes(action.modelId)
+          ? current
+          : [...current, action.modelId]
+        : current.filter((id) => id !== action.modelId);
+      // Unchecking the last model leaves the selection empty on purpose:
+      // the send is disabled instead of using another model behind the
+      // user's back.
+      return {
+        ...state,
+        modelSelection: normalizeSelection(
+          checked,
+          state.modelSelection.primary,
+          defaultModelId(state.preferences),
+        ),
+      };
     }
 
     case "model/checkedSet":
       return {
         ...state,
-        modelSelection: { ...state.modelSelection, checked: [...action.modelIds] },
+        modelSelection: normalizeSelection(
+          [...action.modelIds],
+          state.modelSelection.primary,
+          defaultModelId(state.preferences),
+        ),
       };
 
     case "branch/selection":
@@ -359,10 +647,17 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, composerAttachments: [...action.attachments] };
 
     case "composer/clear":
+      // The normal composer only: the edit buffer belongs to the edit mode
+      // and is cleared by `edit/clear`.
       return {
         ...state,
         composerText: "",
         composerAttachments: [],
+      };
+
+    case "edit/clear":
+      return {
+        ...state,
         editingLatest: null,
         editText: "",
         editAttachments: [],
@@ -405,6 +700,9 @@ export function reducer(state: AppState, action: Action): AppState {
 
     case "model/search":
       return { ...state, modelSearch: action.query };
+
+    case "picker/search":
+      return { ...state, pickerSearch: action.query };
 
     case "picker/toggle":
       return { ...state, pickerOpen: action.open ?? !state.pickerOpen };

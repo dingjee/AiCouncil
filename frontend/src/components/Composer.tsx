@@ -3,17 +3,15 @@ import {
   useEffect,
   useMemo,
   useRef,
-  useState,
   type ClipboardEvent,
   type KeyboardEvent,
 } from "react";
 
 import { t } from "../i18n/strings";
 import { presentation } from "../model/presentation";
-import { enabledModels, resolveSelection, usageSummary } from "../state/selectors";
+import { enabledModels, resolveSelection } from "../state/selectors";
 import { useStore } from "../state/store";
 import { shouldConvertPaste } from "../util/attachments";
-import { formatTokens } from "../util/money";
 import { composerKeyAction } from "../util/keyboard";
 import { Icon } from "./Icon";
 import { ModelPicker } from "./ModelPicker";
@@ -32,9 +30,8 @@ export function Composer() {
   const { state, actions, dispatch } = useStore();
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  const modelButtonRef = useRef<HTMLButtonElement | null>(null);
   const composingRef = useRef(false);
-  const [exportOpen, setExportOpen] = useState(false);
-  const [usageOpen, setUsageOpen] = useState(false);
 
   const editing = state.editingLatest;
   const value = editing ? state.editText : state.composerText;
@@ -54,36 +51,32 @@ export function Composer() {
     );
   }, [state.currentConversationId, state.generations]);
 
-  const usage = useMemo(() => {
-    const conversationId = state.currentConversationId;
-    if (!conversationId) return null;
-    const records = state.usage[conversationId] ?? [];
-    const summary = usageSummary(records);
-    const promptTokens = records.reduce(
-      (sum, record) => sum + (record.prompt_tokens ?? 0),
-      0,
-    );
-    const completionTokens = records.reduce(
-      (sum, record) => sum + (record.completion_tokens ?? 0),
-      0,
-    );
-    const knownTokens = records.some((record) => record.total_tokens !== null);
-    return { ...summary, promptTokens, completionTokens, knownTokens };
-  }, [state.currentConversationId, state.usage]);
-
+  /**
+   * The label of the model button.
+   *
+   * One model: its own name. Several models: the primary plus the number of
+   * the other answers — the user always sees what the send will ask.
+   */
   const modelLabel = useMemo(() => {
     if (!selection.primary) return t("composer.model_picker");
     const entry = state.catalog.find((item) => item.id === selection.primary);
-    if (!entry) return selection.primary;
-    return presentation(entry.id, entry.name).full_label;
-  }, [selection.primary, state.catalog]);
+    const name = entry
+      ? presentation(entry.id, entry.name).full_label
+      : selection.primary;
+    if (selection.targets.length > 1) {
+      return t("selector.primary_plus")
+        .replace("{primary}", name)
+        .replace("{n}", String(selection.targets.length - 1));
+    }
+    return name;
+  }, [selection.primary, selection.targets.length, state.catalog]);
 
   const setValue = useCallback(
     (next: string) => {
-      if (editing) dispatch({ type: "edit/text", text: next });
+      if (editing) actions.setEditText(next);
       else actions.setComposerText(next);
     },
-    [actions, dispatch, editing],
+    [actions, editing],
   );
 
   const handleKeyDown = useCallback(
@@ -167,12 +160,9 @@ export function Composer() {
                   aria-label={`${t("attachment.remove")}: ${attachment.name}`}
                   onClick={() => {
                     if (editing) {
-                      dispatch({
-                        type: "edit/attachments",
-                        attachments: state.editAttachments.filter(
-                          (_, i) => i !== index,
-                        ),
-                      });
+                      actions.setEditAttachments(
+                        state.editAttachments.filter((_, i) => i !== index),
+                      );
                     } else {
                       actions.removeAttachment(index);
                     }
@@ -205,15 +195,6 @@ export function Composer() {
           />
 
           <div className="composer__row">
-            <button
-              type="button"
-              className="btn"
-              title={t("composer.attach_tooltip")}
-              aria-label={t("composer.attach")}
-              onClick={() => fileRef.current?.click()}
-            >
-              <Icon name="paperclip" size={14} />
-            </button>
             <input
               ref={fileRef}
               type="file"
@@ -228,6 +209,7 @@ export function Composer() {
 
             <div className="composer__models">
               <button
+                ref={modelButtonRef}
                 type="button"
                 className="btn"
                 title={
@@ -248,37 +230,17 @@ export function Composer() {
                   <span className="badge">{t("composer.primary_badge")}</span>
                 ) : null}
               </button>
-
-              <button
-                type="button"
-                className={state.modelSelection.parallel ? "btn btn--active" : "btn"}
-                title={t("composer.parallel_tooltip")}
-                aria-pressed={state.modelSelection.parallel}
-                onClick={() => actions.setParallel(!state.modelSelection.parallel)}
-              >
-                {t("composer.parallel")}
-              </button>
             </div>
 
             <div className="composer__row composer__row--end" style={{ marginLeft: "auto" }}>
               <button
                 type="button"
                 className="btn"
-                title={t("panel.export_tooltip")}
-                aria-haspopup="menu"
-                aria-expanded={exportOpen}
-                onClick={() => setExportOpen((open) => !open)}
+                title={t("composer.attach_tooltip")}
+                aria-label={t("composer.attach")}
+                onClick={() => fileRef.current?.click()}
               >
-                <Icon name="export" size={14} />
-              </button>
-              <button
-                type="button"
-                className="btn"
-                title={t("composer.usage_tooltip")}
-                aria-expanded={usageOpen}
-                onClick={() => setUsageOpen((open) => !open)}
-              >
-                {t("composer.usage")}
+                <Icon name="paperclip" size={14} />
               </button>
 
               {streaming ? (
@@ -327,113 +289,18 @@ export function Composer() {
           {selection.invalidReason ? (
             <span>{t(selection.invalidReason)}</span>
           ) : null}
-          {usage ? (
-            <span>
-              {usage.knownTotal !== null
-                ? t("usage.known_pending")
-                    .replace("{known}", usage.knownTotal)
-                    .replace("{pending}", String(usage.pending))
-                    .replace("{unavailable}", String(usage.unavailable))
-                : t("usage.unknown")}
-            </span>
-          ) : null}
           <span className="muted">
             {t("composer.send_tooltip")} · Shift+Enter: newline · Cmd+Enter: send
           </span>
         </div>
       </div>
 
-      {usageOpen && usage ? (
-        <div
-          className="card"
-          role="dialog"
-          aria-label={t("composer.usage")}
-          style={{
-            position: "absolute",
-            right: "var(--space-l)",
-            bottom: "160px",
-            zIndex: 30,
-            padding: "var(--space-s)",
-            minWidth: "220px",
-          }}
-        >
-          <p className="small" style={{ margin: "0 0 4px" }}>
-            {usage.knownTotal !== null
-              ? t("usage.known_pending")
-                  .replace("{known}", usage.knownTotal)
-                  .replace("{pending}", String(usage.pending))
-                  .replace("{unavailable}", String(usage.unavailable))
-              : t("usage.unknown")}
-          </p>
-          <p className="small muted" style={{ margin: 0 }}>
-            {usage.knownTokens
-              ? t("usage.tokens")
-                  .replace("{prompt}", formatTokens(usage.promptTokens))
-                  .replace("{completion}", formatTokens(usage.completionTokens))
-              : t("usage.unknown")}
-          </p>
-        </div>
-      ) : null}
-
-      {exportOpen ? (
-        <div
-          className="card"
-          role="menu"
-          aria-label={t("panel.export_tooltip")}
-          style={{
-            position: "absolute",
-            right: "var(--space-l)",
-            bottom: "160px",
-            zIndex: 30,
-            padding: "var(--space-xs)",
-          }}
-        >
-          <button
-            type="button"
-            className="btn"
-            role="menuitem"
-            style={{ width: "100%", justifyContent: "flex-start" }}
-            onClick={() => {
-              setExportOpen(false);
-              void actions.exportMarkdown("main");
-            }}
-          >
-            {t("panel.export_main")}
-          </button>
-          {state.branchSelection.length > 0 ? (
-            <button
-              type="button"
-              className="btn"
-              role="menuitem"
-              style={{ width: "100%", justifyContent: "flex-start" }}
-              onClick={() => {
-                setExportOpen(false);
-                void actions.exportMarkdown("selected");
-              }}
-            >
-              {t("panel.export_selected").replace(
-                "{n}",
-                String(state.branchSelection.length),
-              )}
-            </button>
-          ) : null}
-          <button
-            type="button"
-            className="btn"
-            role="menuitem"
-            style={{ width: "100%", justifyContent: "flex-start" }}
-            onClick={() => {
-              setExportOpen(false);
-              void actions.exportMarkdown("all_branches");
-            }}
-          >
-            {t("panel.export_all")}
-          </button>
-        </div>
-      ) : null}
-
       {state.pickerOpen ? (
-        <ModelPicker onClose={() => dispatch({ type: "picker/toggle", open: false })} />
+        <ModelPicker
+          onClose={() => dispatch({ type: "picker/toggle", open: false })}
+          onManageModels={() => actions.openModal("models")}
+          trigger={() => modelButtonRef.current}
+        />
       ) : null}
     </div>
   );

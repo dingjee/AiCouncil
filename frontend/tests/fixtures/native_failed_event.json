@@ -1,0 +1,14 @@
+{
+  "conversation_id": "c1",
+  "batch_id": "batch-fixture",
+  "request_id": "req-fixture",
+  "assistant_message_id": "msg-fixture",
+  "event": {
+    "type": "failed",
+    "error": {
+      "kind": "unauthorized",
+      "message": "鉴权失败(401):User not found.",
+      "retry_after_secs": null
+    }
+  }
+}

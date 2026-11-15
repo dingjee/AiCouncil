@@ -126,12 +126,15 @@ pub async fn check_egress(d: State<'_, Desktop>) -> CmdResult<EgressStateDto> {
         EgressVerdict::Allowed(obs) => EgressStateDto {
             verdict: "allowed".into(),
             country_code: obs.country_code.clone(),
-            detail: format!("egress check ok ({})", obs.source),
+            detail: format!("egress check ok;{}", obs.evidence()),
         },
         EgressVerdict::Blocked(obs) => EgressStateDto {
             verdict: "blocked".into(),
             country_code: obs.country_code.clone(),
-            detail: format!("egress blocked in region ({})", obs.source),
+            detail: format!(
+                "egress blocked in region;{};GeoIP/按域名分流可能与上游实际路由不一致",
+                obs.evidence()
+            ),
         },
         EgressVerdict::Unknown(why) => EgressStateDto {
             verdict: "unknown".into(),
@@ -140,8 +143,13 @@ pub async fn check_egress(d: State<'_, Desktop>) -> CmdResult<EgressStateDto> {
         },
     };
     if matches!(verdict, EgressVerdict::Allowed(_)) {
+        let families = match &verdict {
+            EgressVerdict::Allowed(obs) => obs.families,
+            _ => crate::services::network::RouteFamilies::DUAL,
+        };
         *lock(&d.permit) = Some(crate::services::egress::EgressPermit::fresh(
             d.egress.network_revision(),
+            families,
         ));
     } else {
         *lock(&d.permit) = None;

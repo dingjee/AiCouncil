@@ -16,6 +16,11 @@ pub const DEFAULT_TITLE_MODEL: &str = "deepseek-flash";
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 /// 标题最大长度(grapheme)。
 pub const MAX_TITLE_GRAPHEMES: usize = 48;
+/// 标题请求连接超时(实测本网络下 DeepSeek 首字节即可达 ~4.9s,
+/// 旧的 5s 连接超时把可用请求判成 timeout,故放宽)。
+pub const TITLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// 标题请求总超时(单次尝试;不自动重试付费请求)。
+pub const TITLE_TOTAL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// 失败类别(只存类别,不存密钥/提问全文/原始 response)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,8 @@ pub struct DeepSeekTitleClient {
     base: String,
     key: String,
     model: String,
+    /// 单次请求总超时(测试可调短;生产 = TITLE_TOTAL_TIMEOUT)。
+    total_timeout: Duration,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -110,16 +117,25 @@ impl DeepSeekTitleClient {
             .ok()
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_TITLE_MODEL.to_string());
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(12))
-            .build()
-            .expect("reqwest client");
+        // 标题专用连接超时(15s;实测首字节即需 ~4.9s,旧的 5s 会误杀)。
+        let limits = crate::services::network::NetworkLimits {
+            connect_timeout: TITLE_CONNECT_TIMEOUT,
+            ..Default::default()
+        };
+        let http = crate::services::network::NetworkConfig {
+            // 与检测/生成同一代理策略:AICOUNCIL_PROXY 显式代理统一生效,
+            // 无显式代理时尊重环境/系统代理(不再各建一套配置)。
+            proxy: crate::services::network::explicit_proxy_from_env(),
+            limits,
+        }
+        .generation_client()
+        .expect("标题客户端构建失败(网络配置非法,拒绝静默直连)");
         Self {
             http,
             base: base.trim_end_matches('/').to_string(),
             key,
             model,
+            total_timeout: TITLE_TOTAL_TIMEOUT,
         }
     }
 
@@ -151,11 +167,24 @@ impl DeepSeekTitleClient {
             ],
         };
         let url = format!("{}/chat/completions", self.base);
+        // 总预算强制(45s 生产;含连接、响应与 body 读取)。
+        let fut = self.do_request(&url, &body);
+        match tokio::time::timeout(self.total_timeout, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(TitleErrorKind::Timeout),
+        }
+    }
+
+    async fn do_request(
+        &self,
+        url: &str,
+        body: &ChatRequest<'_>,
+    ) -> Result<String, TitleErrorKind> {
         let resp = self
             .http
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.key)
-            .json(&body)
+            .json(body)
             .send()
             .await
             .map_err(|e| {
@@ -175,10 +204,14 @@ impl DeepSeekTitleClient {
         if !status.is_success() {
             return Err(TitleErrorKind::Server);
         }
-        let parsed: ChatResponse = resp
-            .json()
-            .await
-            .map_err(|_| TitleErrorKind::InvalidResponse)?;
+        let parsed: ChatResponse = resp.json().await.map_err(|e| {
+            // body 阶段超时也是 Timeout,不再误报 InvalidResponse。
+            if e.is_timeout() {
+                TitleErrorKind::Timeout
+            } else {
+                TitleErrorKind::InvalidResponse
+            }
+        })?;
         let content = parsed
             .choices
             .first()

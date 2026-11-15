@@ -28,9 +28,13 @@ const NO_PROGRESS_LIMIT: std::time::Duration = std::time::Duration::from_secs(60
 const RESERVED_PARAM_KEYS: &[&str] = &["model", "messages", "stream"];
 
 /// OpenRouter 提供方。`http` 可注入 mock 客户端(测试)。
+/// 按请求携带的已核验地址族(`ImmutableRequest.route`)选择同族约束
+/// 的客户端;未核验的地址族对生成不可达(与检测同一过滤)。
 pub struct OpenRouter {
     id: ProviderId,
     http: reqwest::Client,
+    http_v4: reqwest::Client,
+    http_v6: reqwest::Client,
     base_url: String,
     api_key: String,
 }
@@ -41,16 +45,28 @@ impl OpenRouter {
     }
 
     pub fn with_base_url(id: ProviderId, base_url: String, api_key: String) -> Self {
-        let http = crate::services::network::NetworkConfig::default()
+        // 与检测门禁同一网络策略:AICOUNCIL_PROXY 显式代理同样作用于生成;
+        // 并构造与检测客户端同族过滤的 v4/v6 客户端(未核验族不可发送)。
+        // 配置失败显式 panic(桌面端启动时已用同一配置构建检测客户端,
+        // 正常不会走到此处);禁止静默退回默认直连。
+        let config = crate::services::network::NetworkConfig {
+            proxy: crate::services::network::explicit_proxy_from_env(),
+            ..Default::default()
+        };
+        let http = config
             .generation_client()
-            .unwrap_or_else(|e| {
-                // 统一网络配置失败:显式暴露错误,不静默退回默认直连
-                tracing::error!(%e, "生成客户端构建失败");
-                reqwest::Client::new()
-            });
+            .expect("生成客户端构建失败(网络配置非法,拒绝静默直连)");
+        let http_v4 = config
+            .generation_client_for(crate::services::network::RouteFamilies::V4_ONLY)
+            .expect("v4 生成客户端构建失败(拒绝静默直连)");
+        let http_v6 = config
+            .generation_client_for(crate::services::network::RouteFamilies::V6_ONLY)
+            .expect("v6 生成客户端构建失败(拒绝静默直连)");
         Self {
             id,
             http,
+            http_v4,
+            http_v6,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         }
@@ -64,9 +80,21 @@ impl OpenRouter {
     ) -> Self {
         Self {
             id,
+            http_v4: http.clone(),
+            http_v6: http.clone(),
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+        }
+    }
+
+    /// 按已核验地址族选客户端(DUAL = 默认客户端,行为与旧版一致)。
+    fn client_for(&self, route: crate::services::network::RouteFamilies) -> &reqwest::Client {
+        use crate::services::network::RouteFamilies;
+        match route {
+            RouteFamilies::V4_ONLY => &self.http_v4,
+            RouteFamilies::V6_ONLY => &self.http_v6,
+            _ => &self.http,
         }
     }
 
@@ -153,7 +181,7 @@ impl Provider for OpenRouter {
     }
 
     fn stream(&self, req: ImmutableRequest, cancel: CancellationToken) -> EventStream {
-        let http = self.http.clone();
+        let http = self.client_for(req.route).clone();
         let url = self.url("/chat/completions");
         let api_key = self.api_key.clone();
 
@@ -702,6 +730,7 @@ mod tests {
                 crate::domain::plan::ContextMessage::assistant("A1"),
             ],
             prompt: "Q2".into(),
+            route: crate::services::network::RouteFamilies::DUAL,
         };
         let msgs = build_messages(&req);
         let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
@@ -783,6 +812,7 @@ mod tests {
             system_prompt: None,
             history: Vec::new(),
             prompt: "hello".into(),
+            route: crate::services::network::RouteFamilies::DUAL,
         };
         let mut stream = provider.stream(req, CancellationToken::new());
         let mut events = Vec::new();

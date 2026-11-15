@@ -203,11 +203,51 @@ describe("the shell has no right-hand panel", () => {
     await unmount(root);
   });
 
+  test("the two entries share the bottom left corner of the sidebar", async () => {
+    const { root, container } = await mountApp();
+
+    const footer = container.querySelector(".sidebar__footer");
+    expect(footer).not.toBeNull();
+    const buttons = [...(footer?.querySelectorAll("button") ?? [])];
+    expect(buttons.length).toBe(2);
+    expect(buttons[0].textContent).toContain("Models");
+    expect(buttons[1].textContent).toContain("Settings");
+    // Both of them are direct children of the same row.
+    expect(buttons[0].parentElement).toBe(buttons[1].parentElement);
+
+    // The header carries no second entry any more.
+    const toolbar = container.querySelector(".main__toolbar");
+    expect(toolbar?.textContent).not.toContain("Models");
+    expect(toolbar?.textContent).not.toContain("Settings");
+
+    await unmount(root);
+  });
+
+  test("the toolbar shows the cost and the export, the composer does not", async () => {
+    const { root, container } = await mountApp();
+
+    // The top right toolbar: the amount, then the export.
+    const toolbar = container.querySelector(".main__toolbar");
+    expect(toolbar?.querySelector("[data-testid='toolbar-cost']")).not.toBeNull();
+    expect(toolbar?.querySelector("[data-testid='toolbar-export']")).not.toBeNull();
+
+    // The composer does not repeat the export, the usage or the cost.
+    const composer = container.querySelector(".composer");
+    expect(composer?.querySelector("[data-testid='toolbar-export']")).toBeNull();
+    expect(composer?.textContent).not.toContain("Usage");
+    expect(composer?.querySelector(".composer__status")?.textContent).not.toContain(
+      "$",
+    );
+
+    await unmount(root);
+  });
+
   test("the models button opens an accessible dialog outside the chat column", async () => {
     const { root, container } = await mountApp();
 
+    // The entry lives in the bottom left corner of the sidebar.
     const trigger = [...container.querySelectorAll<HTMLButtonElement>(
-      ".main__toolbar button",
+      ".sidebar__footer button",
     )].find((button) => button.textContent?.includes("Models"));
     if (!trigger) throw new Error("models button not found");
 
@@ -244,7 +284,7 @@ describe("the shell has no right-hand panel", () => {
     const { root, container } = await mountApp();
 
     const trigger = [...container.querySelectorAll<HTMLButtonElement>(
-      ".main__toolbar button",
+      ".sidebar__footer button",
     )].find((button) => button.textContent?.includes("Models"));
     if (!trigger) throw new Error("models button not found");
 
@@ -276,7 +316,7 @@ describe("the shell has no right-hand panel", () => {
     const { root, container } = await mountApp();
 
     const trigger = [...container.querySelectorAll<HTMLButtonElement>(
-      ".main__toolbar button",
+      ".sidebar__footer button",
     )].find((button) => button.textContent?.includes("Settings"));
     if (!trigger) throw new Error("settings button not found");
 
@@ -306,7 +346,7 @@ describe("the shell has no right-hand panel", () => {
     const { root, container } = await mountApp();
 
     const trigger = [...container.querySelectorAll<HTMLButtonElement>(
-      ".main__toolbar button",
+      ".sidebar__footer button",
     )].find((button) => button.textContent?.includes("Settings"));
     if (!trigger) throw new Error("settings button not found");
 

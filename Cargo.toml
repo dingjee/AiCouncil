@@ -1,6 +1,6 @@
 [package]
 name = "aicouncil"
-version = "0.2.1"
+version = "0.2.3"
 edition = "2021"
 rust-version = "1.88"
 description = "AiCouncil - minimal native AI chat with parallel model branches"
@@ -26,7 +26,7 @@ tauri-plugin-dialog = "2"
 
 # 异步与网络
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "system-proxy"] }
 futures-util = "0.3"
 
 # 序列化

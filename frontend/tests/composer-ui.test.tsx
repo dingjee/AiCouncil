@@ -351,9 +351,10 @@ describe("export menu", () => {
     const backend = new UiBackend();
     const { root, container } = await mountApp(backend);
 
-    const exportButton = [
-      ...container.querySelectorAll<HTMLButtonElement>(".composer__box button"),
-    ].find((button) => button.getAttribute("aria-haspopup") === "menu");
+    // The export entry lives in the top right toolbar.
+    const exportButton = container.querySelector<HTMLButtonElement>(
+      "[data-testid='toolbar-export']",
+    );
     if (!exportButton) throw new Error("export button not found");
 
     await act(async () => {

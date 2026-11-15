@@ -53,10 +53,21 @@ describe("resolveSelection", () => {
     expect(result.targets).toEqual([]);
   });
 
-  test("single mode uses the primary model", () => {
+  test("an empty selection disables the send (no silent fallback)", () => {
     const result = resolveSelection(["a", "b"], [], {
       parallel: false,
       checked: [],
+      primary: "a",
+    });
+    expect(result.invalidReason).toBe("composer.send_disabled_no_targets");
+    expect(result.targets).toEqual([]);
+    expect(result.primary).toBeNull();
+  });
+
+  test("one checked model is the whole selection", () => {
+    const result = resolveSelection(["a", "b"], [], {
+      parallel: false,
+      checked: ["b"],
       primary: "b",
     });
     expect(result.targets).toEqual(["b"]);
@@ -64,25 +75,7 @@ describe("resolveSelection", () => {
     expect(result.invalidReason).toBeNull();
   });
 
-  test("single mode falls back to the first enabled model", () => {
-    const result = resolveSelection(["a", "b"], [], {
-      parallel: false,
-      checked: [],
-      primary: "missing",
-    });
-    expect(result.primary).toBe("a");
-  });
-
-  test("parallel mode needs at least one checked model", () => {
-    const result = resolveSelection(["a", "b"], [], {
-      parallel: true,
-      checked: [],
-      primary: null,
-    });
-    expect(result.invalidReason).toBe("composer.send_disabled_no_targets");
-  });
-
-  test("parallel mode promotes the primary to the front", () => {
+  test("several checked models are the parallel selection", () => {
     const result = resolveSelection(["a", "b", "c"], [], {
       parallel: true,
       checked: ["a", "b"],
@@ -92,7 +85,7 @@ describe("resolveSelection", () => {
     expect(result.primary).toBe("b");
   });
 
-  test("parallel mode ignores checked models that are not enabled", () => {
+  test("checked models that are not enabled are ignored", () => {
     const result = resolveSelection(["a"], [], {
       parallel: true,
       checked: ["a", "disabled"],
@@ -102,7 +95,16 @@ describe("resolveSelection", () => {
     expect(result.primary).toBe("a");
   });
 
-  test("parallel mode promotes a ranked model when the primary is invalid", () => {
+  test("the primary falls back to a checked model when it is not checked", () => {
+    const result = resolveSelection(["a", "b"], [], {
+      parallel: true,
+      checked: ["a", "b"],
+      primary: null,
+    });
+    expect(result.primary).toBe("a");
+  });
+
+  test("a ranked model takes over when the primary is not checked", () => {
     const result = resolveSelection(["a", "b"], ["b"], {
       parallel: true,
       checked: ["a", "b"],
@@ -173,6 +175,7 @@ describe("conversationsByGroup", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,
@@ -186,6 +189,7 @@ describe("conversationsByGroup", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,
@@ -212,6 +216,7 @@ describe("conversationsByGroup", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,
@@ -225,6 +230,7 @@ describe("conversationsByGroup", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,
@@ -274,6 +280,7 @@ describe("unknown groups stay visible", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,
@@ -287,6 +294,7 @@ describe("unknown groups stay visible", () => {
           title_source: "empty",
           title_status: "needs_generation",
           title_revision: 0,
+          title_attempt_count: 0,
           main_leaf_id: null,
           draft_revision: 0,
           created_at_ms: 0,

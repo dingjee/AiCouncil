@@ -5,13 +5,17 @@ import { StrictMode } from "react";
 
 import { IpcClient } from "../src/ipc/client";
 import type { Transport } from "../src/ipc/transport";
+import type { ConversationDetail, Generation } from "../src/ipc/types";
+import { App } from "../src/App";
 import { StoreProvider, useStore, type StoreValue } from "../src/state/store";
 import {
   fixtureBootstrap,
   fixtureConversation,
   fixtureDetail,
   fixtureDraft,
+  fixtureGeneration,
   fixtureMessage,
+  fixturePreferences,
 } from "./ipc-contract.test";
 
 /**
@@ -61,6 +65,15 @@ class FakeBackend implements Transport {
   readonly editBufferCalls: Record<string, unknown>[] = [];
   readonly sentRequests: Record<string, unknown>[] = [];
   readonly draftCalls: Record<string, unknown>[] = [];
+  /**
+   * The draft row of every conversation (the backend's truth).
+   *
+   * The backend stores the draft in the conversation row and clears it in
+   * the send transaction — but only when the revision still matches the one
+   * the frontend froze with the snapshot. The mock models both, so a test
+   * sees the same behaviour as the native app.
+   */
+  readonly draftRows = new Map<string, { text: string; attachments: any[] }>();
 
   constructor(
     private readonly conversations = [
@@ -68,6 +81,19 @@ class FakeBackend implements Transport {
       fixtureConversation("c2", "Second"),
     ],
   ) {}
+
+  /** The draft row of a conversation (the seeded content). */
+  private draftRow(conversationId: string) {
+    let row = this.draftRows.get(conversationId);
+    if (!row) {
+      row = {
+        text: conversationId === "c1" ? "draft one" : "draft two",
+        attachments: [],
+      };
+      this.draftRows.set(conversationId, row);
+    }
+    return row;
+  }
 
   async invoke<T>(command: string, args: Record<string, any> = {}): Promise<T> {
     this.calls.push({ command, args });
@@ -88,14 +114,23 @@ class FakeBackend implements Transport {
       }
       case "get_draft": {
         const id = String(args.conversation_id);
-        return fixtureDraft(id === "c1" ? "draft one" : "draft two") as T;
+        const row = this.draftRow(id);
+        return {
+          ...fixtureDraft(row.text),
+          attachments: row.attachments,
+          revision: this.draftRevisionCounter,
+        } as T;
       }
       case "save_draft": {
         if (this.hangSaveDraft) {
           return new Promise<T>(() => undefined);
         }
+        this.draftCalls.push(args);
+        const id = String(args.conversation_id);
+        const row = this.draftRow(id);
         if (!this.deferDrafts) {
-          this.draftCalls.push(args);
+          row.text = String(args.text ?? "");
+          row.attachments = args.attachments ?? [];
           return { revision: this.draftRevisionCounter } as T;
         }
         const pending = deferred<unknown>();
@@ -108,6 +143,15 @@ class FakeBackend implements Transport {
           return this.sendDeferred.promise as Promise<T>;
         }
         this.sentRequests.push(args);
+        // The send transaction consumes the draft — but only when the
+        // revision still matches the frozen one.
+        const request = args.request ?? {};
+        const id = String(request.conversation_id ?? "");
+        if (request.expected_draft_revision === this.draftRevisionCounter) {
+          const row = this.draftRow(id);
+          row.text = "";
+          row.attachments = [];
+        }
         return {
           conversation_id: String(args.conversation_id ?? ""),
           batch_id: "b1",
@@ -136,6 +180,10 @@ class FakeBackend implements Transport {
       case "credential_status":
       case "reload_credentials":
         return { openrouter: true, deepseek: false } as T;
+      case "list_preferences":
+        // The same list the bootstrap answers with; a complete contract so
+        // a defensive branch in the store cannot hide a broken mock here.
+        return fixturePreferences() as T;
       case "save_edit_buffer":
         this.editBufferCalls.push(args);
         return { revision: 1 } as T;
@@ -171,7 +219,7 @@ function Probe() {
   return null;
 }
 
-async function mount(backend: FakeBackend) {
+async function mount(backend: FakeBackend, ui?: "app") {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root: Root = createRoot(container);
@@ -179,7 +227,10 @@ async function mount(backend: FakeBackend) {
     root.render(
       <StrictMode>
         <StoreProvider client={new IpcClient(backend)}>
+          {/* Probe always mounts so the store ref is captured even when the
+              real App UI is also rendered for DOM assertions. */}
           <Probe />
+          {ui === "app" ? <App /> : null}
         </StoreProvider>
       </StrictMode>,
     );
@@ -264,7 +315,8 @@ describe("stale responses", () => {
   });
 });
 
-describe("draft race", () => {  test("only the newest draft reply updates the revision", async () => {
+describe("draft race", () => {
+  test("the writes of one chat run one after the other", async () => {
     const backend = new FakeBackend();
     backend.deferDrafts = true;
     const mounted = await mount(backend);
@@ -289,33 +341,32 @@ describe("draft race", () => {  test("only the newest draft reply updates the re
       await new Promise((resolve) => setTimeout(resolve, 700));
     });
 
-    const pending = backend.draftDeferred;
-    expect(pending.length).toBeGreaterThanOrEqual(2);
-    const newest = pending[pending.length - 1];
-    const middle = pending[pending.length - 2];
-    const oldest = pending[0];
+    // The revision is a compare-and-swap token, so the writes of one chat
+    // must not overlap: the second save waits for the answer of the first.
+    expect(backend.draftDeferred.length).toBe(1);
+    const first = backend.draftDeferred[0];
 
-    // The replies arrive out of order: the stale ones must not win.
     await act(async () => {
-      newest.resolve({ revision: 42 });
-      await newest.promise;
+      first.resolve({ revision: 42 });
+      await first.promise;
       await Promise.resolve();
     });
     expect(mounted.store.state.draftRevision).toBe(42);
 
+    // The second save is issued now and its answer is the current revision.
     await act(async () => {
-      middle.resolve({ revision: 7 });
-      await middle.promise;
-      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 50));
     });
-    expect(mounted.store.state.draftRevision).toBe(42);
+    expect(backend.draftDeferred.length).toBe(2);
+    const second = backend.draftDeferred[1];
+    expect(second).toBeDefined();
 
     await act(async () => {
-      oldest.resolve({ revision: 3 });
-      await oldest.promise;
+      second.resolve({ revision: 43 });
+      await second.promise;
       await Promise.resolve();
     });
-    expect(mounted.store.state.draftRevision).toBe(42);
+    expect(mounted.store.state.draftRevision).toBe(43);
 
     await act(async () => {
       mounted.root.unmount();
@@ -814,4 +865,273 @@ describe("send CAS (flush before snapshot)", () => {
       mounted.root.unmount();
     });
   }, 15000);
+});
+
+// ---------------------------------------------------------------------------
+// Backend chat-event regressions (0.2.3).
+//
+// The shared fixture `fixtures/native_failed_event.json` is the canonical
+// native `failed` wire format — the same file the Rust DTO regression
+// (`failed_event_serializes_nested_error`) asserts against, so the two sides
+// cannot drift. 0.2.2 flattened `error` into the top level, the handler read
+// `event.error.message`, threw, and the terminal refetch never ran — every
+// answer froze on "Connecting".
+// ---------------------------------------------------------------------------
+
+import nativeFailedEvent from "./fixtures/native_failed_event.json";
+
+/** Generation rows for the authoritative refetch, by conversation. */
+function detailWithGenerations(
+  conversationId: string,
+  generations: Generation[],
+): ConversationDetail {
+  return {
+    ...fixtureDetail(conversationId, [
+      fixtureMessage("m1", conversationId, `content of ${conversationId}`),
+    ]),
+    generations,
+  };
+}
+
+function emitChatEvent(backend: FakeBackend, payload: unknown) {
+  const handlers = backend.listeners.get("chat-event") ?? new Set();
+  expect(handlers.size).toBeGreaterThan(0);
+  for (const handler of handlers) {
+    (handler as (p: unknown) => void)(payload);
+  }
+}
+
+/** deferred load of the fixture conversation so the refetch is observable. */
+function gateLoad(backend: FakeBackend, conversationId: string, detail: unknown) {
+  const pending = deferred<unknown>();
+  backend.loadDeferred.set(conversationId, pending);
+  return {
+    async resolve() {
+      await act(async () => {
+        pending.resolve(detail);
+        await pending.promise;
+        await Promise.resolve();
+      });
+    },
+  };
+}
+
+describe("backend chat events (0.2.3)", () => {
+  test("canonical nested failed event (shared fixture) shows the error and refetches", async () => {
+    const backend = new FakeBackend();
+    // Render the real App so the regression covers what the screenshot shows:
+    // the composer's Stop button on a connecting generation.
+    const mounted = await mount(backend, "app");
+    const connectingRow: Generation = {
+      ...fixtureGeneration("req-fixture", "msg-fixture"),
+      status: "connecting",
+      dispatch_phase: "attempted",
+    };
+    await act(async () => {
+      mounted.store.dispatch({
+        type: "generation/upserted",
+        conversationId: "c1",
+        generation: connectingRow,
+      });
+    });
+    expect(
+      mounted.container.querySelector(".composer .btn--danger"),
+    ).not.toBeNull();
+    const failed: Generation = {
+      ...connectingRow,
+      status: "failed",
+      failure_kind: "unauthorized",
+      failure_message: "User not found.",
+    };
+    const gate = gateLoad(
+      backend,
+      "c1",
+      detailWithGenerations("c1", [failed]),
+    );
+    await act(async () => {
+      emitChatEvent(backend, nativeFailedEvent);
+    });
+    await gate.resolve();
+    expect(
+      mounted.container.querySelector(".composer .btn--danger"),
+    ).toBeNull();
+    expect(mounted.store.state.toast?.text).toContain("User not found.");
+    expect(
+      mounted.store.state.generations.c1?.find(
+        (g) => g.request_id === "req-fixture",
+      )?.status,
+    ).toBe("failed");
+    await act(async () => {
+      mounted.root.unmount();
+    });
+  });
+
+  test("legacy flat/malformed failed event does not throw and still refetches", async () => {
+    const backend = new FakeBackend();
+    const mounted = await mount(backend);
+    const failed: Generation = {
+      ...fixtureGeneration("req-fixture", "msg-fixture"),
+      status: "failed",
+    };
+    const gate = gateLoad(
+      backend,
+      nativeFailedEvent.conversation_id,
+      detailWithGenerations(nativeFailedEvent.conversation_id, [failed]),
+    );
+    // Explicitly legacy shape: error fields flattened on the top level.
+    const legacyFlat = {
+      conversation_id: nativeFailedEvent.conversation_id,
+      batch_id: nativeFailedEvent.batch_id,
+      request_id: nativeFailedEvent.request_id,
+      assistant_message_id: nativeFailedEvent.assistant_message_id,
+      event: {
+        type: "failed",
+        kind: "unauthorized",
+        message: "User not found.",
+        retry_after_secs: null,
+      },
+    };
+
+    await act(async () => {
+      emitChatEvent(backend, legacyFlat);
+    });
+    await gate.resolve();
+
+    expect(mounted.store.state.toast?.text).toContain("User not found.");
+    const generation = mounted.store.state.generations[
+      nativeFailedEvent.conversation_id
+    ]?.find((g) => g.request_id === "req-fixture");
+    expect(generation?.status).toBe("failed");
+
+    await act(async () => {
+      mounted.root.unmount();
+    });
+  });
+
+  test("started keeps model/provider ids and only marks connecting; first delta/id marks streaming", async () => {
+    const backend = new FakeBackend();
+    const mounted = await mount(backend);
+    const pending: Generation = {
+      ...fixtureGeneration("req-fixture", "msg-fixture"),
+      status: "queued",
+    };
+    // Seed the store with the authoritative row (what the send refetch produced).
+    backend.loadDeferred.set(nativeFailedEvent.conversation_id, {
+      promise: Promise.resolve(
+        detailWithGenerations(nativeFailedEvent.conversation_id, [pending]),
+      ),
+      resolve: () => {},
+    });
+    await act(async () => {
+      await mounted.store.actions.selectConversation(
+        nativeFailedEvent.conversation_id,
+      );
+    });
+
+    // started alone: connecting, identity preserved (no streaming too early).
+    await act(async () => {
+      emitChatEvent(backend, {
+        conversation_id: nativeFailedEvent.conversation_id,
+        batch_id: nativeFailedEvent.batch_id,
+        request_id: "req-fixture",
+        assistant_message_id: "msg-fixture",
+        event: { type: "started" },
+      });
+    });
+    let generation = mounted.store.state.generations[
+      nativeFailedEvent.conversation_id
+    ]?.find((g) => g.request_id === "req-fixture");
+    expect(generation?.status).toBe("connecting");
+    expect(generation?.model_id).toBe("vendor/alpha");
+    expect(generation?.provider_id).toBe("p1");
+
+    // remote id + first delta in ONE tick: the synchronous race that a
+    // full-object merge would lose (stale remote_generation_id overwrite).
+    await act(async () => {
+      emitChatEvent(backend, {
+        conversation_id: nativeFailedEvent.conversation_id,
+        batch_id: nativeFailedEvent.batch_id,
+        request_id: "req-fixture",
+        assistant_message_id: "msg-fixture",
+        event: { type: "remote_generation_id", id: "gen-remote-1" },
+      });
+      emitChatEvent(backend, {
+        conversation_id: nativeFailedEvent.conversation_id,
+        batch_id: nativeFailedEvent.batch_id,
+        request_id: "req-fixture",
+        assistant_message_id: "msg-fixture",
+        event: { type: "text_delta", delta: "he" },
+      });
+    });
+    generation = mounted.store.state.generations[
+      nativeFailedEvent.conversation_id
+    ]?.find((g) => g.request_id === "req-fixture");
+    expect(generation?.status).toBe("streaming");
+    expect(generation?.remote_generation_id).toBe("gen-remote-1");
+    expect(generation?.model_id).toBe("vendor/alpha");
+
+    // A late `started` never regresses streaming back to connecting.
+    await act(async () => {
+      emitChatEvent(backend, {
+        conversation_id: nativeFailedEvent.conversation_id,
+        batch_id: nativeFailedEvent.batch_id,
+        request_id: "req-fixture",
+        assistant_message_id: "msg-fixture",
+        event: { type: "started" },
+      });
+    });
+    generation = mounted.store.state.generations[
+      nativeFailedEvent.conversation_id
+    ]?.find((g) => g.request_id === "req-fixture");
+    expect(generation?.status).toBe("streaming");
+
+    await act(async () => {
+      mounted.root.unmount();
+    });
+  });
+
+  test("a terminal generation is not resurrected by late progress", async () => {
+    const backend = new FakeBackend();
+    const mounted = await mount(backend);
+    const failedRow: Generation = {
+      ...fixtureGeneration("req-fixture", "msg-fixture"),
+      status: "failed",
+      failure_kind: "unauthorized",
+    };
+    // Seed the authoritative failed row directly (the reducer path the
+    // terminal refetch would take).
+    await act(async () => {
+      mounted.store.dispatch({
+        type: "generation/upserted",
+        conversationId: nativeFailedEvent.conversation_id,
+        generation: failedRow,
+      });
+    });
+
+    await act(async () => {
+      emitChatEvent(backend, {
+        conversation_id: nativeFailedEvent.conversation_id,
+        batch_id: nativeFailedEvent.batch_id,
+        request_id: "req-fixture",
+        assistant_message_id: "msg-fixture",
+        event: { type: "started" },
+      });
+      emitChatEvent(backend, {
+        conversation_id: nativeFailedEvent.conversation_id,
+        batch_id: nativeFailedEvent.batch_id,
+        request_id: "req-fixture",
+        assistant_message_id: "msg-fixture",
+        event: { type: "text_delta", delta: "late" },
+      });
+    });
+
+    const generation = mounted.store.state.generations[
+      nativeFailedEvent.conversation_id
+    ]?.find((g) => g.request_id === "req-fixture");
+    expect(generation?.status).toBe("failed");
+
+    await act(async () => {
+      mounted.root.unmount();
+    });
+  });
 });

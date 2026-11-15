@@ -121,13 +121,25 @@ select {
   padding: 0 var(--space-s) var(--space-l);
 }
 
+/*
+ * The two entries of the bottom left corner (Models, Settings) share one
+ * row: they are the only way into the two panels, so they must not take two
+ * rows of their own.
+ */
 .sidebar__footer {
   flex: none;
   border-top: 1px solid var(--line-subtle);
   padding: var(--space-s) var(--space-m);
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
+  align-items: center;
   gap: var(--space-xs);
+}
+
+.sidebar__footer .btn {
+  flex: 1 1 0%;
+  min-width: 0;
+  justify-content: center;
 }
 
 /*
@@ -168,6 +180,47 @@ select {
   margin-left: auto;
   display: flex;
   gap: var(--space-xs);
+  position: relative;
+  align-items: center;
+}
+
+/* The popovers belong to their button and must stay draggable-free. */
+.main__toolbar,
+.main__toolbar * {
+  -webkit-app-region: no-drag;
+}
+
+.toolbar__cost {
+  font-variant-numeric: tabular-nums;
+  min-width: 3.2em;
+  text-align: right;
+}
+
+/*
+ * The popover of a toolbar entry.
+ *
+ * It hangs below the entry that opened it and never leaves the window: the
+ * header does not clip, so the popover can grow downwards.
+ */
+.toolbar-popover {
+  position: absolute;
+  top: calc(100% + var(--space-xs));
+  right: 0;
+  z-index: 45;
+  min-width: 220px;
+  max-width: min(320px, 90vw);
+  padding: var(--space-s);
+  background: var(--surface);
+  border: 1px solid var(--line-interactive);
+  border-radius: var(--radius-card);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 14%);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toolbar-popover .btn {
+  justify-content: flex-start;
 }
 
 .main__title {
@@ -854,6 +907,15 @@ textarea.input {
   margin-bottom: var(--space-s);
 }
 
+/* The empty state of the picker (no model is enabled yet). */
+.picker__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-xs);
+  padding: var(--space-s) 0;
+}
+
 .picker__group {
   margin-bottom: var(--space-s);
 }
@@ -1040,6 +1102,18 @@ textarea.input {
   display: flex;
   flex-direction: column;
   gap: var(--space-m);
+}
+
+/*
+ * The dialog body scrolls, its content does not shrink.
+ *
+ * Without this the flex children would be squeezed into the visible area
+ * and the last entry of the catalogue would be clipped instead of being
+ * reachable by scrolling.
+ */
+.modal__body > *,
+.panel-section > * {
+  flex: none;
 }
 
 .modal__actions {

@@ -2,7 +2,11 @@ import { useMemo, useState } from "react";
 
 import { t } from "../i18n/strings";
 import { presentation } from "../model/presentation";
-import { groupModels, orderedPreferences } from "../state/selectors";
+import {
+  filterModelGroups,
+  groupModels,
+  orderedPreferences,
+} from "../state/selectors";
 import { useStore } from "../state/store";
 import { Icon } from "./Icon";
 
@@ -12,6 +16,10 @@ import { Icon } from "./Icon";
  * Shows the models the user enabled ("My models"), the full catalog grouped
  * by family, the primary model, the per-model parameter overrides and the
  * catalog refresh control.
+ *
+ * The panel is the **management** surface: every model of the catalog can be
+ * added to "My models" and removed from it again — also the models that do
+ * not have a preference yet.
  */
 export function ModelsPanel() {
   const { state, actions, dispatch } = useStore();
@@ -23,6 +31,11 @@ export function ModelsPanel() {
     () => groupModels(state.catalog, state.preferences),
     [state.catalog, state.preferences],
   );
+  /** The search really filters the catalogue. */
+  const filteredGroups = useMemo(
+    () => filterModelGroups(groups, state.modelSearch),
+    [groups, state.modelSearch],
+  );
   const preferences = useMemo(
     () => orderedPreferences(state.preferences),
     [state.preferences],
@@ -30,6 +43,18 @@ export function ModelsPanel() {
   const enabledIds = useMemo(
     () => new Set(preferences.filter((item) => item.enabled).map((item) => item.model_id)),
     [preferences],
+  );
+  const query = state.modelSearch.trim().toLowerCase();
+  const mine = useMemo(
+    () =>
+      preferences.filter((item) => {
+        if (!item.enabled) return false;
+        if (!query) return true;
+        const entry = state.catalog.find((candidate) => candidate.id === item.model_id);
+        const label = entry ? presentation(entry.id, entry.name).full_label : item.model_id;
+        return `${label} ${item.model_id}`.toLowerCase().includes(query);
+      }),
+    [preferences, query, state.catalog],
   );
 
   const openOverrides = (modelId: string) => {
@@ -100,78 +125,76 @@ export function ModelsPanel() {
 
       <section>
         <h3 className="panel-section__title">{t("models.mine")}</h3>
-        {preferences.filter((item) => item.enabled).length === 0 ? (
+        {mine.length === 0 ? (
           <p className="hint">{t("models.none_enabled")}</p>
         ) : null}
-        {preferences
-          .filter((item) => item.enabled)
-          .map((preference) => {
-            const entry = state.catalog.find(
-              (item) => item.id === preference.model_id,
-            );
-            const label = entry
-              ? presentation(entry.id, entry.name).full_label
-              : preference.model_id;
-            return (
-              <div className="model-row" key={preference.model_id}>
-                <span className="model-row__name" title={preference.model_id}>
-                  {label}
-                </span>
-                {preference.is_default ? (
-                  <span className="badge">{t("composer.primary_badge")}</span>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn--icon"
-                    title={t("models.set_default")}
-                    aria-label={`${t("models.set_default")}: ${label}`}
-                    onClick={() => void actions.setPrimaryModel(preference.model_id)}
-                  >
-                    <Icon name="star" size={13} />
-                  </button>
-                )}
+        {mine.map((preference) => {
+          const entry = state.catalog.find(
+            (item) => item.id === preference.model_id,
+          );
+          const label = entry
+            ? presentation(entry.id, entry.name).full_label
+            : preference.model_id;
+          return (
+            <div className="model-row" key={preference.model_id}>
+              <span className="model-row__name" title={preference.model_id}>
+                {label}
+              </span>
+              {preference.is_default ? (
+                <span className="badge">{t("composer.primary_badge")}</span>
+              ) : (
                 <button
                   type="button"
                   className="btn btn--icon"
-                  title={t("models.overrides")}
-                  aria-label={`${t("models.overrides")}: ${label}`}
-                  aria-pressed={overridesFor === preference.model_id}
-                  onClick={() => openOverrides(preference.model_id)}
+                  title={t("models.set_default")}
+                  aria-label={`${t("models.set_default")}: ${label}`}
+                  onClick={() => void actions.setPrimaryModel(preference.model_id)}
                 >
-                  {t("models.overrides")}
+                  <Icon name="star" size={13} />
                 </button>
-                <button
-                  type="button"
-                  className="btn btn--icon"
-                  title={t("models.move_up_tooltip")}
-                  aria-label={t("models.move_up_tooltip")}
-                  onClick={() => move(preference.model_id, -1)}
-                >
-                  ↑
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--icon"
-                  title={t("models.move_down_tooltip")}
-                  aria-label={t("models.move_down_tooltip")}
-                  onClick={() => move(preference.model_id, 1)}
-                >
-                  ↓
-                </button>
-                <button
-                  type="button"
-                  className="btn btn--icon btn--danger"
-                  title={t("models.enabled")}
-                  aria-label={`${t("models.enabled")}: ${label}`}
-                  onClick={() =>
-                    void actions.setModelEnabled(preference.model_id, false)
-                  }
-                >
-                  <Icon name="close" size={12} />
-                </button>
-              </div>
-            );
-          })}
+              )}
+              <button
+                type="button"
+                className="btn btn--icon"
+                title={t("models.overrides")}
+                aria-label={`${t("models.overrides")}: ${label}`}
+                aria-pressed={overridesFor === preference.model_id}
+                onClick={() => openOverrides(preference.model_id)}
+              >
+                {t("models.overrides")}
+              </button>
+              <button
+                type="button"
+                className="btn btn--icon"
+                title={t("models.move_up_tooltip")}
+                aria-label={t("models.move_up_tooltip")}
+                onClick={() => move(preference.model_id, -1)}
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                className="btn btn--icon"
+                title={t("models.move_down_tooltip")}
+                aria-label={t("models.move_down_tooltip")}
+                onClick={() => move(preference.model_id, 1)}
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                className="btn btn--icon btn--danger"
+                title={t("models.enabled")}
+                aria-label={`${t("models.enabled")}: ${label}`}
+                onClick={() =>
+                  void actions.setModelEnabled(preference.model_id, false)
+                }
+              >
+                <Icon name="close" size={12} />
+              </button>
+            </div>
+          );
+        })}
       </section>
 
       {overridesFor ? (
@@ -211,7 +234,12 @@ export function ModelsPanel() {
         <h3 className="panel-section__title">
           {t("models.catalog").replace("{n}", String(state.catalog.length))}
         </h3>
-        {groups.map((group) => (
+        {filteredGroups.length === 0 ? (
+          <p className="hint">
+            {t("selector.no_results").replace("{query}", state.modelSearch)}
+          </p>
+        ) : null}
+        {filteredGroups.map((group) => (
           <div key={group.label} style={{ marginBottom: "var(--space-s)" }}>
             <div className="picker__group-title">{group.label}</div>
             {group.items.map((item) => (

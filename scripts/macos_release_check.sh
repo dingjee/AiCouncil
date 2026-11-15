@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # GLM-F: verify the final dist artifacts (.app bundle and raw exe).
-# STRICT: every expected artifact must exist and must claim version 0.2.1 —
+# STRICT: every expected artifact must exist and must claim version 0.2.3 —
 # missing artifacts are a FAIL, never a SKIP. Checks: version, arm64 arch,
 # codesign structure (ad-hoc expected; NOT notarization), obsolete GUI linkage.
 # Usage: scripts/macos_release_check.sh [--app PATH] [--exe PATH]
-#        [--skip-app] [--skip-exe] [--expected-version 0.2.1]
+#        [--skip-app] [--skip-exe] [--expected-version 0.2.3]
 #        [--frontend-manifest PATH]
 set -euo pipefail
 
@@ -13,7 +13,7 @@ cd "$ROOT"
 
 APP="dist/AiCouncil.app"
 EXE="dist/aicouncil"
-EXPECTED_VERSION="0.2.1"
+EXPECTED_VERSION="0.2.3"
 MANIFEST="dist/frontend-embed.sha256"
 CHECK_APP=1
 CHECK_EXE=1

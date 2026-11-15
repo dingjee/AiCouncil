@@ -72,9 +72,22 @@ export function createTauriTransport(): Transport {
       if (!internals?.invoke || !internals.transformCallback) {
         throw new Error("Tauri event bridge unavailable.");
       }
-      const handlerId = internals.transformCallback((payload) =>
-        handler(payload as T),
-      );
+      /**
+       * Tauri 2 hands the callback the **event envelope**
+       * `{ event, id, payload }` (see `runCallback` in tauri's event module),
+       * not the payload itself. Unwrap it here so every handler receives the
+       * bare payload the IPC contract promises — without this, the native
+       * shell silently drops every event (streaming deltas, conversation
+       * changes, …) while the browser mock keeps working.
+       */
+      const handlerId = internals.transformCallback((incoming) => {
+        const envelope = incoming as { payload?: unknown } | null;
+        handler(
+          (envelope && typeof envelope === "object" && "payload" in envelope
+            ? envelope.payload
+            : incoming) as T,
+        );
+      });
       await internals.invoke("plugin:event|listen", {
         event,
         target: { kind: "Any" },

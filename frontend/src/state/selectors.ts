@@ -60,11 +60,17 @@ export function defaultModel(state: AppState): string | null {
 /**
  * Resolve the effective model selection.
  *
- * Mirrors the native behaviour:
+ * The selection is the set of **checked** models — there is no separate
+ * parallel mode:
+ *
  *   - no enabled model at all → send disabled ("enable a model first");
- *   - single mode → the primary model (or the first enabled one);
- *   - parallel mode → exactly the checked models; the primary is promoted to
- *     the front and must belong to the checked set.
+ *   - nothing checked → send disabled ("select at least one model"); the
+ *     send never falls back to a model the user unchecked;
+ *   - one checked model → that model answers;
+ *   - several checked models → the same question goes to all of them.
+ *
+ * The primary model owns the main branch. It always belongs to the checked
+ * set: when the user unchecks it, another checked model takes over.
  */
 export function resolveSelection(
   enabled: string[],
@@ -76,18 +82,6 @@ export function resolveSelection(
       targets: [],
       primary: null,
       invalidReason: "composer.send_disabled_no_model",
-    };
-  }
-
-  if (!selection.parallel) {
-    const primary =
-      selection.primary && enabled.includes(selection.primary)
-        ? selection.primary
-        : (enabled[0] ?? null);
-    return {
-      targets: primary ? [primary] : [],
-      primary,
-      invalidReason: null,
     };
   }
 
@@ -110,28 +104,6 @@ export function resolveSelection(
     : checked;
 
   return { targets: ordered, primary, invalidReason: null };
-}
-
-/** The default pair of models for parallel mode (current + best ranked). */
-export function defaultParallelPair(
-  enabled: string[],
-  usageRank: string[],
-  current: string | null,
-): string[] {
-  const checked: string[] = [];
-  if (current && enabled.includes(current)) checked.push(current);
-  for (const model of usageRank) {
-    if (enabled.includes(model) && !checked.includes(model)) {
-      checked.push(model);
-      break;
-    }
-  }
-  if (checked.length < 2) {
-    const fallback = enabled.find((model) => !checked.includes(model));
-    if (fallback) checked.push(fallback);
-  }
-  if (checked.length === 0 && enabled[0]) checked.push(enabled[0]);
-  return checked;
 }
 
 export interface ModelGroup {
@@ -200,6 +172,55 @@ export function filterModelGroups(
     if (items.length > 0) out.push({ label: group.label, items });
   }
   return out;
+}
+
+/**
+ * Group the **enabled** models ("My models") for the composer picker.
+ *
+ * The picker is a selection surface, not a management surface: it may only
+ * offer the models the user enabled in the Models panel. A preference whose
+ * model is not in the catalog (a stale catalogue, a model that was removed
+ * upstream) stays visible — the raw id is used as the label, so the user's
+ * configuration is never silently dropped.
+ */
+export function groupEnabledModels(
+  preferences: ModelPreferenceEntry[],
+  catalog: CatalogEntry[],
+): ModelGroup[] {
+  const enabled = orderedPreferences(preferences).filter(
+    (preference) => preference.enabled,
+  );
+  const byId = new Map(catalog.map((entry) => [entry.id, entry]));
+  const presentations = enabled.map((preference) => {
+    const entry = byId.get(preference.model_id);
+    if (!entry) {
+      // No catalogue entry: the id is the only label we can show.
+      return {
+        raw_id: preference.model_id,
+        catalog_name: "",
+        family_key: `single:${preference.model_id}`,
+        group_label: preference.model_id,
+        item_label: preference.model_id,
+        full_label: preference.model_id,
+      };
+    }
+    return presentation(entry.id, entry.name);
+  });
+  const disambiguated = disambiguate(presentations);
+
+  const groups = new Map<string, ModelGroup>();
+  const ordered: ModelGroup[] = [];
+  for (const item of disambiguated) {
+    const label = item.group_label || item.raw_id;
+    let group = groups.get(label);
+    if (!group) {
+      group = { label, items: [] };
+      groups.set(label, group);
+      ordered.push(group);
+    }
+    group.items.push(item);
+  }
+  return ordered;
 }
 
 /** Conversations filtered by the sidebar search box. */
@@ -296,6 +317,49 @@ export function usageSummary(
     }
   }
   return { knownTotal: sumCosts(known), pending, unavailable };
+}
+
+/**
+ * The cost of the conversation the toolbar shows.
+ *
+ * The records are the ledger of **this** conversation (all branches, all
+ * retries); the sum is exact (decimal strings, never floats).
+ *
+ * The label never lies:
+ *   - a conversation without a single record is `$0.00`;
+ *   - a known total with unsettled records is `$0.02+` (the `+` marks the
+ *     pending part);
+ *   - a conversation whose costs are all unknown is `$?`, never `$0.00`.
+ */
+export interface ConversationCost {
+  /** The exact known total; `null` when nothing is known yet. */
+  knownTotal: string | null;
+  pending: number;
+  unavailable: number;
+  /** True when at least one cost is not settled yet. */
+  partial: boolean;
+  /** The label of the toolbar button. */
+  label: string;
+}
+
+export function conversationCost(
+  records: { cost_text: string | null; status: string }[] | undefined,
+): ConversationCost {
+  const summary = usageSummary(records);
+  const unsettled = summary.pending + summary.unavailable;
+  const partial = unsettled > 0;
+  if (summary.knownTotal !== null) {
+    return {
+      ...summary,
+      partial,
+      label: `$${summary.knownTotal}${partial ? "+" : ""}`,
+    };
+  }
+  if (partial) {
+    // Nothing is known yet: the cost is unknown, not zero.
+    return { ...summary, partial, label: "$?" };
+  }
+  return { ...summary, partial, label: "$0.00" };
 }
 
 /**

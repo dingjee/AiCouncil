@@ -228,12 +228,20 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
         // 每个动作新检测;不读持久缓存,不复用历史 Allowed(A12)
         let cancel = CancellationToken::new();
         match self.guard.check(cancel).await {
-            EgressVerdict::Allowed(_) => {
-                Ok(Some(EgressPermit::fresh(self.guard.network_revision())))
+            EgressVerdict::Allowed(obs) => {
+                // 许可携带已核验地址族:发送连接器据此排除未核验族,
+                // 不会凭单族核验放行任意双栈选路
+                Ok(Some(EgressPermit::fresh(
+                    self.guard.network_revision(),
+                    obs.families,
+                )))
             }
             EgressVerdict::Blocked(o) => Err(AdmissionError::EgressBlocked {
-                country: o.country_code,
-                detail: "当前网络出口位于受限地区(中国大陆/香港),Anthropic 模型请求被拦截".into(),
+                country: o.country_code.clone(),
+                detail: format!(
+                    "当前网络出口位于受限地区(中国大陆/香港),Anthropic 模型请求被拦截;{};GeoIP/按域名分流可能与上游实际路由不一致",
+                    o.evidence()
+                ),
             }),
             EgressVerdict::Unknown(r) => Err(AdmissionError::EgressUnknown {
                 detail: format!("无法确认当前网络出口:{r}"),
@@ -379,7 +387,7 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
         for (bi, b) in plan.branches.iter().enumerate() {
             for (ri, req) in b.requests.iter().enumerate() {
                 let assistant_id = assistant_of[&req.request_id];
-                let immutable = ImmutableRequest::from_planned(
+                let mut immutable = ImmutableRequest::from_planned(
                     req,
                     plan.conversation_id,
                     batch_id,
@@ -388,6 +396,13 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                     &plan.attachments,
                     plan.system_prompt.clone(),
                 );
+                // 门禁许可的地址族约束只作用于门禁模型(Anthropic):
+                // 非门禁模型保持 DUAL(原语义,无地理检测依赖)。
+                if is_anthropic(&immutable.model) {
+                    if let Some(p) = permit {
+                        immutable.route = p.families;
+                    }
+                }
                 self.dispatch(
                     plan.conversation_id,
                     batch_id,
@@ -440,6 +455,8 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
         self.cancels.lock().await.insert(request_id, cancel.clone());
 
         tokio::spawn(async move {
+            // dispatch 级重检可能改变地址族约束:请求体需可重盖章
+            let mut immutable = immutable;
             // 排队可取消:等许可期间也能取消(不派发、不计费)
             let slot = tokio::select! {
                 p = sem.acquire() => p.map_err(|_| ()),
@@ -487,7 +504,10 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                 let stale = !matches!(&permit, Some(p) if p.still_valid(guard.network_revision()));
                 if stale {
                     match guard.check(cancel.clone()).await {
-                        EgressVerdict::Allowed(_) => {}
+                        EgressVerdict::Allowed(obs) => {
+                            // 重检通过:以新核验的地址族为准(旧 permit 已过期)
+                            immutable.route = obs.families;
+                        }
                         EgressVerdict::Blocked(o) => {
                             reject_late(
                                 &db,
@@ -603,6 +623,16 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                 match event {
                     GenEvent::Started => {
                         db_status(&db, request_id, GenerationStatus::Connecting).await;
+                        // Connecting 落库后才对外发 Started(UI 显示连接中,
+                        // 不再提前标 Streaming)。
+                        emit(
+                            &events,
+                            conversation_id,
+                            batch_id,
+                            request_id,
+                            assistant_message_id,
+                            GenEvent::Started,
+                        );
                     }
                     GenEvent::RemoteGenerationId {
                         remote_generation_id: id,
@@ -615,6 +645,10 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                                 dbp.record_remote_generation_id(request_id, &persist_id)
                             })
                             .await;
+                        }
+                        // 远端首次接受:DB 置 Streaming。
+                        if !remote_accepted {
+                            db_status(&db, request_id, GenerationStatus::Streaming).await;
                         }
                         remote_accepted = true;
                         mark_remote_accepted(&db, request_id);
@@ -631,8 +665,10 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
                     }
                     GenEvent::TextDelta(text) => {
                         if !remote_accepted {
+                            // 首个真实文本:远端已接受,DB 置 Streaming。
                             remote_accepted = true;
                             mark_remote_accepted(&db, request_id);
+                            db_status(&db, request_id, GenerationStatus::Streaming).await;
                         }
                         buffered.push_str(&text);
                         unflushed += text.len();
@@ -1066,6 +1102,8 @@ impl<P: Provider + Send + Sync + 'static> ChatService<P> {
             system_prompt: system,
             history: hist,
             prompt: prompt_text,
+            // retry 同样受许可地址族约束(permit 仅在门禁模型时为 Some)
+            route: permit.map(|p| p.families).unwrap_or_default(),
         };
         let mut assistant_of = HashMap::new();
         assistant_of.insert(new_request, sibling);
